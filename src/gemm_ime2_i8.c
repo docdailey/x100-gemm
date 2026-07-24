@@ -77,7 +77,8 @@ static void ukernel_8x32(const int8_t*A,const int8_t*B,int Kb,int32_t*ctmp){
 
 /* scatter 8x8 int32 tile (row-major contiguous) into C[MxN] at (mb,nb) */
 static void store_tile(int32_t*C,int Nt,int mb,int nb,const int32_t*t){
-    for(int r=0;r<M0;r++)for(int c=0;c<N0;c++) C[(mb*M0+r)*Nt+nb*N0+c]=t[r*N0+c];
+    for(int r=0;r<M0;r++){ int32_t*row=C+(size_t)(mb*M0+r)*Nt+(size_t)nb*N0;
+        for(int c=0;c<N0;c++) row[c]=t[r*N0+c]; }
 }
 
 /* single-thread blocked GEMM over packed A,B. C must be pre-zeroed or overwritten (this overwrites). */
@@ -108,10 +109,16 @@ void gemm_ime2_i8_mt(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_
         cpu_set_t s; CPU_ZERO(&s); CPU_SET(8+(tn%8),&s); sched_setaffinity(0,sizeof(s),&s);
         for(int i=0;i<5;i++) sched_yield();
         int32_t ctmp[NRB*N0*N0];
-        for(int mb=tn; mb<Mb; mb+=nthreads)
-            for(int ng=0;ng<Ng;ng++){
+        /* ng outer, mb inner: the B N-panel (K*32 int8) stays L1/L2-resident while
+         * this thread sweeps all its M-blocks -> B (weights) read from DRAM once per ng. */
+        for(int ng=0;ng<Ng;ng++)
+            for(int mb=tn; mb<Mb; mb+=nthreads){
                 ukernel_8x32(pa+(mb*Kb)*TILE, pb+(ng*Kb)*NRB*TILE, Kb, ctmp);
+#ifndef NOSTORE
                 for(int g=0;g<NRB;g++) store_tile(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0);
+#else
+                __asm__ volatile("" :: "r"(ctmp) : "memory");  /* keep ukernel live */
+#endif
             }
     }
 }
