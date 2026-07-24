@@ -8,49 +8,61 @@ Everything here is measured on a live board (`k3`) unless marked [spec].
 | count | 8 harts (0–7) | 8 harts (8–15) |
 | model | `Spacemit(R) X100` | `Spacemit(R) A100` |
 | clock | up to **2.0 GHz** | up to **2.4 GHz** |
-| RVV VLEN | **256-bit** (measured) | **1024-bit** [spec] |
-| IME | IME-1 (`vmadot`, runs as normal insns) | **IME-2 (the ~60 TOPS)** [spec] |
-| **Linux-schedulable?** | **YES** (Cpus_allowed 0–7) | **NO** — kernel refuses affinity (EINVAL) even via systemd-run/cgroup |
+| RVV VLEN | **256-bit** (measured) | **1024-bit** (measured ✓) |
+| IME | IME-1 (`vmadot`) | **IME-2 (`vmadotsu`/`vmadotu`, 1024-bit)** |
+| how to run code there | normal scheduling (Cpus_allowed 0–7) | **write `"0"` to `/proc/set_ai_thread`** (kernel migrates the thread; `taskset`/`sched_setaffinity` give EINVAL) |
 
-**The A100 cores are a driver-managed accelerator, not general CPUs.** They are SMP-online
-(`Brought up 16 CPUs`) but you cannot run user threads on them — `taskset`, `sched_setaffinity`,
-`systemd-run -p AllowedCPUs=0-15`, and cgroup widening all fail with EINVAL for cores 8–15. They are
-reached only through **`/dev/ai_dma` + TCM + HUGETLB_1G shared memory** submission (the SpaceMIT
-`spine_mem_pool`/`ime2_kernels` machinery), the same model as the RCPU.
+**The A100 cores ARE reachable from userspace — just not the obvious way.** `taskset -c 8` /
+`sched_setaffinity` / `systemd-run -p AllowedCPUs=0-15` all fail EINVAL. The sanctioned path is the
+driver hook **`/proc/set_ai_thread`** (write-only, world-writable): open it, `write("0")`, and the kernel
+migrates the calling thread onto an A100 core. Confirmed: after the write, `sched_getcpu()` returns a
+hart ≥ 8 and `vlenb` reports **VLEN=1024**. This is what SpaceMIT's `bind_ai_thread()` does
+(`ime.cpp:1668`), gated on `use_ime2 && !(cpu on AI mask)`.
+
+**IME-2 is INLINE INSTRUCTIONS, not a submit-to-accelerator model.** `ime2_kernels.cpp` issues
+`vmadotsu vd,vs1,vs2,i8` / `vmadotu` directly from the migrated thread — same issue style as IME-1's
+`vmadot`, just 1024-bit wide on the A100 core. There is **no `/dev/ai_dma` dispatch ring for matmul**
+(ai_dma is a separate DMA engine; the ggml backend doesn't use it for weights or compute).
 
 ## Measured compute
 | path | int8 throughput | note |
 |------|-----------------|------|
 | scalar | **5.6 GOP/s** | baseline |
-| **IME-1 `vmadot` (8× X100)** | **889 GOP/s** (111/core) | **160× scalar**, usable now with `-march=rv64gcv_zvfh_xsmtvdotii` |
-| IME-2 (A100, 1024-bit) | ~60 TOPS [spec] | ~67× IME-1; **requires the ai_dma/driver path** |
+| IME-1 `vmadot`, 8× X100, 1-accumulator | ~889 GOP/s | latency-bound (dependent chain) |
+| **IME-2 `vmadotsu`, 1× A100, 4-accumulator** | **~918 GOP/s** | one AI core ≈ the whole X100 cluster |
+| **IME-2, 2× A100** | **~1633 GOP/s** | **1.78× → near-linear scaling** |
+| IME-2, 8× A100 (projected) | ~6–7 TOPS+ | **power-gated on current PSU — see below** |
 
-`vmadot` tile = 4×8×4 int8 (128 MAC), B pre-packed (transpose 8×4→4×8). Official demo:
-`spacemit-com/riscv-ime-extension-spec/example/vmadot-gemm-demo.c` (builds+runs correct on-board).
+*Methodology note:* a single-accumulator `vmadot` loop is **latency-bound**; the real kernel interleaves
+**4 independent accumulators** (v20/v22/v24/v26) to hide matrix-unit latency — that alone is a **4×**
+difference (230 → 918 GOP/s per A100 core). GOP/s assumes 512 MAC/tile (128×VLEN/256, linear estimate);
+**exact `vmadotsu` tile geometry still needs confirming from the IME-2 spec** — true TOPS may be higher.
+
+## ⚠️ Power ceiling (current supply)
+Running the IME at full tilt on **≥3–4 A100 cores simultaneously reliably reboots the board** (clean
+brownout: 1 & 2 cores run fine and stay up; 4 and 8 cores → instant reboot, uptime resets to 0). Almost
+certainly a current/PSU limit, not a software fault — the board had been on a battery bank. **A solid
+USB-C PD supply is needed to exercise all 8 A100 cores** and get the true 8-core / ~60-TOPS ceiling.
 
 ## Memory
 - 64-bit **LPDDR5-6400, 51 GB/s peak** [spec], 32 GB.
 - **Measured CPU-load bandwidth: ~19.7 GB/s read, ~23 GB/s prefetched, ~19 copy** (38–45% of peak).
-  Hugepages didn't move it (not TLB-bound). The gap to 51 GB/s needs **`ai_dma`**.
-- **3 MB TCM** (`/dev/tcm`, phys 0x0, size 0x300000, 8×384KB, direct-mmap) — fast staging for IME.
-- **`/dev/ai_dma`** — DMA engine feeding the A100 cores + TCM.
-- Weight staging uses a **`HUGETLB_1G_IOC_ALLOC` ioctl** + `MAP_SHARED` (SpaceMIT `spine_mem_pool.cpp`).
+- **3 MB TCM** (`/dev/tcm`, phys 0x0, size 0x300000, 8×384KB, direct-mmap) — per-core IME staging via
+  `libspine_tcm.so` (`spine_tcm_mem_get(cpu_id)`).
+- Weight memory pool = **plain DRAM** (default: transparent hugepage `mmap`+`MADV_HUGEPAGE`). The fancier
+  backends want **`/dev/hugetlb_1g`** (ioctl `HUGETLB_1G_IOC_ALLOC`, returns a `dma_addr`) and
+  **`/dev/tcm_sync_mem`** — **NEITHER EXISTS on this board**, which is exactly why llama.cpp needed
+  `SPACEMIT_DISABLE_TCM=1`. `/dev/ai_dma` (char major 240) is present but unused by the ggml backend.
 
-## Why generic runtimes (incl. our llama.cpp run) underperform
-Launched from an ssh session, a process is confined to **cores 0–7 (X100)**. SpaceMIT's llama.cpp sets
-`use_ime2=1` and `cpu_mask ff00`, but its `pthread_setaffinity_np` to the A100 cores **fails silently in
-that context and falls back to X100** → its prefill measured **~616 GOP/s = ~70% of IME-1 (889), but ~1%
-of the 60-TOPS IME-2.** **The A100 tensor cores were never engaged.** This is the single biggest reason
-for poor numbers — not the model, not the quantization.
+## Why our earlier llama.cpp run underperformed
+Launched from an ssh session, its worker threads *did* call `bind_ai_thread()` — but with TCM disabled and
+the mem backend on plain DRAM, plus decode being bandwidth-bound, it never showed the compute ceiling. The
+compute path itself is real and now measured directly: **one A100 core = ~918 GOP/s; two = 1633.**
 
-## The two frontiers (what a custom engine must crack)
-1. **`ai_dma` bandwidth** — reverse its ioctl/mmap ABI; stream DRAM→TCM. Settles 23 vs 51 GB/s → up to
-   **2.2× on all memory-bound decode**.
-2. **A100 IME-2 submission** — how work is dispatched to the driver-managed A100 cluster (via ai_dma +
-   HUGETLB_1G + the barrier/TCM protocol). This is the path to the real **~60 TOPS** (≈67× the IME-1 we
-   can already hit) → the huge **prefill** win. Reference: SpaceMIT `ggml-cpu/spacemit/` source.
-
-## Honest performance envelope
-- **Prefill:** IME-1 alone (889 GOP/s) already ~1.4× a generic run; A100 IME-2 is ~67× beyond that.
-- **Decode:** bandwidth-bound. `ai_dma` → ~2.2×. Dense-27B ceiling ≈ 3.4 t/s @ full 51 GB/s (physics).
-  Fast large-model decode needs **MoE + speculative/MTP** on top.
+## The real levers for a custom engine (revised)
+1. **Fill all 8 A100 cores** (needs the better PSU) — near-linear scaling seen at 2 cores → multi-TOPS.
+2. **Nail the exact `vmadotsu` tile** from the IME-2 spec so TOPS is exact, and use the i2×i8 (2-bit
+   weight) kernel for 4× weight density → less bandwidth pressure on decode.
+3. **TCM staging** (`/dev/tcm` + libspine_tcm) to feed the AI cores without hitting the 19–23 GB/s DRAM wall.
+4. **Decode is still bandwidth-bound** — dense-27B ceiling ≈ 3.4 t/s @ 51 GB/s; fast large-model decode
+   needs MoE + speculative/MTP on top of the now-unlocked AI-core compute.
