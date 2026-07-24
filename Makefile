@@ -1,11 +1,11 @@
 # x100-gemm — GEMM for the SpaceMIT X100 (RISC-V RVA23): RVV 1.0 + IME.
 #
-# Native build on the board (gcc 15, RVV):   make
-# Enable the IME int8 path (needs clang + SpaceMIT xsmtvdot):
-#     make CC=clang IME=1
+# Native build on the board (Bianbu gcc 15.2, RVV):   make
+# Enable the IME int8 (vmadot) path — the board's gcc supports it natively:
+#     make IME=1
 #
-# The RVV path builds with mainline gcc/clang. The IME (vmadot) path is gated
-# behind X100_HAVE_IME and needs a toolchain that assembles smt.vmadot.
+# CONFIRMED: Bianbu gcc 15.2.0 assembles+runs smt.vmadot with -march=...xsmtvdotii
+# (no clang / SpaceMIT toolchain needed). The IME path is gated behind X100_HAVE_IME.
 
 CC      ?= gcc
 STD      = -std=gnu11
@@ -18,8 +18,8 @@ CFLAGS   = $(STD) $(WARN) $(OPT) -march=$(ARCH) $(INC)
 LDLIBS   = -lm
 
 ifeq ($(IME),1)
-  # SpaceMIT IME: X60 subset = xsmtvdot ; A100 = xsmtvdotii. Adjust per core.
-  ARCH   := $(ARCH)_xsmtvdot
+  # SpaceMIT IME: X100 uses xsmtvdotii (confirmed: gcc assembles+runs smt.vmadot).
+  ARCH   := $(ARCH)_xsmtvdotii
   CFLAGS += -DX100_HAVE_IME
 endif
 

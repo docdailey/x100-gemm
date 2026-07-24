@@ -15,7 +15,7 @@ the **IME "Integrated Matrix Extension"** (`vmadot`).
 | Vendor | `mvendorid = 0x710` (SpaceMIT) |
 | **VLEN** | **256‑bit** (VLENB=32) |
 | fp16 vectors | **Zvfh** ✓ (also Zvbb, vector‑crypto Zvk*) |
-| Matrix (IME) | `vmadot` — **custom, not in `riscv,isa`**; needs SpaceMIT Clang |
+| Matrix (IME) | `vmadot` — custom, not in `riscv,isa`; **native gcc `xsmtvdotii`** (assembles + runs ✓) |
 | Cache line | 64 B (Zicboz) |
 
 ## Backends (one API, `include/x100_gemm.h`)
@@ -24,13 +24,13 @@ the **IME "Integrated Matrix Extension"** (`vmadot`).
 | `gemm_ref_*` | fp32 / int8 | any | scalar correctness oracle |
 | `gemm_rvv_f32` | fp32 | gcc/clang `-march=rv64gcv` | RVV, register‑blocked MRx(m4·VL) |
 | `gemm_rvv_f16` | fp16 | +`_zvfh` | 2× lanes; fp16 accum (fp32‑accum variant TODO) |
-| `gemm_ime_i8` | int8→int32 | **clang** `+xsmtvdot` | IME `vmadot`; scalar fallback until enabled |
+| `gemm_ime_i8` | int8→int32 | **gcc** `+xsmtvdotii` | IME `vmadot` (assembles + runs on X100); scalar fallback until wired |
 
 ## Quick start (on the board)
 ```sh
 make                     # native gcc 15, rv64gcv_zvfh
 ./gemm_bench 256 256 256 # capability print + correctness + GFLOP/s
-make CC=clang IME=1      # (once SpaceMIT clang is installed) enable the vmadot path
+make IME=1               # enable the IME vmadot path (native gcc, xsmtvdotii — confirmed)
 ```
 
 ## Measured (X100 @ Jupiter 2, gcc 15.2, 256³, this repo's first cut)
@@ -47,7 +47,9 @@ blocking lands — that's the point of the benchmark harness.
 1. **Cache/L2 blocking** (KC×NC panels + A/B packing) — fixes the large‑matrix falloff.
 2. **fp16 with fp32 accumulation** (`vfwmacc`) — accuracy without losing throughput.
 3. **IME `vmadot` int8 micro‑kernel** — the flagship: 4×8 int8 tiles → int32, the path
-   to the X100's matrix throughput. Needs Clang + `xsmtvdot` (see `docs/IME.md`).
+   to the X100's matrix throughput. Toolchain **confirmed working** (native gcc
+   `-march=…xsmtvdotii`; `vmadot` runs on hardware) — next is wiring/validating the
+   micro‑kernel operand packing (see `docs/IME.md`).
 4. bf16 (`zvfbfmin`) if present; multi‑threaded (8 cores) outer blocking.
 
 ## Docs

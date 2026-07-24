@@ -38,13 +38,15 @@ MVD += widen(MVS1) * transpose(widen(MVS2))
 ```
 (LLVM prefixes the instructions with `smt.`.)
 
-## Toolchain
-- **LLVM feature tokens:** `XSMTVDot` (X60 hw subset, v1.0.0) / `XSMTVDotII` (A100).
-  Enable via `-march=rv64gcv..._xsmtvdot`. X100 support token = **to confirm on‑box**
-  (try `xsmtvdot`; X100 is newer than X60 and may expose a superset).
-- **GCC:** no IME support. RVV paths in this repo build with gcc; IME needs clang.
-- Install: SpaceMIT LLVM (their `ai-sdk` / toolchain release) or a mainline Clang new
-  enough to carry the SpaceMIT vendor extension.
+## Toolchain — CONFIRMED on the X100 (2026-07-24)
+- **The board's native Bianbu gcc 15.2.0 supports IME.** No clang / SpaceMIT LLVM
+  install needed. (Upstream statements that "GCC has no IME support" predate SpaceMIT
+  patching it into their Bianbu gcc.)
+- **Token: `xsmtvdotii`** →  `-march=rv64gcv_zvfh_xsmtvdotii`.
+  (LLVM names: `XSMTVDot` = X60 subset; `XSMTVDotII` = A100/X100 — matches.)
+- Verified: `vmadot / vmadotu / vmadotsu` **assemble, link, and execute** on hardware
+  (exit 0, no illegal-instruction). Disassembly shows `smt.vmadot v8,v0,v4`
+  (`0xe240342b`, CUSTOM_1).
 
 ## Status in this repo
 `src/gemm_ime_i8.c` has the 4×4 micro‑kernel structure with the `vmadot` sequence
