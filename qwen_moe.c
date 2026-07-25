@@ -75,20 +75,34 @@ static Lin lin_new(const float*wf32,int N,int K){
 }
 /* ---- P0 instrumentation: per-token wall-clock buckets (decode steady-state) ---- */
 static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0; static long gT_tok=0; static int gT_on=0;
-static void lin_mm(const Lin*l,const float*x,float*y,int nt,int8_t*xt){
-    int Nb=l->N/N0, Kb=l->K/K0, Kp=l->Kp, kb=Kb;
-    double _ta = gT_on?now():0;
-    float amax=1e-6f; for(int i=0;i<l->K;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
+/* P0.2 activation reuse: pack once, matmul against N Lins sharing the same K-dim input (e.g. hn -> q/k/v,
+ * or ffn_norm'd hn -> all selected experts' gate/up) instead of repacking per linear call. */
+static void pack_act(const float*x,int K,int8_t*xt,float*xs_out){
+    int kb=K/K0;
+    float amax=1e-6f; for(int i=0;i<K;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float xs=amax/127.0f, inv=1.0f/xs;
     memset(xt,0,(size_t)kb*TILE);
-    for(int c=0;c<l->K;c++){ int q=(int)lrintf(x[c]*inv); q=q>127?127:(q<-128?-128:q); xt[(c/K0)*TILE+(c%K0)]=(int8_t)q; }
-    double _tb = gT_on?now():0; if(gT_on) gT_actpack += _tb-_ta;
+    for(int c=0;c<K;c++){ int q=(int)lrintf(x[c]*inv); q=q>127?127:(q<-128?-128:q); xt[(c/K0)*TILE+(c%K0)]=(int8_t)q; }
+    *xs_out=xs;
+}
+/* P0.3 scratch: part[] was malloc/free'd on every (Lin,thread) call (~29 lin_mm calls/token x nt
+ * threads = ~100+ malloc/free/token). Persistent __thread buffer, grown once to the largest Kp seen. */
+static void lin_mm_packed(const Lin*l,const int8_t*xt,float xs,float*y,int nt){
+    int Nb=l->N/N0, Kb=l->K/K0, Kp=l->Kp;
     #pragma omp parallel num_threads(nt)
-    { int tn=omp_get_thread_num(); pin_once(tn); int32_t*part=malloc((size_t)Kp*64*4);
+    { int tn=omp_get_thread_num(); pin_once(tn);
+      static __thread int32_t*part=NULL; static __thread size_t partcap=0;
+      size_t need=(size_t)Kp*64*4; if(partcap<need){ free(part); part=malloc(need); partcap=need; }
       for(int nb=tn;nb<Nb;nb+=nt){ gemv_nb_int4_grouped(xt, l->Wq+(size_t)nb*Kb*QTILE, Kb, part);
           for(int n=0;n<N0;n++){ int out=nb*N0+n; const float*gsr=l->gs+(size_t)out*Kp; float acc=0;
               for(int gp=0;gp<Kp;gp++) acc+=(float)part[gp*64+n]*gsr[gp]; y[out]=acc*xs; } }
-      free(part); }
+    }
+}
+static void lin_mm(const Lin*l,const float*x,float*y,int nt,int8_t*xt){
+    double _ta = gT_on?now():0;
+    float xs; pack_act(x,l->K,xt,&xs);
+    double _tb = gT_on?now():0; if(gT_on) gT_actpack += _tb-_ta;
+    lin_mm_packed(l,xt,xs,y,nt);
     if(gT_on) gT_lin += now()-_tb;
 }
 
@@ -256,13 +270,16 @@ static int cache_load(Model*m,const char*path,int nt){
 
 typedef struct { float*Kc,*Vc; int kvd,ctx; } Kv;
 static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
-                    float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*g,float*u,float*eout,int8_t*xt){
+                    float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*g,float*u,float*eout,int8_t*xt,int8_t*xt2){
     int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,qd=nh*hd,kvd=nkv*hd,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
     static float*h=NULL; if(!h)h=malloc(d*4); memcpy(h,m->tok_embd+(size_t)tok*d,d*4);
     double _f0=gT_on?now():0, _a0=gT_actpack,_l0=gT_lin,_at0=gT_attn;
     for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
         rmsnorm(hn,h,ly->attn_norm,d,m->eps);
-        lin_mm(&ly->q,hn,q,nt,xt); lin_mm(&ly->k,hn,k,nt,xt); lin_mm(&ly->v,hn,vv,nt,xt);
+        { double _ta=gT_on?now():0; float xs; pack_act(hn,d,xt2,&xs);
+          double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
+          lin_mm_packed(&ly->q,xt2,xs,q,nt); lin_mm_packed(&ly->k,xt2,xs,k,nt); lin_mm_packed(&ly->v,xt2,xs,vv,nt);
+          if(gT_on) gT_lin+=now()-_tb; }
         for(int hh=0;hh<nh;hh++){ rmsnorm(q+hh*hd,q+hh*hd,ly->q_norm,hd,m->eps); rope(q+hh*hd,hd,pos,m->rope_base); }
         for(int hh=0;hh<nkv;hh++){ rmsnorm(k+hh*hd,k+hh*hd,ly->k_norm,hd,m->eps); rope(k+hh*hd,hd,pos,m->rope_base); }
         float*Kc=kv->Kc+(size_t)l*kv->ctx*kvd,*Vc=kv->Vc+(size_t)l*kv->ctx*kvd;
@@ -283,10 +300,14 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         for(int a=0;a<na;a++){ int bi=-1; float bv=-1; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[a]=bi; sw[a]=bv; }
         float ssum=0; for(int a=0;a<na;a++)ssum+=sw[a]; for(int a=0;a<na;a++)sw[a]/=ssum;
         for(int i=0;i<d;i++)eout[i]=0;
-        for(int a=0;a<na;a++){ int e=sel[a]; float w=sw[a];
-            lin_mm(&ly->eg[e],hn,g,nt,xt); lin_mm(&ly->eu[e],hn,u,nt,xt);
-            for(int i=0;i<moe;i++){ float x=g[i]; g[i]=(x/(1.0f+expf(-x)))*u[i]; }
-            lin_mm(&ly->ed[e],g,tmp,nt,xt); for(int i=0;i<d;i++)eout[i]+=w*tmp[i]; }
+        { double _ta=gT_on?now():0; float xs2; pack_act(hn,d,xt2,&xs2);
+          if(gT_on) gT_actpack+=now()-_ta;
+          for(int a=0;a<na;a++){ int e=sel[a]; float w=sw[a];
+              double _tb=gT_on?now():0;
+              lin_mm_packed(&ly->eg[e],xt2,xs2,g,nt); lin_mm_packed(&ly->eu[e],xt2,xs2,u,nt);
+              if(gT_on) gT_lin+=now()-_tb;
+              for(int i=0;i<moe;i++){ float x=g[i]; g[i]=(x/(1.0f+expf(-x)))*u[i]; }
+              lin_mm(&ly->ed[e],g,tmp,nt,xt); for(int i=0;i<d;i++)eout[i]+=w*tmp[i]; } }
         for(int i=0;i<d;i++)h[i]+=eout[i];
     }
     rmsnorm(hn,h,m->out_norm,d,m->eps); lin_mm(&m->lm,hn,logits,nt,xt);
@@ -334,17 +355,17 @@ int main(int c,char**v){
     int d=m.d,qd=m.nh*m.hd,moe=m.moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
     float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
          *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m.vocab*4);
-    int8_t*xt=malloc((size_t)(maxk/K0)*TILE);
+    int8_t*xt=malloc((size_t)(maxk/K0)*TILE),*xt2=malloc((size_t)(maxk/K0)*TILE);
 
     int prompt[]={785,6722,315,9625,374,12095,13,576,6722,315,6323,374}; int np=12;
     double tp=now(); int first=0;
-    for(int p=0;p<np;p++){ forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,xt); if(p==np-1)first=argmax(logits,m.vocab); }
+    for(int p=0;p<np;p++){ forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,xt,xt2); if(p==np-1)first=argmax(logits,m.vocab); }
     printf("\nprompt      : "); for(int i=0;i<np;i++)tok_print(&g,prompt[i]);
     printf("\nfirst argmax: %d ('",first); tok_print(&g,first); printf("')  expect 26194 (' Tokyo') -> %s\n", first==26194?"PASS":"FAIL");
     printf("prefill %.2fs (%d tok)\n",now()-tp,np);
     printf("generation  : "); for(int i=0;i<np;i++)tok_print(&g,prompt[i]); tok_print(&g,first);
     int cur=first; double tg=now(); gT_on=1;
-    for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,xt); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
+    for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,xt,xt2); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
     double dt=now()-tg; gT_on=0;
     printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, IME-2 int4 W4A8, nt=%d)\n", ngen/dt, nt);
     if(gT_tok) printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel+fold) %.1f | attention %.1f | rest %.1f | sum %.1f | wall %.1f\n",

@@ -35,15 +35,21 @@ Last update: 2026-07-25. Durable state so work survives a session kill.
 - vmadot asm fns MUST carry `__attribute__((optimize("no-tree-vectorize")))` (auto-vec RVV collides with asm vector state → heap corruption).
 - rustc static-link + `-fPIC` miscompiles the kernel (unbounded loop). gcc non-PIC only. → engines standalone C, Python via ctypes.
 
-## IN FLIGHT — P0 decode optimization (task #16). Do P0 only, then STOP.
-- **P0.1 instrumentation DONE**: per-token buckets `act-pack | linear(kernel+fold) | attention | rest | sum | wall`
-  (gated by gT_on; measured only in decode steady-state, prefill excluded). Prints after decode.
-- **Measuring BASELINE now** (this run writes the local cache + prints baseline buckets).
-- **P0.2 activation reuse** (next): pack `hn` once → Q/K/V; pack `hn2` once → all expert gate/up (§5). ~28→11 packs/layer.
-- **P0.3 scratch** (next): persistent per-thread `part` buffer, kill ~1200 malloc/free per token (§6).
-- Record before/after full-token timing. Keep grouped fold as numerical oracle.
-- THEN STOP → review research_feed_paths.md → pick ONE branch by measured buckets: vendor N32 .hp kernel
-  (fold/kernel overhead) | persistent workers (dispatch overhead) | M-batching (weight-bandwidth). DO NOT auto-advance.
+## P0 decode optimization (task #16) — DONE, 2026-07-26. Findings in codex_recs_1.md §21.
+- **P0.1 instrumentation**: per-token buckets `act-pack | linear(kernel+fold) | attention | rest | sum | wall`
+  (gated by gT_on; measured only in decode steady-state, prefill excluded). Baseline: wall 741.8ms, 1.35 tok/s.
+- **P0.2 activation reuse DONE**: `lin_mm` split into `pack_act()`+`lin_mm_packed()`; `hn` packed once for
+  Q/K/V (via new persistent `xt2` buffer, separate from transient `xt`), `hn` packed once for all 8 selected
+  experts' gate/up. 28→11 packs/layer as predicted. act-pack 60.6→17.0ms.
+- **P0.3 scratch DONE**: `part[]` accumulator is now `static __thread`, grown once, no more malloc/free per
+  (Lin,thread) call. Marginal (linear 579.5→575.9ms) — confirms alloc was never the real cost.
+- **Net: 1.35→1.49 tok/s (+10.3%)**, correctness unchanged (' Tokyo' PASS throughout), same cache/output.
+- **Key correction**: §20.3's "~585ms glue" guess was wrong — glue (act-pack+attention+rest) was only
+  ~138ms even pre-optimization; now ~94ms (14% of wall). The other ~600ms was always *inside*
+  `linear(kernel+fold)` (now 86% of wall) — i.e. the GEMV kernel + scalar per-group fold itself, not glue
+  sitting outside it. This is the real target for the next branch.
+- **STOPPED per working rule** — did NOT auto-advance into PR3 (fold A/B, §7) or Path A (vendor N32 kernel,
+  research_feed_paths.md). Next-branch decision is open; research_feed_paths.md §9 ranked agenda applies.
 
 ## Honest perf model (from codex_recs_1.md)
 - W4 group-32 = **0.625 B/weight** (not 0.5 — fp32 scales). 30B active ~3B → ~1.9 GB/token.

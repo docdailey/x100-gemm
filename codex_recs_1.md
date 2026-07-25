@@ -910,6 +910,64 @@ Cache being populated now (~20 GB).
    Re-measure after each; keep the grouped fold as the numerical oracle.
 Then §7 fold A/B (+ `[Nb][Kp][8]` scales + cache version bump) and §10 M-batch.
 
+## 21. Findings — PR2 closed: activation reuse + persistent scratch (2026-07-26)
+
+Session was interrupted (host power loss) right after the P0.1 baseline landed;
+resumed from the K3-local cache (valid, `ENDIMEC`-footed, survived the outage intact)
+and implemented steps 2–3 of §20.6 / PR2 in full.
+
+### 21.1 What changed
+
+- `lin_mm` split into `pack_act()` (quantize x -> int8 tile + scale) and
+  `lin_mm_packed()` (matmul against a pre-packed tile). `lin_mm` itself is now a
+  thin wrapper (pack + `lin_mm_packed`) kept for call sites with a unique input
+  (`o` proj, each expert's `down` proj, `lm_head`).
+- `forward()` now packs `hn` **once** per layer for Q/K/V (3 calls -> 1 pack) and
+  packs the ffn-norm'd `hn` **once** for all selected experts' gate+up (16 calls ->
+  1 pack), via a second persistent buffer `xt2` (kept separate from the transient
+  `xt` used by `o`/`down`/`lm_head`, which would otherwise be clobbered mid-loop by
+  each expert's `down`-proj pack). Packs/layer: **28 -> 11**, matching the §20.6
+  estimate exactly.
+- `lin_mm_packed`'s `part[]` accumulator (int32, `Kp*64*4` bytes) is now a
+  `static __thread` buffer grown once to the largest `Kp` needed and reused for the
+  rest of the process, instead of `malloc`/`free` on every (Lin, thread) call.
+
+### 21.2 Measured, same cache, same prompt, nt=4 (12-token decode, ' Tokyo' PASS throughout)
+
+| Stage | act-pack | linear(kernel+fold) | attention | rest | wall/tok | tok/s |
+|---|---|---|---|---|---|---|
+| P0.1 baseline (pre-crash) | 60.6 ms | 603.2 ms | 16.8 ms | 60.2 ms | 741.8 ms | 1.35 |
+| + activation reuse (PR2 step 2) | 17.0 ms | 579.5 ms | 16.8 ms | 59.5 ms | 673.9 ms | 1.48 |
+| + persistent scratch (PR2 step 3) | 17.2 ms | 575.9 ms | 16.7 ms | 59.7 ms | 670.5 ms | 1.49 |
+
+Net: **+10.3% decode tok/s** (1.35 -> 1.49), all from removing steady-token
+overhead — no kernel/fold change, no cache format change, output unchanged.
+
+### 21.3 Correction to §20.3's glue hypothesis
+
+§20.3 guessed ~585 ms/token of "glue" outside a ~150 ms weight-stream cost, based
+on a bandwidth-only estimate. The buckets say otherwise: **glue (act-pack +
+attention + rest) was only ~138 ms/token even before this pass** (60.6+16.8+60.2);
+it's now ~94 ms (17.2+16.7+59.7, 14% of wall). The other ~600 ms was always
+*inside* `linear(kernel+fold)` itself — i.e. inside the per-`Lin` GEMV kernel call
+and its scalar per-group scale fold, not sitting outside it as separate glue. Scratch
+removal barely moved `linear` (579.5 -> 575.9 ms), confirming malloc/free was never
+the story there either.
+
+**Implication:** `linear(kernel+fold)` is now **86% of wall-clock** (575.9/670.5 ms)
+and is the only bucket left with room — this is exactly §7/PR3 (group-fold A/B +
+`[Nb][Kp][8]` scale repack) and research_feed_paths.md's Path A (vendor-shaped
+N32 kernel with in-loop fold), not a new branch. R0's gate (§9 of
+research_feed_paths.md: "finish codex timing buckets") is now satisfied with real
+numbers, not the earlier bandwidth-only guess.
+
+### 21.4 Not yet done — explicitly stopping here per working rule
+
+Per §19 / PROGRESS.md: P0 (buckets + reuse + scratch) is complete and measured;
+**not** auto-advancing into PR3 (fold A/B) or Path A (vendor kernel) without a
+branch decision. `research_feed_paths.md` §9's ranked agenda and §12 results log
+still apply for that decision.
+
 Toolchain note (affects any int4/int8 IME kernel here): the vmadot asm functions
 must carry `__attribute__((optimize("no-tree-vectorize")))` (or the file built
 `-fno-tree-vectorize`) — gcc auto-vectorizing the surrounding C (esp. the `ct→y`
