@@ -6,8 +6,9 @@
  * (RMSNorm + QK-norm + NEOX RoPE + GQA + SwiGLU + tied lm_head) with matmuls on the 4 IME-2 units,
  * greedy-generates and decodes to text.
  *
- * Build: gcc -O3 -fno-tree-vectorize -fno-stack-protector -march=rv64gcv_zvfh_xsmtvdotii -fopenmp \
- *            -o qwen_ime qwen_ime.c -lm
+ * Build: gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_ime qwen_ime.c -lm
+ *   (the two IME-2 kernel fns carry __attribute__((optimize("no-tree-vectorize"))) so the vmadot
+ *    asm is safe while the rest of the engine — attention/norm/quant — vectorizes at -O3.)
  * Run  : LD_LIBRARY_PATH=/usr/lib ./qwen_ime /root/models/Qwen3-4B-Q8_0.gguf [ngen] [nt]
  */
 #define _GNU_SOURCE
@@ -37,6 +38,7 @@ static void pack_w_int8(int Nt,int Kt,const int8_t*W,int8_t*Wp){
     for(int nb=0;nb<Nb;nb++)for(int kb=0;kb<Kb;kb++){ int8_t*d=Wp+((size_t)(nb*Kb+kb))*TILE;
         for(int n=0;n<N0;n++)for(int k=0;k<K0;k++) d[n*K0+k]=W[(nb*N0+n)*Kt+kb*K0+k]; }
 }
+__attribute__((optimize("no-tree-vectorize","no-stack-protector")))
 static void gemv_nb_int8(const int8_t*xt,const int8_t*Wp,int Kb,int32_t*ct){
     __asm__ volatile(
         "vsetvli t0,zero,e32,m2\n\t vxor.vv v28,v28,v28\n\t"
@@ -58,7 +60,11 @@ static Lin lin_new(const float*wf32,int N,int K){
         for(int c=0;c<K;c++){ int q=(int)lrintf(row[c]*inv); q=q>127?127:(q<-128?-128:q); wi[(size_t)r*K+c]=(int8_t)q; } }
     l.Wp=malloc((size_t)Nb*Kb*TILE); pack_w_int8(N,K,wi,l.Wp); free(wi); return l;
 }
-/* y[N] = dequant( W @ quant(x) ), tensor-parallel over nt IME units */
+/* y[N] = dequant( W @ quant(x) ), tensor-parallel over nt IME units.
+ * no-tree-vectorize on THIS function only: the ct->y copy after the vmadot asm otherwise gets
+ * auto-vectorized and the emitted RVV collides with the asm's vector state. The rest of the engine
+ * (attention/norm/quant) compiles at -O3 with vectorization ON. */
+__attribute__((optimize("no-tree-vectorize","no-stack-protector")))
 static void lin_mm(const Lin*l,const float*x,float*y,int nt,int8_t*xt){
     int Nb=l->N/N0, Kb=l->K/K0, kb=Kb;
     float amax=1e-6f; for(int i=0;i<l->K;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
