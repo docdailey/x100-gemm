@@ -73,18 +73,23 @@ static Lin lin_new(const float*wf32,int N,int K){
             for(int c=c0;c<c0+GRP;c++){ int q=(int)lrintf(row[c]*inv); q=q>7?7:(q<-7?-7:q); wi[(size_t)r*K+c]=(int8_t)q; } } }
     l.Wq=malloc((size_t)Nb*Kb*QTILE); pack_w_int4(N,K,wi,l.Wq); free(wi); return l;
 }
+/* ---- P0 instrumentation: per-token wall-clock buckets (decode steady-state) ---- */
+static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0; static long gT_tok=0; static int gT_on=0;
 static void lin_mm(const Lin*l,const float*x,float*y,int nt,int8_t*xt){
     int Nb=l->N/N0, Kb=l->K/K0, Kp=l->Kp, kb=Kb;
+    double _ta = gT_on?now():0;
     float amax=1e-6f; for(int i=0;i<l->K;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float xs=amax/127.0f, inv=1.0f/xs;
     memset(xt,0,(size_t)kb*TILE);
     for(int c=0;c<l->K;c++){ int q=(int)lrintf(x[c]*inv); q=q>127?127:(q<-128?-128:q); xt[(c/K0)*TILE+(c%K0)]=(int8_t)q; }
+    double _tb = gT_on?now():0; if(gT_on) gT_actpack += _tb-_ta;
     #pragma omp parallel num_threads(nt)
     { int tn=omp_get_thread_num(); pin_once(tn); int32_t*part=malloc((size_t)Kp*64*4);
       for(int nb=tn;nb<Nb;nb+=nt){ gemv_nb_int4_grouped(xt, l->Wq+(size_t)nb*Kb*QTILE, Kb, part);
           for(int n=0;n<N0;n++){ int out=nb*N0+n; const float*gsr=l->gs+(size_t)out*Kp; float acc=0;
               for(int gp=0;gp<Kp;gp++) acc+=(float)part[gp*64+n]*gsr[gp]; y[out]=acc*xs; } }
       free(part); }
+    if(gT_on) gT_lin += now()-_tb;
 }
 
 /* ===================== GGUF reader (mmap; Q4_0/Q4_1/Q8_0/F32/F16) ===================== */
@@ -180,14 +185,18 @@ static void model_load(Model*m,Gguf*g,int nt){
     else m->lm=lin_new(m->tok_embd,m->vocab,d); /* tied */
     fprintf(stderr,"done\n");
     m->L=malloc(m->nl*sizeof(Layer));
-    for(int l=0;l<m->nl;l++){ char nm[64]; Layer*ly=&m->L[l]; double lt=now();
+    /* requant is embarrassingly parallel over layers. main() pinned us to hart 8, so widen affinity
+     * to the 8 X100 cores first (A100 harts need the /proc unlock for affinity; X100 needs none). */
+    { cpu_set_t s; CPU_ZERO(&s); for(int i=0;i<8;i++)CPU_SET(i,&s); sched_setaffinity(0,sizeof(s),&s); }
+    volatile int _done=0;
+    #pragma omp parallel for schedule(dynamic) num_threads(8)
+    for(int l=0;l<m->nl;l++){ char nm[64]; Layer*ly=&m->L[l];
         #define DQ(suf) ({ snprintf(nm,64,"blk.%d.%s",l,suf); gguf_dequant(g,nm); })
         #define LN(suf,N,K) ({ snprintf(nm,64,"blk.%d.%s",l,suf); float*w=gguf_dequant(g,nm); Lin lin=lin_new(w,N,K); free(w); lin; })
         ly->attn_norm=DQ("attn_norm.weight"); ly->ffn_norm=DQ("ffn_norm.weight");
         ly->q_norm=DQ("attn_q_norm.weight"); ly->k_norm=DQ("attn_k_norm.weight");
         ly->q=LN("attn_q.weight",qd,d); ly->k=LN("attn_k.weight",kvd,d); ly->v=LN("attn_v.weight",kvd,d); ly->o=LN("attn_output.weight",d,qd);
         ly->router=DQ("ffn_gate_inp.weight"); /* [ne, d] fp32 */
-        /* experts: stacked 3D [in, moe, ne] (gate/up), [moe(in), d(out), ne] (down). Extract per-expert. */
         ly->eg=malloc(ne*sizeof(Lin)); ly->eu=malloc(ne*sizeof(Lin)); ly->ed=malloc(ne*sizeof(Lin));
         snprintf(nm,64,"blk.%d.ffn_gate_exps.weight",l); TInfo*tg=gguf_find(g,nm);
         snprintf(nm,64,"blk.%d.ffn_up_exps.weight",l);   TInfo*tu=gguf_find(g,nm);
@@ -199,7 +208,10 @@ static void model_load(Model*m,Gguf*g,int nt){
             gguf_dequant_into(g,td,(size_t)e*d*moe,(size_t)d*moe,ed); ly->ed[e]=lin_new(ed,d,moe);
         }
         free(eg);free(eu);free(ed);
-        fprintf(stderr,"\rpacked layer %d/%d (%.1fs)   ",l+1,m->nl,now()-lt);
+        #pragma omp atomic
+        _done++;
+        #pragma omp critical
+        { fprintf(stderr,"\rrequant %d/%d layers",_done,m->nl); }
     }
     fprintf(stderr,"\n");
 }
@@ -218,10 +230,15 @@ static void cache_save(Model*m,const char*path){
         fwrite(ly->q_norm,4,m->hd,f); fwrite(ly->k_norm,4,m->hd,f); fwrite(ly->router,4,(size_t)m->n_exp*m->d,f);
         wlin(f,&ly->q); wlin(f,&ly->k); wlin(f,&ly->v); wlin(f,&ly->o);
         for(int e=0;e<m->n_exp;e++){ wlin(f,&ly->eg[e]); wlin(f,&ly->eu[e]); wlin(f,&ly->ed[e]); } }
-    fclose(f);
+    fwrite("ENDIMEC",1,8,f); /* footer: proves the write completed (truncated/sshfs writes lack it) */
+    if(fflush(f)||fclose(f)) fprintf(stderr,"cache write error\n");
 }
 static int cache_load(Model*m,const char*path,int nt){
-    FILE*f=fopen(path,"rb"); if(!f) return 0; char mg[4]; fread(mg,1,4,f); if(memcmp(mg,"IMEC",4)){fclose(f);return 0;}
+    FILE*f=fopen(path,"rb"); if(!f) return 0;
+    char mg[4]; if(fread(mg,1,4,f)!=4 || memcmp(mg,"IMEC",4)){fclose(f);return 0;}
+    /* integrity: require the completion footer at EOF (rejects truncated/partial caches) */
+    char foot[8]; if(fseek(f,-8,SEEK_END)||fread(foot,1,8,f)!=8||memcmp(foot,"ENDIMEC",8)){ fprintf(stderr,"cache incomplete/corrupt -> requant\n"); fclose(f); return 0; }
+    fseek(f,4,SEEK_SET);
     int ver; fread(&ver,4,1,f); int hdr[9]; fread(hdr,4,9,f); m->d=hdr[0];m->nl=hdr[1];m->nh=hdr[2];m->nkv=hdr[3];m->hd=hdr[4];m->vocab=hdr[5];m->n_exp=hdr[6];m->n_act=hdr[7];m->moe=hdr[8];
     fread(&m->rope_base,4,1,f); fread(&m->eps,4,1,f); m->nt=nt;
     m->tok_embd=malloc((size_t)m->vocab*m->d*4); fread(m->tok_embd,4,(size_t)m->vocab*m->d,f);
@@ -242,6 +259,7 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
                     float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*g,float*u,float*eout,int8_t*xt){
     int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,qd=nh*hd,kvd=nkv*hd,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
     static float*h=NULL; if(!h)h=malloc(d*4); memcpy(h,m->tok_embd+(size_t)tok*d,d*4);
+    double _f0=gT_on?now():0, _a0=gT_actpack,_l0=gT_lin,_at0=gT_attn;
     for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
         rmsnorm(hn,h,ly->attn_norm,d,m->eps);
         lin_mm(&ly->q,hn,q,nt,xt); lin_mm(&ly->k,hn,k,nt,xt); lin_mm(&ly->v,hn,vv,nt,xt);
@@ -249,11 +267,12 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         for(int hh=0;hh<nkv;hh++){ rmsnorm(k+hh*hd,k+hh*hd,ly->k_norm,hd,m->eps); rope(k+hh*hd,hd,pos,m->rope_base); }
         float*Kc=kv->Kc+(size_t)l*kv->ctx*kvd,*Vc=kv->Vc+(size_t)l*kv->ctx*kvd;
         memcpy(Kc+(size_t)pos*kvd,k,kvd*4); memcpy(Vc+(size_t)pos*kvd,vv,kvd*4);
-        float scale=1.0f/sqrtf(hd);
+        float scale=1.0f/sqrtf(hd); double _at=gT_on?now():0;
         for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q+hh*hd,*sc=tmp;
             for(int j=0;j<=pos;j++){ float*kj=Kc+(size_t)j*kvd+kvh*hd,dd=0; for(int t=0;t<hd;t++)dd+=qh[t]*kj[t]; sc[j]=dd*scale; }
             softmax(sc,pos+1); float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
             for(int j=0;j<=pos;j++){ float w=sc[j],*vj=Vc+(size_t)j*kvd+kvh*hd; for(int t=0;t<hd;t++)oh[t]+=w*vj[t]; } }
+        if(gT_on) gT_attn += now()-_at;
         lin_mm(&ly->o,att,tmp,nt,xt); for(int i=0;i<d;i++)h[i]+=tmp[i];
         /* ---- MoE FFN ---- */
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
@@ -271,6 +290,7 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         for(int i=0;i<d;i++)h[i]+=eout[i];
     }
     rmsnorm(hn,h,m->out_norm,d,m->eps); lin_mm(&m->lm,hn,logits,nt,xt);
+    if(gT_on){ double ft=now()-_f0; gT_rest += ft-(gT_actpack-_a0)-(gT_lin-_l0)-(gT_attn-_at0); gT_tok++; }
 }
 static int argmax(const float*l,int n){ int b=0; float bv=l[0]; for(int i=1;i<n;i++)if(l[i]>bv){bv=l[i];b=i;} return b; }
 
@@ -292,7 +312,7 @@ int main(int c,char**v){
     Gguf g; double t0=now(); gguf_open(&g,v[1]);
     fprintf(stderr,"qwen3moe: %d layers d=%d experts=%d/%d moe_ffn=%d heads=%d/%d hd=%d vocab=%d (parse %.1fs)\n",
         g.block_count,g.embd,g.n_exp,g.n_act,g.moe_ffn,g.nh,g.nkv,g.hd,g.vocab,now()-t0);
-    const char*cpath=(c>4)?v[4]:"/mnt/jupiter2/qwen3-30b-a3b.imecache";
+    const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.imecache"; /* LOCAL disk = ~40s reload (sshfs/NAS is ~13min) */
     Model m; double tl=now(); int cached=0;
     if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
     else {
@@ -323,9 +343,13 @@ int main(int c,char**v){
     printf("\nfirst argmax: %d ('",first); tok_print(&g,first); printf("')  expect 26194 (' Tokyo') -> %s\n", first==26194?"PASS":"FAIL");
     printf("prefill %.2fs (%d tok)\n",now()-tp,np);
     printf("generation  : "); for(int i=0;i<np;i++)tok_print(&g,prompt[i]); tok_print(&g,first);
-    int cur=first; double tg=now();
+    int cur=first; double tg=now(); gT_on=1;
     for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,xt); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
-    double dt=now()-tg; printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, IME-2 int4 W4A8, nt=%d)\n", ngen/dt, nt);
+    double dt=now()-tg; gT_on=0;
+    printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, IME-2 int4 W4A8, nt=%d)\n", ngen/dt, nt);
+    if(gT_tok) printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel+fold) %.1f | attention %.1f | rest %.1f | sum %.1f | wall %.1f\n",
+        gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rest/gT_tok*1e3,
+        (gT_actpack+gT_lin+gT_attn+gT_rest)/gT_tok*1e3, dt/ngen*1e3);
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;
 }
