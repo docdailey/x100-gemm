@@ -83,10 +83,11 @@ static void ukernel_8x64(const int8_t*A,const int8_t*B,int Kb,int32_t*ctmp){
            "v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory");
 }
 
-/* scatter 8x8 int32 tile (row-major contiguous) into C[MxN] at (mb,nb) */
-static void store_tile(int32_t*C,int Nt,int mb,int nb,const int32_t*t){
+/* scatter 8x8 int32 tile (row-major contiguous) into C[MxN] at (mb,nb); acc: += vs = */
+static void store_tile(int32_t*C,int Nt,int mb,int nb,const int32_t*t,int acc){
     for(int r=0;r<M0;r++){ int32_t*row=C+(size_t)(mb*M0+r)*Nt+(size_t)nb*N0;
-        for(int c=0;c<N0;c++) row[c]=t[r*N0+c]; }
+        if(acc) for(int c=0;c<N0;c++) row[c]+=t[r*N0+c];
+        else    for(int c=0;c<N0;c++) row[c] =t[r*N0+c]; }
 }
 
 void gemm_ime2_i8_st(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_t*C){
@@ -96,7 +97,7 @@ void gemm_ime2_i8_st(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_
     int32_t ctmp[NRB*N0*N0];
     for(int ng=0;ng<Ng;ng++)for(int mb=0;mb<Mb;mb++){
         ukernel_8x64(pa+(mb*Kb)*TILE, pb+(ng*Kb)*NRB*TILE, Kb, ctmp);
-        for(int g=0;g<NRB;g++) store_tile(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0);
+        for(int g=0;g<NRB;g++) store_tile(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0,0);
     }
 }
 
@@ -105,6 +106,13 @@ void gemm_ime2_i8_st(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_
  * sweeps all its M-blocks -> B read from DRAM once per (thread,ng). */
 void gemm_ime2_i8_mt(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_t*C,int nthreads){
     int Mb=Mt/M0, Kb=Kt/K0, Ng=Nt/NR;
+    /* K-blocking knob (env KC, in K-elements). DEFAULT = full K (no blocking): measured best,
+     * because kc0-outer K-blocking forces C read-modify-write K/KC times and the scalar C store
+     * is already ~36% of runtime -> C-RMW traffic swamps the L1-residency gain (KC=512 halved
+     * throughput, KC=128 cratered it). Fix the store to a cheap vectorized path BEFORE revisiting
+     * small-KC blocking. See docs/HARDWARE.md ceiling analysis. */
+    int KC = Kt; { const char*e=getenv("KC"); if(e) KC=atoi(e); }
+    int KCb = KC/K0; if(KCb<1) KCb=1; if(KCb>Kb) KCb=Kb;
     #pragma omp parallel num_threads(nthreads)
     {
         int tn=0;
@@ -116,9 +124,13 @@ void gemm_ime2_i8_mt(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_
         for(int i=0;i<5;i++) sched_yield();
         int32_t ctmp[NRB*N0*N0];
         for(int ng=0;ng<Ng;ng++)
-            for(int mb=tn; mb<Mb; mb+=nthreads){
-                ukernel_8x64(pa+(mb*Kb)*TILE, pb+(ng*Kb)*NRB*TILE, Kb, ctmp);
-                for(int g=0;g<NRB;g++) store_tile(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0);
+            for(int kc0=0; kc0<Kb; kc0+=KCb){
+                int kk = (kc0+KCb<=Kb)? KCb : (Kb-kc0);
+                int acc = (kc0>0);
+                for(int mb=tn; mb<Mb; mb+=nthreads){
+                    ukernel_8x64(pa+((size_t)mb*Kb+kc0)*TILE, pb+((size_t)(ng*Kb+kc0)*NRB)*TILE, kk, ctmp);
+                    for(int g=0;g<NRB;g++) store_tile(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0,acc);
+                }
             }
     }
 }

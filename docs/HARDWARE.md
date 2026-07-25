@@ -49,19 +49,39 @@ is what matters; a lone core nearly saturates its unit. This is **~16× the X100
 On the **dying battery bank**, ≥4 cores at full tilt brown-out rebooted the board. On a **proper supply
 it is rock-solid** through 8-core / 16-thread runs at ~12 W. Not a thermal or software limit.
 
-## Memory
-- 64-bit **LPDDR5-6400, 51 GB/s peak** [spec], 32 GB. Measured CPU-load BW **~19.7 GB/s read / ~23
-  prefetched / ~19 copy** (38–45% of peak).
-- **3 MB TCM** (`/dev/tcm`, phys 0x0, 8×384KB, direct-mmap) — per-core IME staging via `libspine_tcm.so`.
-- Weight pool = **plain DRAM** (transparent hugepage). Fancier backends want `/dev/hugetlb_1g`
-  (ioctl `HUGETLB_1G_IOC_ALLOC`) + `/dev/tcm_sync_mem` — **neither exists on this board** → why
-  llama.cpp needed `SPACEMIT_DISABLE_TCM=1`.
+## Memory (measured, single A100 core unless noted)
+- 64-bit **LPDDR5-6400, 51 GB/s peak** [spec], 32 GB. Dependency-free read BW **20.8 GB/s** (1 core),
+  write 30.6; ~19-23 aggregate under multi-core load.
+- Caches: **L1D 64 KB, L2 1 MB per A100 core** (X100: L2 4 MB). Line 64 B.
+- **3 MB TCM** (`/dev/tcm`, direct-mmap) is **UNCACHED device memory** — CPU read **0.41 GB/s** (write 4.8,
+  latency 56 ns). Fast SRAM, but only usable at speed via the IME port / ai_dma, NOT CPU `vle8`. **Not a
+  CPU-feed lever.** (`/dev/hugetlb_1g`, `/dev/tcm_sync_mem` don't exist here → llama.cpp's `DISABLE_TCM=1`.)
+
+## GEMM ceiling — register-fed peak is NOT reachable by real matmul
+The 14.6 TOPS peak loads operands **once into registers** and loops — zero per-op memory traffic. Real GEMM
+reloads operands every K-step, and **`vle8`-from-cache is the wall**. Measured microkernel throughput vs
+where its working set lives (`bench/ime2_l1_ceiling.c`, 8 threads):
+
+| working set | location | TOPS |
+|---|---|---|
+| 18 KB | **L1** | **2.3** |
+| 72 KB | L1/L2 edge | 2.5 |
+| 576 KB | L2 | 0.38 |
+| 4.6 MB | DRAM | 0.37 |
+
+So the **realistic int8 GEMM ceiling is ~2.3 TOPS** (L1-resident), with a hard cliff to ~0.38 on L1 spill.
+Current `src/gemm_ime2_i8.c`: **0.97 TOPS @2048³** (8-accumulator, `C==CRef`), L1-overflow because a full-K
+microkernel tile streams ~144 KB. **The scalar C store is ~36% of runtime** (0.71 vs 1.11 no-store) and is
+the current blocker: naive K-blocking to shrink the working set forces C read-modify-write K/KC times, and
+that C-store traffic *swamps* the L1 gain (KC=512 halved throughput). **Fix order: (1) cheap vectorized C
+store, then (2) MN-blocking with C held in registers across full K.** Above ~2.3 TOPS needs the ai_dma/IME
+feed path, not CPU `vle8`.
 
 ## Levers for the custom engine (revised, in priority order)
 1. **Feed the 4 IME-2 units** — pin 1 thread per unit (harts 8/10/12/14) + 8-accumulator microkernel.
-   Compute is unlocked: **~14.6 TOPS int8 @ 12W, proven.**
-2. **Exact-tile int8/int4 packing** — 8×8×16 tiles; the shipped kernel is i2×i8 (2-bit weights) for 4×
-   weight density → less decode bandwidth pressure. int4 path is the route toward the 60-TOPS ceiling.
-3. **TCM staging** (`/dev/tcm` + libspine_tcm) to feed the units without the 19–23 GB/s DRAM wall.
+   Register-fed compute is **~14.6 TOPS int8 @ 12W, proven**; L1-fed GEMM realistically **~2.3 TOPS**.
+2. **Cheap store + MN cache blocking** — the path from the current 0.97 → ~2.3 TOPS (see GEMM section).
+3. **int4 / i2×i8 weights** — 8×8×16 tiles; shipped kernel packs 2-bit weights for 4× density → less
+   decode bandwidth pressure (do int8 solid first, then drop the same kernels to int4/Q4).
 4. **Decode stays bandwidth-bound** — dense-27B ceiling ≈ 3.4 t/s @ 51 GB/s; big-model speed needs
    MoE + speculative/MTP layered on the now-unlocked compute.
