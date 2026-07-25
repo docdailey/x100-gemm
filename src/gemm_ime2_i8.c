@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sched.h>
+#include <riscv_vector.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -89,6 +90,14 @@ static void store_tile(int32_t*C,int Nt,int mb,int nb,const int32_t*t,int acc){
         if(acc) for(int c=0;c<N0;c++) row[c]+=t[r*N0+c];
         else    for(int c=0;c<N0;c++) row[c] =t[r*N0+c]; }
 }
+/* experiment: per-row RVV vector write-back (vl=8) instead of scalar scatter */
+static void store_tile_v(int32_t*C,int Nt,int mb,int nb,const int32_t*t,int acc){
+    for(int r=0;r<M0;r++){ int32_t*row=C+(size_t)(mb*M0+r)*Nt+(size_t)nb*N0;
+        vint32m1_t v=__riscv_vle32_v_i32m1(t+r*N0,N0);
+        if(acc){ vint32m1_t o=__riscv_vle32_v_i32m1(row,N0); v=__riscv_vadd_vv_i32m1(v,o,N0); }
+        __riscv_vse32_v_i32m1(row,v,N0);
+    }
+}
 
 void gemm_ime2_i8_st(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_t*C){
     bind_ai(); { cpu_set_t s; CPU_ZERO(&s); CPU_SET(8,&s); sched_setaffinity(0,sizeof(s),&s); }
@@ -127,9 +136,11 @@ void gemm_ime2_i8_mt(int Mt,int Nt,int Kt,const int8_t*pa,const int8_t*pb,int32_
             for(int kc0=0; kc0<Kb; kc0+=KCb){
                 int kk = (kc0+KCb<=Kb)? KCb : (Kb-kc0);
                 int acc = (kc0>0);
+                int usev = getenv("SCALARSTORE")==NULL;   /* default: vector write-back */
                 for(int mb=tn; mb<Mb; mb+=nthreads){
                     ukernel_8x64(pa+((size_t)mb*Kb+kc0)*TILE, pb+((size_t)(ng*Kb+kc0)*NRB)*TILE, kk, ctmp);
-                    for(int g=0;g<NRB;g++) store_tile(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0,acc);
+                    if(usev) for(int g=0;g<NRB;g++) store_tile_v(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0,acc);
+                    else     for(int g=0;g<NRB;g++) store_tile(C,Nt,mb,ng*NRB+g,ctmp+g*N0*N0,acc);
                 }
             }
     }
