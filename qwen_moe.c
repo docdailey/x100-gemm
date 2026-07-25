@@ -43,42 +43,48 @@ static void pack_w_int4(int Nt,int Kt,const int8_t*W,uint8_t*Wq){
         for(int j=0;j<TILE;j++) d[j]=(uint8_t)((t0[j]&0xf)|((t1[j]&0xf)<<4));
     }
 }
-__attribute__((optimize("no-tree-vectorize","no-stack-protector")))
-static void gemv_nb_int4(const int8_t*xt,const uint8_t*Wq,int Kb,int32_t*ct){
+/* per-GROUP int4 (group=32=one interleaved iteration, matches Q4_0): each group writes its 8x8
+ * int32 partial so a per-(output,group) scale can be applied — per-channel int4 is too lossy. */
+__attribute__((noinline,optimize("no-tree-vectorize","no-stack-protector")))
+static void gemv_nb_int4_grouped(const int8_t*xt,const uint8_t*Wq,int Kb,int32_t*part){
     long Kp=Kb/2;
     __asm__ volatile(
+        "vsetvli t0,zero,e8,m1\n\t"
+        "1:\n\t"
         "vsetvli t0,zero,e32,m2\n\t vxor.vv v28,v28,v28\n\t vxor.vv v30,v30,v30\n\t"
         "vsetvli t0,zero,e8,m1\n\t"
-        "1:\n\t vle8.v v0,(%0)\n\t addi %0,%0,128\n\t vle8.v v2,(%0)\n\t addi %0,%0,128\n\t"
+        "vle8.v v0,(%0)\n\t addi %0,%0,128\n\t vle8.v v2,(%0)\n\t addi %0,%0,128\n\t"
         "vle8.v v4,(%1)\n\t addi %1,%1,128\n\t"
         "vsll.vi v5,v4,4\n\t vsra.vi v5,v5,4\n\t vsra.vi v6,v4,4\n\t"
         "vmadot v28,v0,v5\n\t vmadot v30,v2,v6\n\t"
+        "vsetvli t0,zero,e32,m2\n\t vadd.vv v28,v28,v30\n\t vse32.v v28,(%3)\n\t addi %3,%3,256\n\t"
         "addi %2,%2,-1\n\t bnez %2,1b\n\t"
-        "vsetvli t0,zero,e32,m2\n\t vadd.vv v28,v28,v30\n\t vse32.v v28,(%3)\n\t"
-        : "+r"(xt),"+r"(Wq),"+r"(Kp) : "r"(ct) : "t0","v0","v2","v4","v5","v6","v28","v29","v30","v31","memory");
+        : "+r"(xt),"+r"(Wq),"+r"(Kp),"+r"(part) : : "t0","v0","v2","v4","v5","v6","v28","v29","v30","v31","memory");
 }
-/* int4 linear: per-output-channel int4 weights (packed) + scale */
-typedef struct { int N,K; uint8_t*Wq; float*ws; } Lin;
+#define GRP 32
+typedef struct { int N,K,Kp; uint8_t*Wq; float*gs; } Lin;  /* gs[N*Kp] per-(out,group) scale */
 static Lin lin_new(const float*wf32,int N,int K){
-    Lin l; l.N=N; l.K=K; int Nb=N/N0,Kb=K/K0;
-    int8_t*wi=malloc((size_t)N*K); l.ws=malloc((size_t)N*4);
-    for(int r=0;r<N;r++){ const float*row=wf32+(size_t)r*K; float amax=1e-6f;
-        for(int c=0;c<K;c++){ float a=fabsf(row[c]); if(a>amax)amax=a; }
-        float s=amax/7.0f; l.ws[r]=s; float inv=1.0f/s;
-        for(int c=0;c<K;c++){ int q=(int)lrintf(row[c]*inv); q=q>7?7:(q<-7?-7:q); wi[(size_t)r*K+c]=(int8_t)q; } }
+    Lin l; l.N=N; l.K=K; int Nb=N/N0,Kb=K/K0,Kp=Kb/2; l.Kp=Kp;
+    int8_t*wi=malloc((size_t)N*K); l.gs=malloc((size_t)N*Kp*4);
+    for(int r=0;r<N;r++){ const float*row=wf32+(size_t)r*K;
+        for(int gp=0;gp<Kp;gp++){ float amax=1e-6f; int c0=gp*GRP;
+            for(int c=c0;c<c0+GRP;c++){ float a=fabsf(row[c]); if(a>amax)amax=a; }
+            float s=amax/7.0f; l.gs[(size_t)r*Kp+gp]=s; float inv=1.0f/s;
+            for(int c=c0;c<c0+GRP;c++){ int q=(int)lrintf(row[c]*inv); q=q>7?7:(q<-7?-7:q); wi[(size_t)r*K+c]=(int8_t)q; } } }
     l.Wq=malloc((size_t)Nb*Kb*QTILE); pack_w_int4(N,K,wi,l.Wq); free(wi); return l;
 }
-__attribute__((optimize("no-tree-vectorize","no-stack-protector")))
 static void lin_mm(const Lin*l,const float*x,float*y,int nt,int8_t*xt){
-    int Nb=l->N/N0, Kb=l->K/K0, kb=Kb;
+    int Nb=l->N/N0, Kb=l->K/K0, Kp=l->Kp, kb=Kb;
     float amax=1e-6f; for(int i=0;i<l->K;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float xs=amax/127.0f, inv=1.0f/xs;
     memset(xt,0,(size_t)kb*TILE);
     for(int c=0;c<l->K;c++){ int q=(int)lrintf(x[c]*inv); q=q>127?127:(q<-128?-128:q); xt[(c/K0)*TILE+(c%K0)]=(int8_t)q; }
     #pragma omp parallel num_threads(nt)
-    { int tn=omp_get_thread_num(); pin_once(tn); int32_t ct[64];
-      for(int nb=tn;nb<Nb;nb+=nt){ gemv_nb_int4(xt, l->Wq+(size_t)nb*Kb*QTILE, Kb, ct);
-          for(int n=0;n<N0;n++) y[nb*N0+n]=(float)ct[n]*l->ws[nb*N0+n]*xs; } }
+    { int tn=omp_get_thread_num(); pin_once(tn); int32_t*part=malloc((size_t)Kp*64*4);
+      for(int nb=tn;nb<Nb;nb+=nt){ gemv_nb_int4_grouped(xt, l->Wq+(size_t)nb*Kb*QTILE, Kb, part);
+          for(int n=0;n<N0;n++){ int out=nb*N0+n; const float*gsr=l->gs+(size_t)out*Kp; float acc=0;
+              for(int gp=0;gp<Kp;gp++) acc+=(float)part[gp*64+n]*gsr[gp]; y[out]=acc*xs; } }
+      free(part); }
 }
 
 /* ===================== GGUF reader (mmap; Q4_0/Q4_1/Q8_0/F32/F16) ===================== */
@@ -126,6 +132,7 @@ static void gguf_open(Gguf*g,const char*path){
     g->vocab=0; for(int i=0;i<g->nt;i++) if(strcmp(g->t[i].name,"token_embd.weight")==0) g->vocab=g->t[i].dims[1];
 }
 static TInfo* gguf_find(Gguf*g,const char*name){ for(int i=0;i<g->nt;i++) if(strcmp(g->t[i].name,name)==0) return &g->t[i]; printf("missing %s\n",name); exit(1); }
+static int gguf_has(Gguf*g,const char*name){ for(int i=0;i<g->nt;i++) if(strcmp(g->t[i].name,name)==0) return 1; return 0; }
 /* dequant `n` elems starting at element `elem0` of a tensor into out (caller-alloc'd n floats) */
 static void gguf_dequant_into(Gguf*g,TInfo*ti,size_t elem0,size_t n,float*out){
     unsigned char*base=g->p+g->data_start+ti->off;
@@ -139,6 +146,16 @@ static void gguf_dequant_into(Gguf*g,TInfo*ti,size_t elem0,size_t n,float*out){
         for(int j=0;j<32 && bl*32+j<n;j++){ int nib=(j<16)?(qs[j]&0xf):(qs[j-16]>>4); out[bl*32+j]=(nib-8)*d; } } return; }
     if(ti->typ==3){ for(size_t bl=0;bl<nb;bl++){ unsigned char*q=base+(bl0+bl)*20; float d=f16f(*(uint16_t*)q),m=f16f(*(uint16_t*)(q+2)); unsigned char*qs=q+4;
         for(int j=0;j<32 && bl*32+j<n;j++){ int nib=(j<16)?(qs[j]&0xf):(qs[j-16]>>4); out[bl*32+j]=nib*d+m; } } return; }
+    if(ti->typ==14){ /* Q6_K, super-block 256 (210 bytes). Only whole-tensor (elem0==0). */
+        size_t nbk=(n+255)/256;
+        for(size_t sb=0;sb<nbk;sb++){ unsigned char*blk=base+sb*210; unsigned char*ql=blk,*qh=blk+128; int8_t*sc=(int8_t*)(blk+192);
+            float d=f16f(*(uint16_t*)(blk+208)); float*y=out+sb*256;
+            for(int h=0;h<2;h++){ unsigned char*qlh=ql+h*64,*qhh=qh+h*32; int8_t*sch=sc+h*8; float*yh=y+h*128;
+                for(int l=0;l<32;l++){ int is=l/16;
+                    int q1=((qlh[l]&0xF)|(((qhh[l]>>0)&3)<<4))-32, q2=((qlh[l+32]&0xF)|(((qhh[l]>>2)&3)<<4))-32;
+                    int q3=((qlh[l]>>4)|(((qhh[l]>>4)&3)<<4))-32, q4=((qlh[l+32]>>4)|(((qhh[l]>>6)&3)<<4))-32;
+                    yh[l]=d*sch[is]*q1; yh[l+32]=d*sch[is+2]*q2; yh[l+64]=d*sch[is+4]*q3; yh[l+96]=d*sch[is+6]*q4; } } }
+        return; }
     printf("dequant type %u unsupported (%s)\n",ti->typ,ti->name); exit(1);
 }
 static float* gguf_dequant(Gguf*g,const char*name){ TInfo*ti=gguf_find(g,name); size_t total=1; for(int d=0;d<ti->nd;d++)total*=ti->dims[d];
@@ -158,7 +175,10 @@ static void model_load(Model*m,Gguf*g,int nt){
     int qd=m->nh*m->hd, kvd=m->nkv*m->hd, d=m->d, moe=m->moe, ne=m->n_exp;
     fprintf(stderr,"packing token_embd + lm_head (int4) ... "); fflush(stderr);
     m->tok_embd=gguf_dequant(g,"token_embd.weight"); m->out_norm=gguf_dequant(g,"output_norm.weight");
-    m->lm=lin_new(m->tok_embd,m->vocab,d); fprintf(stderr,"done\n");
+    if(gguf_has(g,"output.weight")){ float*ow=gguf_dequant(g,"output.weight"); m->lm=lin_new(ow,m->vocab,d); free(ow);
+        fprintf(stderr,"(untied lm_head from output.weight) "); }
+    else m->lm=lin_new(m->tok_embd,m->vocab,d); /* tied */
+    fprintf(stderr,"done\n");
     m->L=malloc(m->nl*sizeof(Layer));
     for(int l=0;l<m->nl;l++){ char nm[64]; Layer*ly=&m->L[l]; double lt=now();
         #define DQ(suf) ({ snprintf(nm,64,"blk.%d.%s",l,suf); gguf_dequant(g,nm); })
@@ -182,6 +202,39 @@ static void model_load(Model*m,Gguf*g,int nt){
         fprintf(stderr,"\rpacked layer %d/%d (%.1fs)   ",l+1,m->nl,now()-lt);
     }
     fprintf(stderr,"\n");
+}
+
+/* ===================== requant cache (skip the ~15-min requant on reruns) ===================== */
+static void wlin(FILE*f,Lin*l){ int Nb=l->N/N0,Kb=l->K/K0; fwrite(&l->N,4,1,f); fwrite(&l->K,4,1,f); fwrite(&l->Kp,4,1,f);
+    fwrite(l->Wq,1,(size_t)Nb*Kb*QTILE,f); fwrite(l->gs,4,(size_t)l->N*l->Kp,f); }
+static Lin rlin(FILE*f){ Lin l; fread(&l.N,4,1,f); fread(&l.K,4,1,f); fread(&l.Kp,4,1,f); int Nb=l.N/N0,Kb=l.K/K0;
+    l.Wq=malloc((size_t)Nb*Kb*QTILE); fread(l.Wq,1,(size_t)Nb*Kb*QTILE,f); l.gs=malloc((size_t)l.N*l.Kp*4); fread(l.gs,4,(size_t)l.N*l.Kp,f); return l; }
+static void cache_save(Model*m,const char*path){
+    FILE*f=fopen(path,"wb"); if(!f){fprintf(stderr,"cache write fail\n");return;}
+    int hdr[9]={m->d,m->nl,m->nh,m->nkv,m->hd,m->vocab,m->n_exp,m->n_act,m->moe}; fwrite("IMEC",1,4,f); int ver=1; fwrite(&ver,4,1,f);
+    fwrite(hdr,4,9,f); fwrite(&m->rope_base,4,1,f); fwrite(&m->eps,4,1,f);
+    fwrite(m->tok_embd,4,(size_t)m->vocab*m->d,f); fwrite(m->out_norm,4,m->d,f); wlin(f,&m->lm);
+    for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l]; fwrite(ly->attn_norm,4,m->d,f); fwrite(ly->ffn_norm,4,m->d,f);
+        fwrite(ly->q_norm,4,m->hd,f); fwrite(ly->k_norm,4,m->hd,f); fwrite(ly->router,4,(size_t)m->n_exp*m->d,f);
+        wlin(f,&ly->q); wlin(f,&ly->k); wlin(f,&ly->v); wlin(f,&ly->o);
+        for(int e=0;e<m->n_exp;e++){ wlin(f,&ly->eg[e]); wlin(f,&ly->eu[e]); wlin(f,&ly->ed[e]); } }
+    fclose(f);
+}
+static int cache_load(Model*m,const char*path,int nt){
+    FILE*f=fopen(path,"rb"); if(!f) return 0; char mg[4]; fread(mg,1,4,f); if(memcmp(mg,"IMEC",4)){fclose(f);return 0;}
+    int ver; fread(&ver,4,1,f); int hdr[9]; fread(hdr,4,9,f); m->d=hdr[0];m->nl=hdr[1];m->nh=hdr[2];m->nkv=hdr[3];m->hd=hdr[4];m->vocab=hdr[5];m->n_exp=hdr[6];m->n_act=hdr[7];m->moe=hdr[8];
+    fread(&m->rope_base,4,1,f); fread(&m->eps,4,1,f); m->nt=nt;
+    m->tok_embd=malloc((size_t)m->vocab*m->d*4); fread(m->tok_embd,4,(size_t)m->vocab*m->d,f);
+    m->out_norm=malloc((size_t)m->d*4); fread(m->out_norm,4,m->d,f); m->lm=rlin(f);
+    m->L=malloc(m->nl*sizeof(Layer));
+    for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
+        ly->attn_norm=malloc(m->d*4); fread(ly->attn_norm,4,m->d,f); ly->ffn_norm=malloc(m->d*4); fread(ly->ffn_norm,4,m->d,f);
+        ly->q_norm=malloc(m->hd*4); fread(ly->q_norm,4,m->hd,f); ly->k_norm=malloc(m->hd*4); fread(ly->k_norm,4,m->hd,f);
+        ly->router=malloc((size_t)m->n_exp*m->d*4); fread(ly->router,4,(size_t)m->n_exp*m->d,f);
+        ly->q=rlin(f); ly->k=rlin(f); ly->v=rlin(f); ly->o=rlin(f);
+        ly->eg=malloc(m->n_exp*sizeof(Lin)); ly->eu=malloc(m->n_exp*sizeof(Lin)); ly->ed=malloc(m->n_exp*sizeof(Lin));
+        for(int e=0;e<m->n_exp;e++){ ly->eg[e]=rlin(f); ly->eu[e]=rlin(f); ly->ed[e]=rlin(f); } }
+    fclose(f); return 1;
 }
 
 typedef struct { float*Kc,*Vc; int kvd,ctx; } Kv;
@@ -239,7 +292,23 @@ int main(int c,char**v){
     Gguf g; double t0=now(); gguf_open(&g,v[1]);
     fprintf(stderr,"qwen3moe: %d layers d=%d experts=%d/%d moe_ffn=%d heads=%d/%d hd=%d vocab=%d (parse %.1fs)\n",
         g.block_count,g.embd,g.n_exp,g.n_act,g.moe_ffn,g.nh,g.nkv,g.hd,g.vocab,now()-t0);
-    Model m; double tl=now(); model_load(&m,&g,nt); fprintf(stderr,"loaded in %.1fs\n",now()-tl);
+    const char*cpath=(c>4)?v[4]:"/mnt/jupiter2/qwen3-30b-a3b.imecache";
+    Model m; double tl=now(); int cached=0;
+    if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
+    else {
+      /* early dequant sanity: Q4_0 gate + Q4_1 down + Q6_K output of blk.0 (catches dequant bugs in <1s) */
+      { TInfo*tg=gguf_find(&g,"blk.0.ffn_gate_exps.weight"); size_t N=(size_t)g.moe_ffn*g.embd; float*t=malloc(N*4);
+        gguf_dequant_into(&g,tg,0,N,t); double mn=0,sd=0; for(size_t i=0;i<N;i++)mn+=t[i]; mn/=N;
+        for(size_t i=0;i<N;i++)sd+=(t[i]-mn)*(t[i]-mn); sd=sqrt(sd/N);
+        fprintf(stderr,"[dequant] gate_exps e0 (Q4_0 t=%u): mean=%.4f std=%.4f\n",tg->typ,mn,sd);
+        TInfo*td=gguf_find(&g,"blk.0.ffn_down_exps.weight"); size_t Md=(size_t)g.embd*g.moe_ffn;
+        gguf_dequant_into(&g,td,0,Md,t); mn=0; for(size_t i=0;i<Md;i++)mn+=t[i]; mn/=Md; sd=0; for(size_t i=0;i<Md;i++)sd+=(t[i]-mn)*(t[i]-mn); sd=sqrt(sd/Md);
+        fprintf(stderr,"[dequant] down_exps e0 (Q4_1 t=%u): mean=%.4f std=%.4f\n",td->typ,mn,sd); free(t);
+        if(gguf_has(&g,"output.weight")){ TInfo*to=gguf_find(&g,"output.weight"); float*t2=malloc(25600*4); gguf_dequant_into(&g,to,0,25600,t2);
+            double m2=0,s2=0; for(int i=0;i<25600;i++)m2+=t2[i]; m2/=25600; for(int i=0;i<25600;i++)s2+=(t2[i]-m2)*(t2[i]-m2); s2=sqrt(s2/25600);
+            fprintf(stderr,"[dequant] output.weight (Q6_K t=%u): mean=%.4f std=%.4f  (UNTIED lm_head)\n",to->typ,m2,s2); free(t2); } }
+      model_load(&m,&g,nt); fprintf(stderr,"requant loaded in %.1fs\n",now()-tl);
+    }
 
     int ctx=64; Kv kv; kv.kvd=m.nkv*m.hd; kv.ctx=ctx; kv.Kc=calloc((size_t)m.nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m.nl*ctx*kv.kvd,4);
     int d=m.d,qd=m.nh*m.hd,moe=m.moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
@@ -257,5 +326,6 @@ int main(int c,char**v){
     int cur=first; double tg=now();
     for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,xt); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
     double dt=now()-tg; printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, IME-2 int4 W4A8, nt=%d)\n", ngen/dt, nt);
+    if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;
 }
