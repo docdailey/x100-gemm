@@ -44,3 +44,15 @@ grep -oiE "vmadot[a-z]*|vmv|vle8|vsetvli|\.insn|\.word 0x[0-9a-f]+" /tmp/ep.s | 
 - Only `vmadot`/`vmadotsu` in the hot loop  → same register-fed path; 2.3 TOPS is the real ceiling;
   ai_dma just moves DRAM→TCM to cut CPU cost / feed private BW (helps decode, not prefill compute).
 - A distinct custom matrix op with memory/TCM operands → the mem-direct datapath; replicate it.
+
+## RESULTS (2026-07-25, board @192.168.68.88 home LAN)
+- **Vendor EP int8 2048³ (DynamicQuantizeMatMul): ~2.79 TOPS** (162 inf/s, 6.15 ms), **CPU usage 110% (~1 core)**.
+  => The matmul is OFFLOADED to the ai_dma/IME accelerator; CPU nearly idle. My 8-core-vmadot (0.97 TOPS,
+  ~800% CPU) is the WRONG paradigm. FORK #1 verdict: **no 14-60 TOPS for real matmul; ~2.8 is the ceiling**
+  (60 TOPS = peak/register-fed marketing).
+- **ABI (strace):** opens /dev/tcm(×2, O_RDWR|O_SYNC), /dev/aidma_list, /dev/ai_dma, /dev/dma_msi.
+  /dev/tcm ioctls: magic 0x63('c'), nr 0x7=query(_IOC_READ,4B), nr 0x9=acquire(_IOC_READ|WRITE,4B, 8× = per
+  block). /dev/dma_msi: _IOC_NONE (irq). ai_dma SUBMISSION = mmap'd ring/doorbell (no per-transfer syscalls)
+  -> needs objdump of libspacemit_ep.so to fully recover.
+- **STRATEGIC FORK:** (A) RE the ai_dma ring -> custom offload engine (huge, ceiling ~2.8), or (B) USE the
+  vendor EP for matmul offload + build value at decode/MoE/MTP/scheduling. Recommend B.
