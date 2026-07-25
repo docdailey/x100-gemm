@@ -13,9 +13,16 @@ A/B: vendor is **6.66x faster** at identical N32K256 work (`research_feed_paths.
 same GGUF/model/forward()/attention, only the GEMV+weight-pack layer swapped to the vendor shape.
 New cache format (`IMEC` ver=2, path `qwen3-30b-a3b.hp.imecache`, incompatible with the old cache).
 All this model's Lin shapes are exact multiples of 256(K)/32(N) — no remainder handling needed.
-**Status when last checked: first full requant + coherence + tok/s run in progress on the board**
-(background job, `/root/qwen_moe_hp`). Check research_feed_paths.md §12 "A5 (real)" row for the
-outcome — update it (and this doc) with real numbers once it lands, don't leave it "in progress" stale.
+**RESULT (2026-07-26): 6.19 tok/s, ' Tokyo' PASS, coherent — 4.16x over our 1.49 tok/s baseline.**
+Still below the real vendor binary (11.71-12.89 tok/s). Requant into the new format is slow
+(~18.4 min vs ~2 min old format — real cost, not yet optimized). **The buckets tell the story**:
+`linear(kernel)` dropped 575.9→38.4ms (15x, matches the A3 hot-timing prediction) but `rest`
+exploded to 100.3ms = 62% of wall (was 9%). This is OpenMP fork-join overhead — `lin_mm_hp` opens
+a fresh `#pragma omp parallel` team per Lin call (29/layer x 48 layers = 1392 spawns/token), and
+now that the kernel itself is ~446ns/call that fixed spawn cost dominates. **Next: persistent
+thread pool** (codex_recs_1.md §17 PR8, "if still warranted" — now warranted, with data). Rough
+projection if fork-join overhead collapses: ~60ms/tok from kernel+attn+pack alone → ~16 tok/s,
+which would **beat** the vendor binary. Full detail in `research_feed_paths.md` §12, "A5 (real)" row.
 
 ## Headline status
 - **Qwen3-30B-A3B MoE runs COHERENT on the K3 IME-2**, pure C: prompt → ' Tokyo' PASS;

@@ -975,3 +975,68 @@ copy) emits RVV that collides with the asm's vector state → heap corruption. A
 the identical object miscompiles under **rustc static-link with -fPIC** (unbounded
 loop); pure gcc `-fno-pie`/non-PIC is correct. Prefer building these engines as
 standalone C (Python via ctypes), not linked into a rustc PIE.
+
+## 22. Findings — Path A vendor kernel, ported, verified, integrated (2026-07-26)
+
+Picked up the §21.4 branch decision: research_feed_paths.md Path A (vendor-shaped N32 int4
+kernel), following its A1-A5 probe plan.
+
+### 22.1 A1-A4: port the real kernel, not a guess
+
+First attempt (`gemm_kernel_i8i4_m1`, hand-paired with a guessed A-pack from the kernel's own
+inline comments) executed without crashing but was **unverified** — single-element hardware
+probes disproved the naive zero-point hypothesis, then surfaced that the reference file
+(`reference/spacemit-backend/ime2_kernels.cpp`, 5768 lines) has multiple kernel/pack variant
+pairs and the wrong two had been paired. Traced `ime.cpp`'s actual dispatch (Q4_0/Q4_1,
+INTER_SIZE==256, count_m<4) to the real chain: `gemm_kernel_i8i4_hp` → **`gemm_kernel_i8i4_hp_m1`**
+— a materially different kernel (scale-fusion baked into the dot instruction via a packed operand,
+fp16 accumulation) — paired with the real `quantize_a_row_i8_hp` (A) and `make_block_q4_0x32` (B).
+Root cause of the first mismatch: real B nibble-pairing is adjacent `{2j,2j+1}`, not the
+native-ggml `{j,j+16}` pairing assumed from reading the asm alone. **Faithfully transcribed +
+verified against an independent scalar dequant oracle: max rel diff 2.3%**, consistent with
+fp16-accumulation noise (`bench/vendor_ime_a2_full.c`). Hot kernel-only A/B at identical N32K256:
+vendor is **6.66x faster** than our `gemv_nb_int4_grouped` (`bench/vendor_ime_a2_full.c`'s timing
+section) — close enough to the ~8x full-token gap against the real vendor binary
+(research_feed_paths.md A5-equiv: 11.71-12.89 tok/s vs our 1.49) to confirm kernel
+microarchitecture, not ggml dispatch overhead, is what's worth chasing.
+
+Lesson for future kernel ports in this repo: reference source with `#if 0`/`#else` branches and
+multiple similarly-named functions is not reliable to hand-pair by reading comments — trace the
+actual dispatch call graph (or `objdump` the compiled `.so`) before trusting a port's correctness.
+"It executes without a SIGILL" is not "it's correct."
+
+### 22.2 A5: full engine integration (`qwen_moe_hp.c`)
+
+New file, not a modification of the working/committed `qwen_moe.c` — this repo's existing pattern
+of parallel engine variants (`qwen_ime.c`/`qwen_ime4.c`/`qwen_moe.c`) made a separate binary the
+natural "feature flag" split, so the original engine is never at risk. Same GGUF reader, model
+struct, `forward()`, attention, MoE routing, and the §21 P0.2 shared-activation-pack structure —
+only the GEMV+weight-pack layer changed. New incompatible cache format (`IMEC` ver=2). All of this
+model's Lin shapes (d=2048, qd=4096, kvd=512, moe_ffn=768, vocab=151936) are exact multiples of
+256(K)/32(N) — zero remainder/padding handling needed anywhere.
+
+**Result on the real 30B-A3B model, nt=4: 6.19 tok/s, `' Tokyo'` PASS, coherent generation
+matching the original engine exactly. 4.16x over the 1.49 tok/s baseline**, though still below
+the real vendor binary's 11.71-12.89. Requant into the new format is slow (**1104.5s / ~18.4
+min**, vs ~2 min for the old format's simpler pack) — a real, not-yet-optimized cost from the
+extra fp16 conversions and 8-subblock nesting per weight group.
+
+### 22.3 The buckets found the next bottleneck, unprompted
+
+| | act-pack | linear(kernel) | attention | rest | wall |
+|---|---|---|---|---|---|
+| Old engine (§21, post-P0.2/P0.3) | 17.2ms | 575.9ms | 16.7ms | 59.7ms (9%) | 670.5ms |
+| New engine (HP kernel) | 5.1ms | **38.4ms** | 16.8ms | **100.3ms (62%)** | 161.6ms |
+
+`linear(kernel)` fell 15x, exactly matching the A3 hot-timing prediction. But `rest` grew both
+in absolute terms and as a share of wall-clock — now the dominant cost. Almost certainly OpenMP
+fork-join overhead: `lin_mm_hp` opens a fresh `#pragma omp parallel` team per `Lin` call (29/layer
+x 48 layers = 1392 team spawns per token), and now that the kernel itself is ~446ns/call, that
+fixed per-spawn cost dominates. This is precisely **§17 PR8's exit criterion** ("implement only if
+profiling still attributes material time to scheduling") — now met, with real numbers instead of
+a guess. Rough projection if that overhead collapses: ~60ms/token from kernel+attention+pack alone
+→ ~16 tok/s, which would **beat** the vendor binary's 12.89 tok/s, not just close the gap.
+
+Not yet done: PR8 itself (persistent thread pool spanning multiple/all `Lin` calls instead of
+per-call `#pragma omp parallel`), and speeding up the new format's slow requant. Stopping here
+per the same working rule as §21.4 — this is the next branch decision, not an auto-advance.
