@@ -1,6 +1,21 @@
 # PROGRESS — K3 pure-C IME-2 decode engine (session log, live)
 
-Last update: 2026-07-25. Durable state so work survives a session kill.
+Last update: 2026-07-26. Durable state so work survives a session kill.
+
+## Path A — vendor kernel port (2026-07-26, IN FLIGHT)
+Chased the ~8x gap found against the real vendor binary (research_feed_paths.md A5-equiv:
+11.71-12.89 tok/s vs our 1.49). Traced `ime.cpp`'s dispatch to the real M=1 kernel
+(`gemm_kernel_i8i4_hp_m1`, NOT the first-guess `gemm_kernel_i8i4_m1`), faithfully ported it +
+its two real pack routines, **verified correct** against an independent dequant oracle (max rel
+diff 2.3%, consistent with fp16 accumulation noise — `bench/vendor_ime_a2_full.c`). Hot kernel-only
+A/B: vendor is **6.66x faster** at identical N32K256 work (`research_feed_paths.md` §12, A1-A3, A5).
+**`qwen_moe_hp.c`** is the full engine integration (new file, NOT touching working `qwen_moe.c`) —
+same GGUF/model/forward()/attention, only the GEMV+weight-pack layer swapped to the vendor shape.
+New cache format (`IMEC` ver=2, path `qwen3-30b-a3b.hp.imecache`, incompatible with the old cache).
+All this model's Lin shapes are exact multiples of 256(K)/32(N) — no remainder handling needed.
+**Status when last checked: first full requant + coherence + tok/s run in progress on the board**
+(background job, `/root/qwen_moe_hp`). Check research_feed_paths.md §12 "A5 (real)" row for the
+outcome — update it (and this doc) with real numbers once it lands, don't leave it "in progress" stale.
 
 ## Headline status
 - **Qwen3-30B-A3B MoE runs COHERENT on the K3 IME-2**, pure C: prompt → ' Tokyo' PASS;
