@@ -1414,3 +1414,69 @@ Bucket ranking is now: `linear(kernel)` 58.6-58.7ms (~52% of wall, dominant) > `
 fixed) > `act-pack` 2.3ms (down from 17.4ms, no longer top-3) > `rope` 2.0ms > `rest(other)` 2.1ms.
 With attention and activation-packing both closed out, `linear(kernel)` is now the clear, sole
 largest bucket and hasn't been revisited since A3's hot-timing validation — the natural next target.
+
+### 22.11 Before optimizing `linear(kernel)`: checked "memory-bandwidth-bound" against a real number — it doesn't hold up
+
+Concurrently with this session's own investigation, subclass instrumentation landed in
+`qwen_moe_hp.c` (`g_lin_class`/`lin_add()`, partitioning the 58.6ms `linear(kernel)` bucket by
+consumer without touching the math) and found: **expert FFN (gate+up+down across 8 experts) is
+35.9ms — 61% of linear(kernel), the clear majority** — vs qkv 9.4ms (16%), o 7.6ms (13%), lm_head
+5.7ms (10%). The natural read: optimize the expert path.
+
+Before acting on that, worth checking the load-bearing assumption underneath it. This session has
+repeatedly reached for "memory-bandwidth-bound" as the explanation for why vectorization stalls
+out — the router's RVV pass only got 1.6x (§22.4), and nt=8 regressed vs nt=4 (§22.5) — and that
+framing was about to be used again to either justify or deprioritize expert-path work. It had never
+actually been checked against a real achievable-bandwidth number on this hardware.
+
+**`bench/ram_bw_probe.c`**: nt=4 threads, pinned exactly like production (harts 8,10,12,14,
+`bind_ai()`+`sched_setaffinity` per the §22.10 infra gotcha), each stream-read a private 256MB
+buffer (far larger than any cache level) for 4 passes. Result: **17.05 GB/s aggregate** (solo
+single-thread: 10.56 GB/s — notably the aggregate is only ~1.6x solo, so even a clean sequential
+pattern doesn't scale linearly past 1 thread on this board, a fact worth remembering on its own).
+
+Compared against `linear(kernel)`'s real per-token weight-byte volume — computed from `BREC`
+(576B/32×256 tile) × tile-count across q/k/v/o and all 8 selected experts' gate/up/down, summed
+across 48 layers — **191.1 MB/token**. At 58.5ms (nt=4), that's **3.26 GB/s effective: only 19% of
+the measured 17.05 GB/s ceiling.**
+
+**Isolated the per-thread-scaling question directly**, not just inferred from the aggregate: reran
+the real engine at nt=1 (no pool, no multi-thread contention at all). Result: `linear(kernel)`
+169.8ms → **1.13 GB/s**, closely matching A3's original isolated-kernel rate (446.4ns/call for a
+576B tile ≈ 1.29 GB/s) — reassuring, not a new/contradictory number, just confirmation the nt=1
+path is behaving as expected. But nt=4's 58.5ms is only a **2.90x speedup over nt=1, not the ~4x**
+a compute-bound, unit-per-thread workload should give — and nt=4 already assigns one thread to
+each of the 4 physical IME-2 units with zero unit-sharing (unlike nt=8, which puts two harts on
+each shared unit — the well-understood, different cause of *that* regression, per §22.5).
+
+**Conclusion: DRAM-controller bandwidth is not the limiter — 81% of the measured streaming-read
+ceiling sits unused while `linear(kernel)` runs.** The "memory-bandwidth-bound" framing, while
+correctly ruling out nt=8 and explaining why the router's RVV pass had a low ceiling, does **not**
+explain the sub-linear nt=1→nt=4 scaling seen here, and citing it again to wave off further
+expert-path work would be exactly the kind of unmeasured guess this file has flagged as a repeat
+mistake before (§22.6's premature "router not worth pursuing," the two timing-boundary bugs).
+Candidate explanations for the actual gap, none yet isolated:
+
+1. **Pool-dispatch/synchronization overhead**, accumulating over ~1392 small `Lin` calls/token —
+   each dispatch round-trip (generation-counter bump, worker spin-wake, per-panel work, done-flag
+   spin-wait) has some fixed cost that a large aggregate byte-count measurement doesn't separate
+   out from real memory/compute time.
+2. **Real per-call access is far less favorable than a clean 256MB stream** — each `Lin`'s `B`
+   buffer is a separate, independently-`malloc`'d region (via `lin_new_hp`), so every call boundary
+   is a cold start for the DRAM row buffer / hardware prefetcher, unlike the probe's one long
+   uninterrupted stream per thread. Per-thread chunks are also small (e.g. an expert's `eg`:
+   ~27.6KB/thread/call at nt=4) — row-buffer-friendly streaming has much less runway to help before
+   the next call jumps somewhere else in the heap.
+3. **The kernel's own fp16-accumulation compute path may be the real per-thread ceiling**, not the
+   memory fetch feeding it — A3's original framing ("kernel microarchitecture is the dominant
+   factor, not ggml dispatch/threading overhead," when comparing against the custom q4-in-q8
+   kernel) was about relative kernel efficiency, not an absolute bandwidth statement, and may still
+   be closer to the truth than the "bandwidth-bound" language that got applied to it later.
+
+**Not resolved here — deliberately left as an open, well-defined question rather than a guessed
+fix.** The next step has to isolate dispatch-wait time from kernel-execution time (e.g. a separate
+timer around just the pool's spin-wait-for-done, vs. a timer around a single unpooled direct kernel
+call at realistic per-thread chunk sizes) before any change to the dispatch pool or the kernel
+itself can be justified by more than intuition. `linear(kernel)`'s 58.5ms bucket, and its expert-FFN
+majority (61%, from the concurrent subclass work), stand as the confirmed target — *how* to close
+the gap to the vendor binary's 11.71-12.89 tok/s is still open.

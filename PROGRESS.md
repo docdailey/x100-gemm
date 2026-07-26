@@ -56,6 +56,42 @@ hart with the wrong VLEN — a probe result contradicting the real hardware, not
 with context) > `act-pack` 2.3ms (down from 17.4ms — no longer a top-3 bucket) > `rope` 2.0ms >
 `rest(other)` 2.1ms.
 
+**Linear breakdown (2026-07-26, measure-first next step):** subclass timers partition the 58.6ms
+`linear(kernel)` bucket by consumer (same run: 9.24 tok/s, `' Tokyo'` PASS):
+
+| Subclass | ms/tok | % of linear | Notes |
+|----------|--------|-------------|-------|
+| **expert (gate+up+down)** | **35.9** | **61%** | Dominant — 8 experts × 3 Lins; next target |
+| qkv | 9.4 | 16% | 3 Lins, shared A pack (P0.2) |
+| o | 7.6 | 13% | 1 Lin + pack inside `lin_mm` |
+| lm_head | 5.7 | 10% | 1 Lin, N=vocab (large N, once/token) |
+| **sum** | **58.6** | 100% | Matches parent bucket exactly |
+
+Implication: residual vendor gap (~9.2 vs ~12 tok/s) is not evenly distributed — expert FFN
+weight stream is the majority of remaining linear time. Prefer expert-path scheduling / panel
+fusion / any vendor feed difference over more QKV/O micro-opts.
+
+**Follow-up check before touching the kernel (2026-07-26): is `linear(kernel)` actually
+memory-bandwidth-bound, or just assumed to be?** This session has repeatedly invoked "memory-
+bandwidth-bound" to explain the router's modest 1.6x RVV ceiling and nt=8's regression — worth
+checking against a real number before using it again to justify (or defer) expert-path work.
+`bench/ram_bw_probe.c`: real nt=4 concurrent sequential-read ceiling (harts 8,10,12,14, same
+pinning as production) is **17.05 GB/s**. `linear(kernel)` only achieves **3.26 GB/s effective
+(58.5ms for 191.1MB/tok) — 19% of that ceiling.** An nt=1 rerun of the real engine gives
+**1.13 GB/s** (consistent with A3's original 446.4ns/call kernel-only rate), so nt=4 is only a
+**2.90x speedup over nt=1, not 4x** — despite nt=4 already giving one thread per physical IME-2
+unit (no unit-sharing; nt=8's regression is the well-understood *different* case of 2 harts
+sharing each unit). **DRAM bandwidth is not the limiter here — 81% of the streaming-read ceiling
+sits idle.** The real cause of the sub-linear nt=1→nt=4 scaling is still open: candidates are
+pool-dispatch/sync overhead accumulating over ~1392 small Lin calls/token, each Lin's weight
+buffer being a separate small heap allocation (no row-buffer/prefetcher continuity between calls,
+unlike a clean 256MB streaming probe), or the kernel's own fp16-accumulation compute path being
+the real per-thread ceiling rather than the memory fetch. **This revises, not confirms,** the
+"memory-bandwidth-bound" framing used elsewhere in this doc — real headroom may exist, but the
+next step is isolating dispatch overhead from kernel-compute time (e.g. instrument the pool's
+wait-for-dispatch time separately from the kernel's own execution time), not a kernel rewrite on
+faith that more bandwidth is unreachable. See `research_feed_paths.md` §12 for the full writeup.
+
 **Router-as-quantized-Lin fp16 experiment — real result, but the "stop here" conclusion was
 premature (self-correction, flagged by review).** Weight-only fp16 (activation stays fp32),
 validated with an explicit expert-selection comparison (not just eyeballing coherence): 0/1344
@@ -294,9 +330,10 @@ See HEADLINE at the top of this doc — `qwen_moe_hp.c` is current, `qwen_moe.c`
    both now vectorized (9.2-14.7ms and 2.3ms respectively, see HEADLINE) — the "activation packing
    or attention" review item is fully closed. SwiGLU (14.0ms) is now the single largest
    fully-untouched bucket, deliberately deferred — needs quality validation beyond the
-   single-prompt coherence check before approximating `expf`/sigmoid. `linear(kernel)` (58.6-58.7ms,
-   ~52% of wall) is the biggest item overall and hasn't been revisited since A3's hot-timing
-   validation — the next natural target now that the other scalar buckets are cleared out.
+   single-prompt coherence check before approximating `expf`/sigmoid. `linear(kernel)` (58.6ms,
+   ~52% of wall) is now **subclassed**: expert FFN 35.9ms (61% of linear) dominates; qkv 9.4 /
+   o 7.6 / lm_head 5.7. Next work should target expert weight-stream / scheduling, not more QKV
+   polish. Instrumentation is in `qwen_moe_hp.c` (uncommitted at handoff).
 3. To run the router fp16-vs-fp32 validator again: pass a 6th CLI arg of `1` (e.g. `... 16 4
    /root/models/qwen3-30b-a3b.hp.imecache 1`) — adds a "router fp16-vs-fp32" summary line but
    roughly doubles the router bucket's cost (computes both paths), so leave it off (`0` or omit)

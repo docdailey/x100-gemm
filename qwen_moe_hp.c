@@ -373,6 +373,20 @@ static void pack_act_i8(const float*x,int K,uint8_t*Abuf){
     int Kg=K/32; for(int kg=0;kg<Kg;kg++) pack_A_i8(x+kg*32, Abuf+(size_t)kg*38);
 }
 static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0, gT_rope=0, gT_router=0, gT_swiglu=0; static long gT_tok=0; static int gT_on=0;
+/* linear(kernel) subclass breakdown (codex synthesis + PROGRESS next step): total gT_lin stays
+ * the rest-accounting sink; these four partition it by consumer so we can see whether residual
+ * vendor gap lives in QKV, O, expert FFN (gate/up/down), or lm_head. */
+static double gT_lin_qkv=0, gT_lin_o=0, gT_lin_exp=0, gT_lin_lm=0;
+enum { LIN_NONE=0, LIN_QKV, LIN_O, LIN_EXP, LIN_LM };
+static int g_lin_class=LIN_NONE;
+static void lin_add(double d){
+    if(!gT_on) return;
+    gT_lin+=d;
+    if(g_lin_class==LIN_QKV) gT_lin_qkv+=d;
+    else if(g_lin_class==LIN_O) gT_lin_o+=d;
+    else if(g_lin_class==LIN_EXP) gT_lin_exp+=d;
+    else if(g_lin_class==LIN_LM) gT_lin_lm+=d;
+}
 /* router precision validation counters (research_feed_paths.md router-quantization experiments) */
 /* separate counters per experimental mode so one validate run reports both int4-vs-fp32 and
  * int8-vs-fp32 quality independently -- directly answers "which tradeoff is better" */
@@ -445,7 +459,7 @@ static void lin_mm(const Lin*l,const float*x,float*y,int nt,uint8_t*Abuf){
     pack_act_hp(x,l->K,Abuf);
     double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
     lin_mm_hp(l,Abuf,y,nt);
-    if(gT_on) gT_lin+=now()-_tb;
+    if(gT_on) lin_add(now()-_tb);
 }
 
 /* ===================== GGUF reader (mmap; Q4_0/Q4_1/Q8_0/F32/F16) — unchanged from qwen_moe.c ===================== */
@@ -661,8 +675,9 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         rmsnorm(hn,h,ly->attn_norm,d,m->eps);
         { double _ta=gT_on?now():0; pack_act_hp(hn,d,Abuf2);
           double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
+          g_lin_class=LIN_QKV;
           lin_mm_hp(&ly->q,Abuf2,q,nt); lin_mm_hp(&ly->k,Abuf2,k,nt); lin_mm_hp(&ly->v,Abuf2,vv,nt);
-          if(gT_on) gT_lin+=now()-_tb; }
+          if(gT_on) lin_add(now()-_tb); g_lin_class=LIN_NONE; }
         { double _tr=gT_on?now():0;
           for(int hh=0;hh<nh;hh++){ rmsnorm(q+hh*hd,q+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q+hh*hd,hd,cosb,sinb); }
           for(int hh=0;hh<nkv;hh++){ rmsnorm(k+hh*hd,k+hh*hd,ly->k_norm,hd,m->eps); rope_apply(k+hh*hd,hd,cosb,sinb); }
@@ -675,7 +690,8 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
             softmax(sc,pos+1); float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
             for(int j=0;j<=pos;j++){ float*vj=Vc+(size_t)j*kvd+kvh*hd; vaxpy_f32(oh,vj,sc[j],hd); } }
         if(gT_on) gT_attn += now()-_at;
-        lin_mm(&ly->o,att,tmp,nt,Abuf); for(int i=0;i<d;i++)h[i]+=tmp[i];
+        g_lin_class=LIN_O; lin_mm(&ly->o,att,tmp,nt,Abuf); g_lin_class=LIN_NONE;
+        for(int i=0;i<d;i++)h[i]+=tmp[i];
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
         /* router precision mode (codex_recs_1.md §22.7-22.8): fp32 is the DEFAULT (exact, matches
          * the original engine). int4 HP-Lin: 33% faster router-bucket but 58.9% of routing
@@ -722,16 +738,20 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         }
         for(int i=0;i<d;i++)eout[i]=0;
           for(int a=0;a<na;a++){ int e=sel[a]; float w=sw[a];
+              g_lin_class=LIN_EXP;
               double _tb=gT_on?now():0;
               lin_mm_hp(&ly->eg[e],Abuf2,g,nt); lin_mm_hp(&ly->eu[e],Abuf2,u,nt);
-              if(gT_on) gT_lin+=now()-_tb;
+              if(gT_on) lin_add(now()-_tb);
               double _ts=gT_on?now():0;
               for(int i=0;i<moe;i++){ float x=g[i]; g[i]=(x/(1.0f+expf(-x)))*u[i]; }
               if(gT_on) gT_swiglu+=now()-_ts;
-              lin_mm(&ly->ed[e],g,tmp,nt,Abuf); for(int i=0;i<d;i++)eout[i]+=w*tmp[i]; } }
+              lin_mm(&ly->ed[e],g,tmp,nt,Abuf); /* attributes to gT_lin_exp via g_lin_class */
+              g_lin_class=LIN_NONE;
+              for(int i=0;i<d;i++)eout[i]+=w*tmp[i]; } }
         for(int i=0;i<d;i++)h[i]+=eout[i];
     } }
-    rmsnorm(hn,h,m->out_norm,d,m->eps); lin_mm(&m->lm,hn,logits,nt,Abuf);
+    rmsnorm(hn,h,m->out_norm,d,m->eps);
+    g_lin_class=LIN_LM; lin_mm(&m->lm,hn,logits,nt,Abuf); g_lin_class=LIN_NONE;
     if(gT_on){ double ft=now()-_f0; gT_rest += ft-(gT_actpack-_a0)-(gT_lin-_l0)-(gT_attn-_at0)-(gT_rope-_r0)-(gT_router-_ro0)-(gT_swiglu-_sw0); gT_tok++; }
 }
 static int argmax(const float*l,int n){ int b=0; float bv=l[0]; for(int i=1;i<n;i++)if(l[i]>bv){bv=l[i];b=i;} return b; }
@@ -780,9 +800,14 @@ int main(int c,char**v){
     double dt=now()-tg; gT_on=0;
     const char*router_names[]={"fp32(default)","int4-HP(experimental)","int8-M1(experimental)"};
     printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, vendor IME-2-HP int4 W4A8, nt=%d, router=%s)\n", ngen/dt, nt, router_names[g_router_mode]);
-    if(gT_tok) printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rope+qknorm %.1f | router %.1f | swiglu %.1f | rest(other) %.1f | sum %.1f | wall %.1f\n",
-        gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rope/gT_tok*1e3, gT_router/gT_tok*1e3, gT_swiglu/gT_tok*1e3, gT_rest/gT_tok*1e3,
-        (gT_actpack+gT_lin+gT_attn+gT_rope+gT_router+gT_swiglu+gT_rest)/gT_tok*1e3, dt/ngen*1e3);
+    if(gT_tok){
+        printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rope+qknorm %.1f | router %.1f | swiglu %.1f | rest(other) %.1f | sum %.1f | wall %.1f\n",
+            gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rope/gT_tok*1e3, gT_router/gT_tok*1e3, gT_swiglu/gT_tok*1e3, gT_rest/gT_tok*1e3,
+            (gT_actpack+gT_lin+gT_attn+gT_rope+gT_router+gT_swiglu+gT_rest)/gT_tok*1e3, dt/ngen*1e3);
+        printf("  linear breakdown (avg/%ld tok, ms): qkv %.1f | o %.1f | expert(gate/up/down) %.1f | lm_head %.1f | sum %.1f\n",
+            gT_tok, gT_lin_qkv/gT_tok*1e3, gT_lin_o/gT_tok*1e3, gT_lin_exp/gT_tok*1e3, gT_lin_lm/gT_tok*1e3,
+            (gT_lin_qkv+gT_lin_o+gT_lin_exp+gT_lin_lm)/gT_tok*1e3);
+    }
     if(g_router_validate){
         printf("  router int4-HP-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
             g_rtr_cmp, g_rtr_hp_mismatch, g_rtr_hp_mismatch?(double)g_rtr_hp_diffcount/g_rtr_hp_mismatch:0.0, m.n_act, g_rtr_hp_maxabs, g_rtr_hp_maxrel);
