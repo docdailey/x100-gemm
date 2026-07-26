@@ -1145,13 +1145,22 @@ gotchas" (PROGRESS.md) as general lessons for any future RVV code in this file:
    the matching-width load, verified against `gemm_kernel_i8i4_hp_m1`'s already-proven ordering.
 
 **Result after both fixes**: `' Tokyo'` PASS, identical generation. Validation: **0/1344
-expert-set mismatches** (12 prefill + 16 decode positions x 48 layers), max abs/rel logit delta
-0.00000 vs the fp32 reference. **But the router bucket didn't move — 18.6ms fp16 vs 18.7ms fp32.**
-This disconfirms the pure-bytes-streamed/bandwidth-saturation theory (halving weight bytes should
-help if that were the bottleneck) and points at per-iteration loop-carried latency in the
-single-threaded (not pool-parallelized) sequential computation as the real constraint instead.
+expert-set mismatches** (12 prefill + 16 decode positions x 48 layers) vs the fp32 reference.
+Logit deltas were reported at `%.5f` (0.00000) — that precision can mask real differences; treat
+"0.00000" as "small" not "zero" until re-measured in scientific notation. **The router bucket
+didn't move — 18.6ms fp16 vs 18.7ms fp32.**
 
-**Conclusion: do not pursue W4 router.** Quality would likely hold up there too, but with zero
-speed benefit already from fp16, further byte reduction is very unlikely to help — the bottleneck
-isn't weight size. Kept the fp16 path in the codebase (validated, harmless, real if small memory
-saving: 512KB vs 1MB/layer) rather than reverting for zero net change.
+**Self-correction (flagged in review): the "stop here" conclusion this section originally reached
+was premature and has been retracted.** Two problems with it: (1) this experiment used a
+standalone hand-written `vdot_f16w_f32a`, run **single-threaded on the main thread only** — not
+the actual `lin_mm_hp`/pool-dispatch path (nt=4, parallel across N32 panels) every other `Lin` in
+this engine goes through. A real HP-format router `Lin`, packed the same way as q/k/v/etc. and run
+through `lin_mm_hp`, would get both the proven ~446ns/call kernel (A3) *and* multi-threading —
+neither of which this test exercised. (2) "Loop-carried latency is the bottleneck" was written as
+a finding but is an **unverified hypothesis** — it was never isolated (e.g. via independent
+accumulators, or by actually threading the comparison). **Do not treat W4/HP-router as closed.**
+Real next step: pack router weights in the real HP `Lin` format, run through `lin_mm_hp`, and
+compare all router logits + top-8 sets + full generation + timing against fp32 — only conclude
+"not worth it" if that apples-to-apples test also shows no material improvement. Kept the fp16
+path in the codebase regardless (validated at the granularity tested, harmless, real if small
+memory saving: 512KB vs 1MB/layer).

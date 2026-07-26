@@ -18,15 +18,21 @@ memory-bandwidth-bound workload, more threads just adds bus contention, see belo
 `router`≈`attention` 18.7ms each > `act-pack` 17.3ms > `swiglu` 14.2ms (untouched) > `rope` 2.0ms
 > `rest(other)` 2.2ms (confirms the bucket split is essentially complete).
 
-**Done, not just tried: router-as-quantized-Lin fp16 experiment.** Weight-only fp16 (activation
-stays fp32), validated with an explicit expert-selection comparison (not just eyeballing
-coherence): 0/1344 expert-set mismatches (12 prefill + 16 decode positions x 48 layers), max
-logit delta 0.00000 vs the fp32 reference. Routing is NOT sensitive to fp16 weight precision here.
-**But no speedup** — router bucket unchanged (18.6ms fp16 vs 18.7ms fp32) — disconfirms pure
-bytes-streamed/bandwidth-saturation as the bottleneck; looks like per-iteration loop-carried
-latency in the single-threaded sequential computation instead. **Conclusion: do not pursue W4
-router** — even if quality held up too, zero speed benefit from fp16 means further byte reduction
-is very unlikely to help. Kept in the codebase (validated, harmless, real if small memory saving).
+**Router-as-quantized-Lin fp16 experiment — real result, but the "stop here" conclusion was
+premature (self-correction, flagged by review).** Weight-only fp16 (activation stays fp32),
+validated with an explicit expert-selection comparison (not just eyeballing coherence): 0/1344
+expert-set mismatches (12 prefill + 16 decode positions x 48 layers) vs the fp32 reference —
+routing is not sensitive to fp16 weight precision, at least at that granularity (logit deltas were
+printed at `%.5f`, which can round small-but-real differences to `0.00000` — re-report in
+scientific notation before treating that as "no difference"). **But router bucket didn't move**
+(18.6ms fp16 vs 18.7ms fp32). **Caveat that matters**: this used a standalone hand-written
+`vdot_f16w_f32a`, single-threaded on the main thread — NOT the actual `lin_mm_hp`/pool-dispatch
+path (nt=4 parallel across N32 panels) every other `Lin` in this engine runs through. "Loop-carried
+latency is the bottleneck" was stated as a finding but is still an **unverified hypothesis** — it
+was never isolated (e.g. multiple independent accumulators, or actual threading). **Do not treat
+W4 router as closed.** Real next step: pack router weights in the real HP `Lin` format and run
+through `lin_mm_hp` for a true apples-to-apples comparison (multi-threaded, the proven ~446ns/call
+kernel) — only conclude "not worth it" if THAT test also shows no material improvement.
 Found and fixed two real toolchain bugs along the way (see "Toolchain gotchas" below) — worth
 reading before writing any more RVV code in this file.
 
