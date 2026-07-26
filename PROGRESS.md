@@ -2,15 +2,19 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 9.5-9.9 tok/s (default config)
+## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config)
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
-untouched) for comparison. `qwen_moe_hp.c` is now **~6.4-6.6x faster** at its actual default
-config (int8-M1 router + exact SiLU), same correctness bar (`' Tokyo'` PASS, coherent generation).
-An experimental flag (`g_swiglu_fast=1`, hard-swish) reaches 11.49-11.5 tok/s (~7.7x) but was
-**promoted then retracted** the same day — see the dated entry below and
-`codex_recs_1.md` §22.19 before citing the higher number as current. **Build now REQUIRES
+untouched) for comparison. `qwen_moe_hp.c` is now **~7.6-7.8x faster** at its actual default config
+(int8-M1 router + rational-Padé SwiGLU), same correctness bar (`' Tokyo'` PASS, coherent
+generation, tokens identical to exact SiLU on the canonical prompt). An earlier experimental flag
+(`g_swiglu_fast=1`, hard-swish) reaches a similar 11.49-11.5 tok/s but was **promoted then
+retracted** the same day for a real quality regression (11.0% perplexity inflation at scale) — see
+`codex_recs_1.md` §22.19-20 — and stays rejected; do not re-promote it. The default SwiGLU mode is
+now `g_swiglu_fast=2` (rational-Padé), promoted 2026-07-26 after passing an expanded quality
+harness (§22.20) *and* a bounded production A/B (§22.21) — see the dated entries below. `0`
+(exact SiLU) remains available as an explicit revert flag. **Build now REQUIRES
 `-fno-tree-vectorize`** (see the toolchain-hardening entry below and the file's own header
 comment) — this is not optional, it's a correctness/performance fix, not a tuning knob.
 
@@ -27,7 +31,8 @@ int8-M1 with four promotion thresholds fixed in advance. **All four passed**: ro
 mismatch 6.1% (<10%), avg NLL delta -0.0034 nats/tok (<0.5), token divergence 2.1% (<15%), speed
 13.7% faster (>=10%). `g_router_mode=0` remains available as an explicit exact-fp32 revert flag;
 int4-HP (`g_router_mode=1`) remains rejected per §22.7, not promoted. SwiGLU approximation
-evaluation is the explicit next step, using the same harness, not yet started.
+evaluation followed the same harness — see the rational-Padé entries below; it is now **done**,
+not pending (hard-swish rejected, rational-Padé promoted).
 
 **Memory-corruption root-caused + systematic toolchain hardening (2026-07-26): router bucket
 16.2ms→4.4ms (int8 default), ~19ms→11.1ms (fp32), net 8.84-9.25→9.5-9.9 tok/s.** The `argv[7]`
@@ -92,8 +97,9 @@ exact-SiLU baseline, not only pairwise against the immediately-prior config; try
 polynomial/rational sigmoid approximation instead of a different function; re-threshold in
 perplexity-multiplier terms, not raw nats. None of this started yet.
 
-**Session cumulative from the original 1.49 tok/s baseline, at the actual current default: ~6.4-6.6x**
-(hard-swish's ~7.7x is not currently in effect).
+**Session cumulative from the original 1.49 tok/s baseline, at this point in the narrative
+(int8-M1 router + exact SiLU): ~6.4-6.6x** (hard-swish's ~7.7x is not currently in effect). Note:
+superseded by the rational-Padé promotion below — see the HEADLINE for the actual current figure.
 
 **Rational-SiLU evaluated on the board (2026-07-26) — PASSES every gate, hard-swish RE-CONFIRMED
 rejected, neither is promoted.** Added `g_swiglu_fast=2` (rational-Padé approximation of the actual
@@ -116,12 +122,29 @@ the teacher-forced check remains the deciding methodology. Free-running spot che
 rational-Padé's continuation tracks production's actual phrasing closely; hard-swish's diverges
 into a different narrative element. Full numbers in `codex_recs_1.md` §22.20.
 
-**No default changed.** `g_swiglu_fast` remains `0` (exact SiLU). `g_swiglu_fast=1` (hard-swish)
-stays rejected. `g_swiglu_fast=2` (rational-Padé) has now passed every harness gate administered
-but is deliberately **not promoted from this checkpoint** — the session's own standing discipline
-(a harness/probe pass still needs a production A/B before adoption, per the §22.14 scheduling
-precedent) hasn't been run for it yet, and promotion is being left to explicit confirmation rather
-than auto-applied.
+**No default changed at this checkpoint.** `g_swiglu_fast` remained `0` (exact SiLU) pending a
+production A/B — see the next entry, where that A/B was run and rational-Padé was promoted.
+
+**Rational-Padé production A/B — CONFIRMED, promoted to default (2026-07-26).** One bounded A/B,
+identical build/cache/prompt/router/thread-count/generation-length, varying only `g_swiglu_fast`
+(0 vs 2), two paired trials run interleaved to control for drift. **Exact SiLU: 9.55 & 9.92 tok/s
+(avg 9.735, swiglu bucket 17.7/14.0ms avg 15.85ms). Rational-Padé: 11.38 & 11.37 tok/s (avg
+11.375, swiglu bucket 1.2/1.3ms avg 1.25ms).** SwiGLU bucket reduction **92.1%**, exceeding the
+expected ~90%; wall time down 14.4% (14.8ms/token saved, close to the ~12.5ms/token estimate);
+tok/s **+16.8%, landing at 11.35-11.38 tok/s** — inside the predicted 11.0-11.4 tok/s range. Every
+other bucket (act-pack, linear-kernel, attention, rope+qknorm, router, rest, and the qkv/o/expert/
+lm_head breakdown) was statistically unchanged across all four runs (≤0.3ms deltas, run-to-run
+noise) — no regression anywhere else. All four runs `' Tokyo'` PASS, and **generated tokens were
+byte-identical** between exact and rational-Padé on the canonical prompt in every trial (stronger
+than "desirable but not required"). Keep-criterion met (the ~90% SwiGLU reduction transferred with
+no regression elsewhere) — **`g_swiglu_fast` production default promoted `0→2`**. `g_swiglu_fast=0`
+(exact SiLU) remains an explicit revert flag; `g_swiglu_fast=1` (hard-swish) stays rejected.
+Verified the promotion takes effect with *no* CLI arg at all (the real production invocation):
+`swiglu 1.4ms`, `11.35 tok/s`. Full trial table in `codex_recs_1.md` §22.21.
+
+**Session cumulative from the original 1.49 tok/s baseline, at the actual current default (int8-M1
+router + rational-Padé SwiGLU): ~7.6-7.8x**, now 11.37/11.71≈97.1% of the vendor binary's low
+`nt=4` endpoint and 11.37/12.89≈88.2% of its high `nt=8` endpoint (both stated).
 
 **Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
 Per the standing review item ("otherwise move to activation packing or attention"), reused the
@@ -526,18 +549,24 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
 - ~1.9GB/token / ~13 GB/s packed ≈ 150ms matmul; token is ~735ms → ~585ms glue = the P0 target (unconfirmed until buckets).
 
 ## Next-session quick start
-See HEADLINE at the top of this doc — `qwen_moe_hp.c` is current, `qwen_moe.c` is superseded.
+**This section predates the router/SwiGLU work below and is kept only for the CLI mechanics — its
+"Router: fp32 is default" / "SwiGLU deliberately deferred" claims are stale, see HEADLINE for the
+actual current state.** See HEADLINE at the top of this doc — `qwen_moe_hp.c` is current,
+`qwen_moe.c` is superseded.
 1. `ssh root@192.168.68.24` (static, wired); HP cache exists → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache` reloads in ~22s and prints buckets.
-2. Router: fp32 is the production default; int4-HP and int8-M1 are both real, validated, and kept
-   behind the `g_router_mode` experimental flag (7th CLI arg) — see HEADLINE and codex_recs_1.md
-   §22.7-22.8 for the full quality-vs-speed tradeoff on each. Attention and activation-packing are
-   both now vectorized (9.2-14.7ms and 2.3ms respectively, see HEADLINE) — the "activation packing
-   or attention" review item is fully closed. SwiGLU (14.0ms) is now the single largest
-   fully-untouched bucket, deliberately deferred — needs quality validation beyond the
-   single-prompt coherence check before approximating `expf`/sigmoid. `linear(kernel)` (58.6ms,
-   ~52% of wall) is now **subclassed**: expert FFN 35.9ms (61% of linear) dominates; qkv 9.4 /
-   o 7.6 / lm_head 5.7. Next work should target expert weight-stream / scheduling, not more QKV
-   polish. Instrumentation is in `qwen_moe_hp.c` (uncommitted at handoff).
+2. **Current defaults (2026-07-26): `g_router_mode=2` (int8-M1) and `g_swiglu_fast=2`
+   (rational-Padé)** — both promoted after passing quality harnesses and, for SwiGLU, a bounded
+   production A/B; see HEADLINE and codex_recs_1.md §22.15/§22.20/§22.21. `g_router_mode=0`
+   (fp32) and `g_swiglu_fast=0` (exact SiLU) remain available as explicit revert flags (7th/8th CLI
+   args); int4-HP (`g_router_mode=1`) and hard-swish (`g_swiglu_fast=1`) are both rejected, kept
+   only as experimental flags. Attention and activation-packing are both vectorized (9.0-9.2ms and
+   2.3-2.6ms respectively) — the "activation packing or attention" review item is fully closed.
+   `linear(kernel)` (58.7-58.9ms, ~67% of the current ~87ms wall) is now the dominant bucket and
+   is **subclassed**: expert FFN ~36ms (61% of linear) dominates; qkv 9.5 / o 7.6 / lm_head 5.7-5.8.
+   Next work, if resumed, should target expert weight-stream / scheduling, not more QKV polish —
+   see `research_feed_paths.md` §9's ranked agenda for the bandwidth-investigation branches already
+   explored (and one, blocked panel scheduling, that regressed in its own production A/B and was
+   reverted — §22.14).
 3. To run the router fp16-vs-fp32 validator again: pass a 6th CLI arg of `1` (e.g. `... 16 4
    /root/models/qwen3-30b-a3b.hp.imecache 1`) — adds a "router fp16-vs-fp32" summary line but
    roughly doubles the router bucket's cost (computes both paths), so leave it off (`0` or omit)

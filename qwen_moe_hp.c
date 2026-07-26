@@ -408,11 +408,12 @@ static long g_rtr_cmp=0;
 static long g_rtr_hp_mismatch=0, g_rtr_hp_diffcount=0; static float g_rtr_hp_maxabs=0, g_rtr_hp_maxrel=0;
 static long g_rtr_i8_mismatch=0, g_rtr_i8_diffcount=0; static float g_rtr_i8_maxabs=0, g_rtr_i8_maxrel=0;
 static int g_router_validate=0; /* set from main() via env/arg */
-/* router precision mode, EXPERIMENTAL, fp32 is the default: 0=fp32 (exact, matches the original
- * engine), 1=int4 HP-Lin (33% faster router bucket but 58.9% of routing decisions perturbed vs
- * fp32, avg 1.38/8 experts -- codex_recs_1.md §22.7), 2=int8 M1 (validated near-bit-exact
- * standalone, bench/vendor_ime_i8_full.c max rel diff 1e-5, but not yet measured for real
- * routing-quality impact on this model -- codex_recs_1.md §22.8). Set via 7th CLI arg. */
+/* router precision mode: 0=fp32 (exact, revert flag, matches the original engine), 1=int4 HP-Lin
+ * (33% faster router bucket but 58.9% of routing decisions perturbed vs fp32, avg 1.38/8 experts
+ * -- REJECTED, codex_recs_1.md §22.7), 2=int8 M1 (DEFAULT since 2026-07-26 -- passed the
+ * multi-prompt quality harness: 6.1% router mismatch, -0.0034 nats/tok NLL delta, 2.1% token
+ * divergence, 13.7% faster, all four pre-registered thresholds PASS -- codex_recs_1.md §22.15).
+ * Set via 7th CLI arg. */
 static int g_router_mode=0;
 
 /* PR8 (codex_recs_1.md §17/§22.3): with the vendor kernel at ~446ns/call, the ~1392 fresh
@@ -637,7 +638,7 @@ static void swiglu_ratsig_rvv(float*g,const float*u,int n){
         vy=__riscv_vfmul_vv_f32m1(vy,vu,vl);
         __riscv_vse32_v_f32m1(g+i,vy,vl); i+=vl; }
 }
-static int g_swiglu_fast=0; /* 0=exact(DEFAULT) 1=hard-swish(retracted, §22.19) 2=rational-Pade(new, §22.20) */
+static int g_swiglu_fast=0; /* 0=exact(revert flag) 1=hard-swish(REJECTED, §22.19-20 -- 11.0% perplexity inflation, fails the 5% gate) 2=rational-Pade(DEFAULT since 2026-07-26, §22.21 -- passed the full quality harness §22.20 AND a bounded production A/B: 9.7->11.4 tok/s, swiglu bucket -92.1%, identical tokens, no regression in any other bucket) */
 /* Router-as-HP-Lin experiment (research_feed_paths.md/codex_recs_1.md): router is itself a 128xd
  * Lin, same shape family as q/k/v/eg/eu/ed/lm. First attempt (retracted) hand-wrote a standalone
  * fp16-weight dot product run single-threaded on the main thread -- NOT representative of how
@@ -760,14 +761,14 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         g_lin_class=LIN_O; lin_mm(&ly->o,att,tmp,nt,Abuf); g_lin_class=LIN_NONE;
         for(int i=0;i<d;i++)h[i]+=tmp[i];
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
-        /* router precision mode (codex_recs_1.md §22.7-22.8): fp32 is the DEFAULT (exact, matches
-         * the original engine). int4 HP-Lin: 33% faster router-bucket but 58.9% of routing
-         * decisions get >=1/8 expert swapped vs fp32 (avg 1.38/8, usually a near-tie swap). int8
-         * M1: validated near-bit-exact standalone but real routing-quality impact not yet measured.
-         * Neither clears "keep only if quality holds" on its own yet -- both gated behind
-         * g_router_mode (0=fp32 default) until broader eval settles it. router shares its int4-HP
-         * activation pack with eg/eu below regardless of mode (same hn, same K=d) -- pack once,
-         * matching the P0.2 pattern used for q/k/v; int8 mode needs its own differently-shaped
+        /* router precision mode (codex_recs_1.md §22.7-22.8, §22.15): int8-M1 is the DEFAULT
+         * (g_router_mode=2) since 2026-07-26 -- passed the multi-prompt quality harness (6.1%
+         * mismatch, -0.0034 nats/tok NLL delta, 2.1% divergence, 13.7% faster, all thresholds PASS).
+         * int4 HP-Lin: 33% faster router-bucket but 58.9% of routing decisions get >=1/8 expert
+         * swapped vs fp32 (avg 1.38/8) -- REJECTED, stays behind g_router_mode=1. fp32
+         * (g_router_mode=0) remains available as an explicit exact revert flag. router shares its
+         * int4-HP activation pack with eg/eu below regardless of mode (same hn, same K=d) -- pack
+         * once, matching the P0.2 pattern used for q/k/v; int8 mode needs its own differently-shaped
          * activation pack, computed separately only when needed. */
         { double _ta=gT_on?now():0; pack_act_hp(hn,d,Abuf2);
           double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
@@ -918,12 +919,15 @@ static void harness_run_fp32(Model*m,const HarnessPrompt*hp,int*out_toks,float*o
         cur=argmax(logits,m->vocab); out_toks[s]=cur; out_selfnll[s]=harness_nll(logits,m->vocab,cur);
     }
 }
-/* SwiGLU evaluation (§22.18): reference generation under TODAY's production default (int8-M1
- * router, g_router_mode=2 -- NOT fp32/mode=0 like harness_run_fp32 above, which is the original
- * router-promotion ground truth, kept as-is for history) with exact SwiGLU. This is deliberately a
- * separate function rather than a parameterized reuse of harness_run_fp32: the SwiGLU question is
- * "does adding fast SwiGLU on top of what's already shipping cause a problem", not a re-litigation
- * of the router decision, so the reference must match current production exactly, router included. */
+/* SwiGLU evaluation (§22.18): reference generation under int8-M1 router (g_router_mode=2 -- NOT
+ * fp32/mode=0 like harness_run_fp32 above, which is the original router-promotion ground truth,
+ * kept as-is for history) with EXACT SwiGLU, hardcoded (g_swiglu_fast=0) regardless of whatever
+ * the CLI/production default currently is -- this is the fixed gold reference every SwiGLU
+ * candidate is measured against, so it must stay pinned to exact math even after §22.21 promoted
+ * rational-Pade to the production default. This is deliberately a separate function rather than a
+ * parameterized reuse of harness_run_fp32: the SwiGLU question is "does adding fast SwiGLU on top
+ * of what's already shipping cause a problem", not a re-litigation of the router decision, so the
+ * router must match current production exactly while SwiGLU stays exact. */
 __attribute__((noinline,optimize("no-tree-vectorize")))
 static void harness_run_prod_reference(Model*m,const HarnessPrompt*hp,int*out_toks,float*out_selfnll,Kv*kv,
         float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
@@ -1246,7 +1250,7 @@ int main(int c,char**v){
     const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.hp.imecache";
     g_router_validate=(c>5)?atoi(v[5]):0; /* router HP-Lin/int8-vs-fp32 expert-selection validation, off by default (extra compute) */
     g_router_mode=(c>6)?atoi(v[6]):2; /* 0=fp32(exact, revert flag) 1=int4-HP(rejected, see §22.7) 2=int8-M1(DEFAULT since 2026-07-26 -- passed the multi-prompt quality harness, codex_recs_1.md §22.15: 6.1% router mismatch, -0.0034 nats/tok NLL delta, 2.1% token divergence, 13.7% faster, all four pre-registered thresholds PASS) */
-    g_swiglu_fast=(c>7)?atoi(v[7]):0; /* 0=exact(DEFAULT) 1=hard-swish(EXPERIMENTAL, REJECTED §22.19-20 -- 11.0% perplexity inflation vs production on the expanded 1063-token/4-methodology eval, fails the 5% gate) 2=rational-Pade(EXPERIMENTAL, PASSES ALL GATES §22.20 -- 2.0% perplexity inflation vs production, 2.6% vs original fp32+exact, real-text perplexity statistically indistinguishable from both baselines, 10x faster -- promotion decision left to explicit confirmation, not auto-promoted despite passing) */
+    g_swiglu_fast=(c>7)?atoi(v[7]):2; /* 0=exact(revert flag) 1=hard-swish(REJECTED §22.19-20 -- 11.0% perplexity inflation vs production on the expanded 1063-token/4-methodology eval, fails the 5% gate) 2=rational-Pade(DEFAULT since 2026-07-26, §22.21 -- passed the harness §22.20 AND a bounded production A/B: 2 paired trials, 9.7->11.4 tok/s, swiglu bucket 15.85ms->1.25ms (-92.1%), identical generated tokens both trials, no regression in any other bucket) */
     Model m; double tl=now(); int cached=0;
     if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
     else { model_load(&m,&g,nt); fprintf(stderr,"requant loaded in %.1fs\n",now()-tl); }

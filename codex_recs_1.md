@@ -2087,3 +2087,46 @@ methodology used for the scheduling experiment, §22.14) — harness gates are n
 session's own established discipline (§22.14) is that a harness/isolated-probe result, however
 clean, still needs a production A/B before adoption. Not run yet; explicit confirmation, not
 automatic promotion, is what determines whether it happens next.
+
+### 22.21 Rational-Padé production A/B — CONFIRMED, promoted to default
+
+One bounded production A/B, run exactly as scoped: identical build (mandatory
+`-fno-tree-vectorize` flags), identical cache, identical canonical prompt/router/thread count
+(`nt=4`, `g_router_mode=2`), identical generation length (`ngen=16`), varying only
+`g_swiglu_fast` between `0` (exact) and `2` (rational-Padé). Two paired trials each, run
+interleaved (exact, ratsig, exact, ratsig) to control for thermal/load drift rather than blocked
+by config.
+
+| trial | config | tok/s | wall/tok | swiglu bucket | other buckets | tokens |
+|---|---|---|---|---|---|---|
+| 1 | exact | 9.55 | 104.7ms | 17.7ms | act-pack 2.6, linear 58.9, attn 9.1, rope 3.2, router 4.2, rest 8.2 | `Tokyo. The capital of Brazil is Brasília. The capital of Canada is Ottawa.` |
+| 1 | ratsig | 11.38 | 87.9ms | 1.2ms | act-pack 2.3, linear 58.7, attn 9.0, rope 3.2, router 4.2, rest 8.2 | identical |
+| 2 | exact | 9.92 | 100.8ms | 14.0ms | act-pack 2.5, linear 58.9, attn 9.0, rope 3.2, router 4.2, rest 8.0 | identical |
+| 2 | ratsig | 11.37 | 88.0ms | 1.3ms | act-pack 2.4, linear 58.8, attn 9.1, rope 3.1, router 4.2, rest 8.1 | identical |
+
+Averages: exact 9.735 tok/s (wall 102.75ms, swiglu 15.85ms); rational-Padé 11.375 tok/s (wall
+87.95ms, swiglu 1.25ms). **SwiGLU bucket reduction: 92.1%** (15.85→1.25ms), exceeding the expected
+~90%. **Wall-time reduction: 14.4%** (14.8ms/token saved, close to the ~12.5ms/token estimate).
+**tok/s improvement: +16.8%** (9.735→11.375), landing at **11.37-11.38 tok/s**, inside the
+predicted 11.0-11.4 tok/s range. Every non-SwiGLU bucket (act-pack, linear-kernel, attention,
+rope+qknorm, router, rest, and the qkv/o/expert/lm_head linear breakdown) is statistically
+unchanged across all four runs — differences are ≤0.3ms, consistent with run-to-run noise, not a
+regression. All four runs: `' Tokyo'` PASS, and **generated tokens are byte-identical between
+exact and rational-Padé** on this canonical prompt (stronger than the "desirable but not required"
+bar) — `Tokyo. The capital of Brazil is Brasília. The capital of Canada is Ottawa.` in every trial.
+This 16-token free-running decode is itself non-teacher-forced (each step feeds back its own
+argmax), corroborating the two longer free-running spot-checks already run in §22.20.
+
+**Keep-criterion met**: the expected ~90% SwiGLU reduction transferred to production with no
+regression elsewhere, exactly the pre-registered bar from step 5 of the A/B scope. **Promoted**:
+`g_swiglu_fast` production default changed `0→2` (rational-Padé). `g_swiglu_fast=0` (exact SiLU)
+remains available as an explicit revert flag; `g_swiglu_fast=1` (hard-swish) stays rejected,
+unchanged. Verified post-promotion: invoking the binary with *no* `g_swiglu_fast` argument at all
+(the real production quick-start command) reports `swiglu 1.4ms` and `11.35 tok/s` — the promotion
+takes effect through the actual default code path, not only when the flag is passed explicitly.
+
+**Session cumulative from the original 1.49 tok/s baseline, at the actual current default
+(int8-M1 router + rational-Padé SwiGLU): ~7.6-7.8x** (9.735→11.35-11.38 tok/s over 1.49 tok/s),
+now materially closer to the real vendor binary's 11.71-12.89 tok/s window (11.37/11.71≈97.1% of
+the low endpoint, 11.37/12.89≈88.2% of the high endpoint — both stated, per the §22.19 phrasing
+correction).
