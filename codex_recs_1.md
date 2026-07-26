@@ -1021,22 +1021,41 @@ the real vendor binary's 11.71-12.89. Requant into the new format is slow (**110
 min**, vs ~2 min for the old format's simpler pack) — a real, not-yet-optimized cost from the
 extra fp16 conversions and 8-subblock nesting per weight group.
 
-### 22.3 The buckets found the next bottleneck, unprompted
+### 22.3 The buckets pointed at PR8 — then turned out to be measuring the wrong thing
 
-| | act-pack | linear(kernel) | attention | rest | wall |
-|---|---|---|---|---|---|
-| Old engine (§21, post-P0.2/P0.3) | 17.2ms | 575.9ms | 16.7ms | 59.7ms (9%) | 670.5ms |
-| New engine (HP kernel) | 5.1ms | **38.4ms** | 16.8ms | **100.3ms (62%)** | 161.6ms |
+First read: `linear(kernel)` fell 15x (575.9→38.4ms, matching A3's hot-timing prediction) but
+`rest` grew to 100.3ms = 62% of wall (was 59.7ms/9%). Read that as OpenMP fork-join overhead
+(`lin_mm_hp` opens a fresh `#pragma omp parallel` team per `Lin` call, 1392 spawns/token) and
+projected that fixing it would land ~16 tok/s — beating the vendor binary.
 
-`linear(kernel)` fell 15x, exactly matching the A3 hot-timing prediction. But `rest` grew both
-in absolute terms and as a share of wall-clock — now the dominant cost. Almost certainly OpenMP
-fork-join overhead: `lin_mm_hp` opens a fresh `#pragma omp parallel` team per `Lin` call (29/layer
-x 48 layers = 1392 team spawns per token), and now that the kernel itself is ~446ns/call, that
-fixed per-spawn cost dominates. This is precisely **§17 PR8's exit criterion** ("implement only if
-profiling still attributes material time to scheduling") — now met, with real numbers instead of
-a guess. Rough projection if that overhead collapses: ~60ms/token from kernel+attention+pack alone
-→ ~16 tok/s, which would **beat** the vendor binary's 12.89 tok/s, not just close the gap.
+**That projection was wrong, and not because the hardware behaved unexpectedly.** Implemented
+PR8 (persistent spin-dispatch pool: threads spawned once, generation-counter dispatch instead of
+per-call `#pragma omp parallel`) and got only 6.19→6.53 tok/s — a ~6% gain, not the 2.4x implied
+by the projection. Investigating found a real bug: the new engine's `lin_mm()` wrapper (used for
+`o`, all 8 `ed[e]`, and `lm` — over a third of per-layer `Lin` calls) had **zero timing
+instrumentation**, unlike the old engine's version. All of that call's real work — pack *and*
+kernel — was silently falling into `rest` the whole time, making a mostly-real, correctly-doing-
+its-job bucket look like a 62%-of-wall dispatch-overhead mystery. Fixed the instrumentation
+(ported the `_ta/_tb` pattern from the old `lin_mm`) and re-measured with the pool still active:
 
-Not yet done: PR8 itself (persistent thread pool spanning multiple/all `Lin` calls instead of
-per-call `#pragma omp parallel`), and speeding up the new format's slow requant. Stopping here
-per the same working rule as §21.4 — this is the next branch decision, not an auto-advance.
+| | act-pack | linear(kernel) | attention | rest | wall | tok/s |
+|---|---|---|---|---|---|---|
+| Old engine (§21, post-P0.2/P0.3) | 17.2ms | 575.9ms | 16.7ms | 59.7ms (9%) | 670.5ms | 1.49 |
+| New engine, first (buggy) reading | 5.1ms | 38.4ms | 16.8ms | 100.3ms (62%) | 161.6ms | 6.19 |
+| New engine, pool + instrumentation fixed | 16.6ms | **58.7ms** | 16.9ms | **59.3ms (39%)** | 152.4ms | **6.56** |
+
+`linear` and `rest` are now roughly tied as the two biggest buckets, and `rest` is genuine scalar
+C — router matvec (128 experts x d=2048 = 262144 unvectorized mults/layer), per-head RoPE + q/k
+rmsnorm (~4600 `sinf`/`cosf` calls/layer across nh=32+nkv=4 heads), SwiGLU (~6144 `expf`
+calls/layer) — not dispatch overhead waiting to be collapsed. The persistent pool is a real, worth
+keeping ~6% win; the "beats the vendor binary" claim from the first reading is retracted.
+
+**Lesson**: a bucket that looks too large after a big kernel win is exactly the moment to check
+whether it's actually being measured, not just theorize about the hardware. "The buckets say X"
+is only as trustworthy as the instrumentation producing them.
+
+Not yet done: profiling `rest` itself finely enough to pick a next target (router vectorization is
+the obvious first guess — 262144 unvectorized mults/layer is the single largest identified item —
+but per §19/working-rule, that's a measurement to take, not an assumption to build on), and
+speeding up the new format's slow requant (~18.4 min). Stopping here per the same working rule as
+§21.4 — this is the next branch decision, not an auto-advance.

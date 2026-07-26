@@ -13,16 +13,25 @@ A/B: vendor is **6.66x faster** at identical N32K256 work (`research_feed_paths.
 same GGUF/model/forward()/attention, only the GEMV+weight-pack layer swapped to the vendor shape.
 New cache format (`IMEC` ver=2, path `qwen3-30b-a3b.hp.imecache`, incompatible with the old cache).
 All this model's Lin shapes are exact multiples of 256(K)/32(N) — no remainder handling needed.
-**RESULT (2026-07-26): 6.19 tok/s, ' Tokyo' PASS, coherent — 4.16x over our 1.49 tok/s baseline.**
+**RESULT (2026-07-26): 6.56 tok/s, ' Tokyo' PASS, coherent — 4.4x over our 1.49 tok/s baseline.**
 Still below the real vendor binary (11.71-12.89 tok/s). Requant into the new format is slow
-(~18.4 min vs ~2 min old format — real cost, not yet optimized). **The buckets tell the story**:
-`linear(kernel)` dropped 575.9→38.4ms (15x, matches the A3 hot-timing prediction) but `rest`
-exploded to 100.3ms = 62% of wall (was 9%). This is OpenMP fork-join overhead — `lin_mm_hp` opens
-a fresh `#pragma omp parallel` team per Lin call (29/layer x 48 layers = 1392 spawns/token), and
-now that the kernel itself is ~446ns/call that fixed spawn cost dominates. **Next: persistent
-thread pool** (codex_recs_1.md §17 PR8, "if still warranted" — now warranted, with data). Rough
-projection if fork-join overhead collapses: ~60ms/tok from kernel+attn+pack alone → ~16 tok/s,
-which would **beat** the vendor binary. Full detail in `research_feed_paths.md` §12, "A5 (real)" row.
+(~18.4 min vs ~2 min old format — real cost, not yet optimized).
+
+**Correction — the first bucket read was wrong, not just the hardware hypothesis.** Initially
+`rest` looked like 100.3ms/62% of wall and got pinned on OpenMP fork-join overhead (PR8). Built
+the persistent spin-dispatch thread pool to fix it (workers spawned once, generation-counter
+dispatch instead of a fresh `#pragma omp parallel` per `Lin` call) — result was only 6.19→6.53
+tok/s, nowhere near the ~16 tok/s projected. Root cause turned out to be a real instrumentation
+bug: the new engine's `lin_mm()` wrapper (used for `o`, all 8 `ed[e]`, and `lm` — over a third of
+per-layer `Lin` calls) had **zero timing instrumentation**, so that entire chunk of real work was
+silently landing in `rest`. Fixed it (ported the old engine's `_ta/_tb` pattern into the new
+`lin_mm`) and re-measured with the pool still in place: **act-pack 16.6ms, linear(kernel) 58.7ms,
+attention 16.9ms, rest 59.3ms, wall 152.4ms → 6.56 tok/s.** `linear` and `rest` are now roughly
+tied as the two biggest buckets; `rest` is genuine scalar C (router matvec — 262144 unvectorized
+mults/layer, per-head RoPE+qk-norm — ~4600 sin/cos calls/layer, SwiGLU — ~6144 `expf` calls/layer),
+not dispatch overhead. The persistent pool itself is a real, modest, keep-it win (~6%); the
+"beats the vendor binary" projection is retracted. Full detail in `research_feed_paths.md` §12,
+"A5 (real)" and "PR8 + bucket fix" rows.
 
 ## Headline status
 - **Qwen3-30B-A3B MoE runs COHERENT on the K3 IME-2**, pure C: prompt → ' Tokyo' PASS;

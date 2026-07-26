@@ -30,6 +30,8 @@
 #include <time.h>
 #include <math.h>
 #include <omp.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static int bind_ai(void){ int fd=open("/proc/set_ai_thread",O_WRONLY); if(fd<0)return -1; int r=write(fd,"0",1); close(fd); return r<0?-1:0; }
@@ -198,15 +200,54 @@ static Lin lin_new_hp(const float*wf32,int N,int K){
 static void pack_act_hp(const float*x,int K,uint8_t*Abuf){
     int Sb=K/256; for(int sb=0;sb<Sb;sb++) pack_A_hp(x+sb*256, Abuf+(size_t)sb*AREC);
 }
+static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0; static long gT_tok=0; static int gT_on=0;
+
+/* PR8 (codex_recs_1.md §17/§22.3): with the vendor kernel at ~446ns/call, the ~1392 fresh
+ * #pragma omp parallel spawns/token that lin_mm_hp used to do dominated wall-clock (100.3ms,
+ * 62%). Replace with a persistent spin-dispatch pool: threads created once, wait on a generation
+ * counter instead of libgomp fork/join. Same round-robin panel partitioning as before (np=tn;
+ * np<Np; np+=nt), so the actual math is unchanged -- only the dispatch mechanism differs. */
+#define MAXNT 16
+typedef struct { const Lin*l; const uint8_t*Abuf; float*y; int kb; } HpWork;
+static _Atomic int g_pool_gen=0, g_pool_done=0;
+static HpWork g_pool_work;
+static int g_pool_nt=0;
+static pthread_t g_pool_threads[MAXNT];
+
+static void lin_mm_hp_worker_run(int tn){
+    int Np=g_pool_work.l->N/32;
+    for(int np=tn; np<Np; np+=g_pool_nt)
+        run_hp_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER, g_pool_work.y+np*32, g_pool_work.kb);
+}
+static void* lin_mm_hp_worker(void*arg){
+    int tn=(int)(intptr_t)arg; pin_once(tn);
+    int last=0;
+    for(;;){
+        int gen;
+        while((gen=atomic_load_explicit(&g_pool_gen,memory_order_acquire))==last) { /* spin */ }
+        last=gen;
+        if(gen<0) return NULL; /* shutdown sentinel */
+        lin_mm_hp_worker_run(tn);
+        atomic_fetch_add_explicit(&g_pool_done,1,memory_order_release);
+    }
+}
+static void lin_mm_pool_init(int nt){
+    g_pool_nt=nt; pin_once(0);
+    for(int i=1;i<nt;i++) pthread_create(&g_pool_threads[i],NULL,lin_mm_hp_worker,(void*)(intptr_t)i);
+}
 static void lin_mm_hp(const Lin*l,const uint8_t*Abuf,float*y,int nt){
-    int Np=l->N/32, kb=l->K/256;
-    #pragma omp parallel num_threads(nt)
-    { int tn=omp_get_thread_num(); pin_once(tn);
-      for(int np=tn; np<Np; np+=nt) run_hp_m1(Abuf, l->B+(size_t)np*kb*BSUPER, y+np*32, kb); }
+    g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/256;
+    atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release); /* wake workers 1..nt-1 */
+    lin_mm_hp_worker_run(0); /* main thread does its own share (tn=0) */
+    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < nt-1) { /* spin */ }
 }
 static void lin_mm(const Lin*l,const float*x,float*y,int nt,uint8_t*Abuf){
+    double _ta=gT_on?now():0;
     pack_act_hp(x,l->K,Abuf);
+    double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
     lin_mm_hp(l,Abuf,y,nt);
+    if(gT_on) gT_lin+=now()-_tb;
 }
 
 /* ===================== GGUF reader (mmap; Q4_0/Q4_1/Q8_0/F32/F16) — unchanged from qwen_moe.c ===================== */
@@ -368,7 +409,6 @@ static int cache_load(Model*m,const char*path,int nt){
 }
 
 typedef struct { float*Kc,*Vc; int kvd,ctx; } Kv;
-static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0; static long gT_tok=0; static int gT_on=0;
 static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
                     float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*g,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2){
     int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,qd=nh*hd,kvd=nkv*hd,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
@@ -440,6 +480,7 @@ int main(int c,char**v){
     float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
          *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m.vocab*4);
     uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
+    lin_mm_pool_init(nt); /* PR8: persistent workers, spawned once, spin-dispatched per lin_mm_hp call */
 
     int prompt[]={785,6722,315,9625,374,12095,13,576,6722,315,6323,374}; int np=12;
     double tp=now(); int first=0;
