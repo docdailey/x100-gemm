@@ -9,7 +9,8 @@ kernel) — that engine is now the **prior baseline**, superseded but kept as-is
 untouched) for comparison. `qwen_moe_hp.c` is **5.06x faster**, same correctness bar (`' Tokyo'`
 PASS, coherent generation), still below the real vendor *binary*'s 11.71-12.89 tok/s.
 
-**Quick start**: `ssh root@192.168.68.88`; cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
+**Quick start**: `ssh root@192.168.68.24` (IP not reliably static right now — check the "IP is not
+reliably static" note under Board State below if this fails); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
 → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache`
 reloads in ~22s and prints buckets. **nt=4 is the right default** (nt=8 measured slightly worse —
 memory-bandwidth-bound workload, more threads just adds bus contention, see below).
@@ -35,6 +36,31 @@ through `lin_mm_hp` for a true apples-to-apples comparison (multi-threaded, the 
 kernel) — only conclude "not worth it" if THAT test also shows no material improvement.
 Found and fixed two real toolchain bugs along the way (see "Toolchain gotchas" below) — worth
 reading before writing any more RVV code in this file.
+
+**Router-as-HP-Lin, the real test (2026-07-26) — done, result is mixed, decision left open.**
+Followed through: router packed via `lin_new_hp` (real int4 vendor format, same as every other
+`Lin`), run through `lin_mm_hp` (pooled, multi-threaded, the proven kernel) — not the earlier
+single-threaded hand-written dot product. First validation run: **1344/1344 (100%) expert-set
+mismatches** — a real bug, not a quantization surprise. The top-8 argmax sentinel (`bv=-1`) is only
+safe for post-softmax probabilities (always positive); the fp32 reference comparison used **raw**
+logits, which run well below -1 (observed ~-1.7 to -5), so the sentinel silently rejected valid
+negative candidates. Fixed (`bv=-1e30f`). Also fixed a second, separate bug: the router-bucket
+timer had been stopped right after `lin_mm_hp`, but the pre-HP-Lin baseline's `router` bucket also
+included softmax+select+renormalize — moved the stop-timer to match, so before/after numbers are
+genuinely comparable (this is the same *class* of bug as the earlier `lin_mm` instrumentation gap
+— always suspect the measurement before the hardware when a number looks too good or too strange).
+
+**After both fixes**: 791/1344 (58.9%) expert-set mismatches remain — real, not a bug — but **avg
+only 1.38/8 experts differ per mismatch** (usually one near-tie swap, not wholesale reshuffling).
+Generation still coherent (`' Tokyo'` PASS) on this short test. **Timing: router 18.7→12.5ms
+(-33%), wall 132.6→128.5ms (-3%), 7.51-7.54→7.78 tok/s (+3-4%)** — real but modest, not the ~40x
+the buggy first reading suggested. **This does not cleanly clear "keep only if quality holds and
+the bucket falls materially"**: the speedup is real but modest, and routing quality does not
+cleanly hold (majority of decisions perturbed, usually mildly). **Left as an open decision** — not
+resolved: revert router to fp32, keep as-is since generation still looks fine, or investigate
+whether swapped experts typically carry low renormalized weight (→ low actual output impact)
+before deciding. Any of these needs broader eval (longer generations, more prompts, ideally
+perplexity) to actually settle, not another short coherence check.
 
 Full narrative below (kept for the reasoning trail — what was tried, what turned out wrong, why).
 

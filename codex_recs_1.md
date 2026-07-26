@@ -1164,3 +1164,47 @@ compare all router logits + top-8 sets + full generation + timing against fp32 �
 "not worth it" if that apples-to-apples test also shows no material improvement. Kept the fp16
 path in the codebase regardless (validated at the granularity tested, harmless, real if small
 memory saving: 512KB vs 1MB/layer).
+
+### 22.7 Router-as-HP-Lin, done for real — result is genuinely mixed, not a clean win
+
+Followed through on §22.6's "next step": router weights packed via `lin_new_hp` (real int4 vendor
+format, identical to every other `Lin` in this engine) and computed via `lin_mm_hp` (pooled,
+multi-threaded, the proven ~446ns/call kernel from A3) — `ly->router` (fp32) kept only as the
+validation reference. Two real bugs surfaced before the result could be trusted, both instructive:
+
+1. **First validation run: 1344/1344 (100%) expert-set mismatches.** Not a quantization surprise —
+   a real bug in the validation harness. The top-8 selection's argmax sentinel (`bv=-1`) is only
+   safe when every candidate is guaranteed positive, which holds for post-softmax probabilities but
+   not for raw logits — the fp32 reference comparison used raw logits, observed running as low as
+   ~-5, so the sentinel silently rejected valid negative candidates and corrupted the comparison.
+   Fixed (`bv=-1e30f`).
+2. **A second, separate instrumentation bug**, same *class* as §21's `lin_mm` gap: the router-bucket
+   timer had been stopped immediately after `lin_mm_hp`, but the pre-HP-Lin baseline's `router`
+   bucket also bundled in softmax + top-8-select + renormalize. Comparing a narrower window against
+   a wider one is not apples-to-apples. Fixed by moving the stop-timer to match the original
+   boundary exactly. **Lesson repeated from §21**: when a number moves further than expected after
+   a change, check what's actually being measured before trusting the hardware explanation.
+
+**Result after both fixes**: 791/1344 (58.9%) expert-set mismatches remain — this part is real, not
+a bug. Added a finer metric (avg experts differing per mismatch, not just binary match/no-match):
+**1.38/8 on average** — most mismatches are a single near-tie expert swap, not wholesale different
+routing. Max abs/rel logit deltas (8.45 / 403%) are outlier-dominated across 172032 individual
+logit comparisons and not representative of the typical case. Generation stayed coherent
+(`' Tokyo'` PASS) on the 28-token test used throughout this session.
+
+**Timing: router 18.7→12.5ms (-33%), wall 132.6→128.5ms (-3%), 7.51-7.54→7.78 tok/s (+3-4%).** Real,
+but modest — not the ~40x the first (buggy) reading implied.
+
+**This does not cleanly satisfy the stated bar** ("keep only if quality holds and the bucket falls
+materially"): the speedup is real but modest, and quality does not cleanly hold — a majority of
+routing decisions get at least one expert swapped, even if usually a minor one. **Left as an open,
+unresolved decision** rather than picking a side: revert to fp32, keep as-is (generation still
+looked fine), or first check whether swapped experts typically carry low renormalized softmax
+weight (which would mean low actual output impact despite the raw mismatch rate) — any of these
+needs broader evaluation (longer generations, more prompts, ideally perplexity) to actually settle,
+not another short coherence check on 28 tokens.
+
+**Caveat on §22.6's fp16 result**: that experiment's validation used the same vulnerable sentinel
+pattern. Given fp16's much smaller rounding error the "0/1344 mismatches" result is still plausibly
+correct, but it was never verified against this specific bug, and the code has since been replaced
+so it can't be re-checked directly.
