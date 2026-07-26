@@ -1324,3 +1324,93 @@ Bucket ranking is now: `linear(kernel)` 59.0ms (~47% of wall, unchanged) > `rout
 validation) > `attention` 9.1ms (no longer tied with router) > `rope` 2.0ms > `rest(other)` 2.1ms.
 Activation-packing remains the other, still-unaddressed half of this review item — a candidate for
 a follow-up pass, not yet attempted.
+
+### 22.10 Activation-packing vectorized — ported the real vendor RVV code, not a hand-rolled one, closes the review item
+
+With attention done (§22.9), activation-packing (`pack_A_hp`/`pack_act_hp`) was the other,
+still-unaddressed half of "otherwise move to activation packing or attention." Unlike attention,
+this one wasn't a case of reusing an already-proven exact-math primitive (`vdot_f32`/`vaxpy_f32`) —
+it needed a genuinely new quantization routine: find each 32-wide subblock's max-abs value, derive
+a per-subblock scale plus a per-256-wide-block averaged scale, and round+clamp 256 floats to int8.
+Float-to-int rounding is exactly the kind of thing that bit for this file before (the `vfwcvt`
+vtype-timing bug in §22.6) — hand-writing a new vectorized quantizer from intuition risked a *third*
+instance of "compiles clean, runs clean, silently wrong," the hardest class of bug to catch.
+
+**So: don't hand-write it — trace the real vendor implementation, same as every kernel port this
+session.** `pack_A_hp` was already commented as "a portable scalar port of `quantize_a_row_i8_hp`"
+(`rvv_kernels.cpp:1989`) — meaning the *actual RVV vendor source* for this exact function was known
+to exist and had simply never been ported, only its scalar behavior copied by hand in an earlier
+session. Read it directly off the board (`/root/llama.cpp/ggml/src/ggml-cpu/spacemit/rvv_kernels.cpp`):
+it branches on `__riscv_vlenb()` — a `vlenb==128` path (VLEN=1024, this board's A100 cores, one
+32-wide subblock fits exactly in one `e32m1` vector register) and a `vlenb==32` path (VLEN=256,
+X100, `e32m4`/4x wider LMUL to cover the same 32 elements). Since every call site in this engine
+runs on the main thread, which `main()` already pins to hart 8 (A100) before the decode loop,
+**only the `vlenb==128` branch applies here** — ported that one, intrinsics-for-intrinsics, into
+`bench/vendor_ime_actpack_probe.c`:
+
+```c
+size_t vl=__riscv_vsetvl_e32m1(32);
+vfloat32m1_t v_a=__riscv_vle32_v_f32m1(a+kk*32,vl);
+vfloat32m1_t v_a_abs=__riscv_vfabs_v_f32m1(v_a,vl);
+vfloat32m1_t v_a_max=__riscv_vfredmax_vs_f32m1_f32m1(v_a_abs,__riscv_vfmv_v_f_f32m1(0.0f,vl),vl);
+float max_abs_a=__riscv_vfmv_f_s_f32m1_f32(v_a_max);
+/* ... scale_temp[kk]=max_abs_a/127.0f, scale_avg accumulation, unchanged from the scalar port ... */
+vfloat32m1_t v_a_scale = __riscv_vfmul_vf_f32m1(v_a, rep_scale_a, vl);
+vint16mf2_t  v_a_quant = __riscv_vfncvt_x_f_w_i16mf2(v_a_scale, vl);      /* float -> int16, rounds */
+vint8mf4_t   v_a_quant_i8 = __riscv_vncvt_x_x_w_i8mf4(v_a_quant, vl);     /* narrow int16 -> int8 */
+vint16m1_t   v_a_sum = __riscv_vwredsum_vs_i8mf4_i16m1(v_a_quant_i8, __riscv_vmv_v_x_i16m1(0,vl), vl);
+```
+
+**Validation methodology**: not "does this look right" — byte-for-byte comparison against the
+currently-shipping scalar `pack_A_hp` (copied verbatim into the probe as the oracle), across
+200,000 random trials spread across 5 input distributions (generic random, tiny-magnitude,
+one-dominant-outlier, all-zero, alternating-sign) chosen to stress the edge cases a quantizer is
+most likely to get wrong.
+
+**First run: 100% mismatch, every distribution.** Root cause wasn't the port — `__riscv_vlenb()`
+reported **32** (X100/VLEN=256), not the expected 128, even though the probe explicitly pinned to
+hart 8 via `sched_setaffinity`. Traced this to an infra gotcha, not a code bug (full writeup in
+`PROGRESS.md`'s Toolchain gotchas): this SSH session's shell has `Cpus_allowed` capped to harts 0-7
+by its cgroup, and `sched_setaffinity(CPU_SET(8))` alone **silently no-ops** when requesting a hart
+outside that mask — no error was checked, so the probe just kept running on an X100 hart with
+VLEN=256, where `__riscv_vsetvl_e32m1(32)` clamps to `vl=8` and only a quarter of each subblock got
+processed. The fix was already sitting in `qwen_moe_hp.c`'s own `main()`, one line before its own
+pinning call: `bind_ai()` — writes `"0"` to `/proc/set_ai_thread`, the vendor driver interface that
+actually grants a thread access to harts 8-15. Adding the same `bind_ai()` call to the probe (in
+the same order, immediately before `sched_setaffinity`) fixed it: `vlenb=128`, matching production.
+
+**Second run, with `vlenb=128` confirmed: 20.0000% mismatch, exactly and only the all-zero-row
+distribution (`mismatched_records=40000` of 200000, `20000/5`).** A real, narrow divergence: the
+scalar port initializes its running max as `float amax=1e-6f` (a defensive floor against
+division-by-zero for an all-zero input), while the vendor RVV code starts its `vfredmax` reduction
+from a literal `0.0f` with no floor. For a genuinely all-zero subblock this makes `scale_temp[kk]`
+either a tiny nonzero value (scalar) or exactly `0.0f` (RVV) — different stored bytes, but
+**numerically inconsequential**: an all-zero activation block contributes exactly 0 to the matmul
+either way, since the quantized data is 0 regardless of which scale accompanies it. Matched the
+scalar port's floor in the RVV version anyway (one `if` before the divide) — not because leaving it
+out would have been wrong in practice, but because "byte-identical" is a strictly stronger,
+easier-to-trust guarantee than "equivalent in the cases I thought to check," and it cost nothing.
+
+**Third run: byte-identical, 0/200000 mismatches, 0 total byte diffs, all 5 distributions.** Hot
+kernel-only timing (2M reps, warm cache, matching A3's methodology): **6009.7ns/call scalar vs
+1542.4ns/call RVV — 3.90x.**
+
+**Wired into production directly** — replaced `pack_A_hp`'s body in `qwen_moe_hp.c`, no feature
+flag needed (byte-identical to the code it replaced, not an approximation, same reasoning as the
+attention change in §22.9). Added the same `noinline,optimize("no-tree-vectorize")` guard as every
+other RVV function in this file, defensively (this code doesn't touch `vmadot` state at all, so it
+likely isn't strictly required, but costs nothing and matches the file's established pattern).
+
+**Result: act-pack 17.4ms→2.3ms (-87%), 7.68-7.89→8.84-9.25 tok/s.** The production win is bigger
+than the isolated 3.90x hot-call ratio would suggest — plausibly because the RVV version also
+issues far fewer scalar loads/stores/branches per call, which helps more under realistic
+non-warmed-cache conditions than a tight warm-cache repeat-call microbenchmark can capture. This is
+the single largest per-token win of the session so far, larger than the attention change (§22.9,
+-51% off a smaller bucket). Two runs on the board, both `' Tokyo'` PASS, identical continued
+generation (Brasília, Ottawa, then Canberra/Cairo/New Delhi on the longer 40-token run).
+
+Bucket ranking is now: `linear(kernel)` 58.6-58.7ms (~52% of wall, dominant) > `router` 18.3-18.9ms
+(fp32) > `swiglu` 14.0ms (still untouched) > `attention` 9.2-14.7ms (grows with context, no longer
+fixed) > `act-pack` 2.3ms (down from 17.4ms, no longer top-3) > `rope` 2.0ms > `rest(other)` 2.1ms.
+With attention and activation-packing both closed out, `linear(kernel)` is now the clear, sole
+largest bucket and hasn't been revisited since A3's hot-timing validation — the natural next target.

@@ -2,12 +2,12 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 7.68-7.89 tok/s
+## HEADLINE: qwen_moe_hp.c is the current best engine — 8.84-9.25 tok/s
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
-untouched) for comparison. `qwen_moe_hp.c` is now **~5.2x faster**, same correctness bar (`' Tokyo'`
-PASS, coherent generation), still below the real vendor *binary*'s 11.71-12.89 tok/s.
+untouched) for comparison. `qwen_moe_hp.c` is now **~6.1x faster**, same correctness bar (`' Tokyo'`
+PASS, coherent generation), closing in on the real vendor *binary*'s 11.71-12.89 tok/s.
 
 **Quick start**: `ssh root@192.168.68.24` (static IP on wired Ethernet, confirmed persistent across
 reboots via NetworkManager — see Board State below); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
@@ -28,9 +28,33 @@ Zero approximation risk (exact vectorization of the same math, same as the RoPE-
 fixes) — consistent with the standing instruction to leave approximate SwiGLU alone until broader
 quality validation exists.
 
-**Current bucket ranking** (wall ~125.8-126.8ms/tok): `linear(kernel)` 59.0ms (~47%, still dominant) >
-`router` 22.1ms (fp32 default) > `act-pack` 17.4ms > `swiglu` 14.0ms (untouched) > `attention` 9.1ms
-(down from 18.7ms — no longer tied with router) > `rope` 2.0ms > `rest(other)` 2.1ms.
+**Activation-packing vectorized (2026-07-26, closes the review item): act-pack 17.4→2.3ms (-87%),
+7.68-7.89→8.84-9.25 tok/s — the biggest single win yet.** Rather than hand-writing a vectorized
+quantizer, traced the real vendor RVV source (`quantize_a_row_i8_hp`, `rvv_kernels.cpp:1989`,
+`vlenb==128` branch — this board's A100 cores) and ported it verbatim, same discipline as the M1/
+int8 kernel ports. Validated **byte-identical** against the shipping scalar `pack_A_hp` across
+200k random trials, 5 distributions (`bench/vendor_ime_actpack_probe.c`) — one real edge case found
+and fixed along the way: the scalar port's defensive `1e-6f` amax floor for all-zero rows vs. the
+vendor code's bare `0.0f` (numerically inconsequential — a zero block contributes 0 to the matmul
+regardless of the stored scale — but matched anyway for a true drop-in, not just an equivalent
+one). Hot kernel-only: 6009.7ns/call scalar vs 1542.4ns/call RVV, **3.90x** — the *production*
+win (87% off the bucket) is bigger than that ratio predicts, likely fewer scalar loads/branches
+helping beyond raw per-call throughput. No feature flag needed (byte-identical, not approximate,
+same as the attention change). Two runs, both `' Tokyo'` PASS, identical generation.
+
+**Toolchain/infra gotcha found along the way** (see "Toolchain gotchas" below for the full note):
+a standalone RVV probe reported the wrong `vlenb` (32, i.e. X100) even when explicitly pinned to
+hart 8 via `sched_setaffinity` — turned out `bind_ai()` (write `"0"` to `/proc/set_ai_thread`,
+already called by `qwen_moe_hp.c`'s `main()` before its own pinning, easy to forget in a quick
+standalone probe) is what actually grants a thread access to harts 8-15 under this session's
+cgroup; `sched_setaffinity(CPU_SET(8))` alone silently no-ops without it. Any future standalone
+RVV/IME probe on this board needs both calls, in that order, or it will silently run on the wrong
+hart with the wrong VLEN — a probe result contradicting the real hardware, not a bug in the code.
+
+**Current bucket ranking** (wall ~108-113ms/tok): `linear(kernel)` 58.6-58.7ms (~52%, dominant) >
+`router` 18.3-18.9ms (fp32 default) > `swiglu` 14.0ms (untouched) > `attention` 9.2-14.7ms (grows
+with context) > `act-pack` 2.3ms (down from 17.4ms — no longer a top-3 bucket) > `rope` 2.0ms >
+`rest(other)` 2.1ms.
 
 **Router-as-quantized-Lin fp16 experiment — real result, but the "stop here" conclusion was
 premature (self-correction, flagged by review).** Weight-only fp16 (activation stays fp32),
@@ -227,6 +251,18 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
   IMMEDIATELY after the matching-width load, before any other `vsetvli`. Verified correct against
   `gemm_kernel_i8i4_hp_m1`'s proven ordering.
 - rustc static-link + `-fPIC` miscompiles the kernel (unbounded loop). gcc non-PIC only. → engines standalone C, Python via ctypes.
+- **`sched_setaffinity(CPU_SET(8..15))` alone is not enough to reach the A100/IME-2 harts — you
+  also need `bind_ai()` (write `"0"` to `/proc/set_ai_thread`) first, or it silently no-ops.**
+  Found 2026-07-26 writing a standalone activation-pack probe: this SSH session's shell has
+  `Cpus_allowed` capped to `0-7` (X100 only) by its cgroup (`user.slice/.../session-N.scope`), even
+  though the cgroup's own `cpuset.cpus.effective` is `0-15` — some sessions' shells start pre-pinned
+  narrower than what they're actually allowed. A bare `sched_setaffinity` requesting hart 8 from
+  such a shell (or a child process spawned from it) fails silently — no error checked, so the
+  process just keeps running on whatever X100 hart it started on. Symptom: `__riscv_vlenb()` reads
+  32 (VLEN=256, X100) instead of 128 (VLEN=1024, A100) even after the pinning call. `qwen_moe_hp.c`'s
+  `main()` already does this correctly (`bind_ai()` immediately before `CPU_SET(8)`); any *new*
+  standalone RVV/IME probe on this board needs to copy that exact pattern or it will silently
+  validate against the wrong hardware.
 
 ## P0 decode optimization (task #16) — DONE, 2026-07-26. Findings in codex_recs_1.md §21.
 - **P0.1 instrumentation**: per-token buckets `act-pack | linear(kernel+fold) | attention | rest | sum | wall`
@@ -254,13 +290,13 @@ See HEADLINE at the top of this doc — `qwen_moe_hp.c` is current, `qwen_moe.c`
 1. `ssh root@192.168.68.24` (static, wired); HP cache exists → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache` reloads in ~22s and prints buckets.
 2. Router: fp32 is the production default; int4-HP and int8-M1 are both real, validated, and kept
    behind the `g_router_mode` experimental flag (7th CLI arg) — see HEADLINE and codex_recs_1.md
-   §22.7-22.8 for the full quality-vs-speed tradeoff on each. Attention is now vectorized (9.1ms,
-   see HEADLINE) — no longer tied with router as a bottleneck. SwiGLU (14.0ms) is now the largest
+   §22.7-22.8 for the full quality-vs-speed tradeoff on each. Attention and activation-packing are
+   both now vectorized (9.2-14.7ms and 2.3ms respectively, see HEADLINE) — the "activation packing
+   or attention" review item is fully closed. SwiGLU (14.0ms) is now the single largest
    fully-untouched bucket, deliberately deferred — needs quality validation beyond the
-   single-prompt coherence check before approximating `expf`/sigmoid. `linear(kernel)` (59.0ms,
-   ~47% of wall) is still the single biggest item and hasn't been revisited since A3's hot-timing
-   validation. Activation-packing (`pack_act_hp`) remains unvectorized — the other half of the
-   "activation packing or attention" item, not yet attempted.
+   single-prompt coherence check before approximating `expf`/sigmoid. `linear(kernel)` (58.6-58.7ms,
+   ~52% of wall) is the biggest item overall and hasn't been revisited since A3's hot-timing
+   validation — the next natural target now that the other scalar buckets are cleared out.
 3. To run the router fp16-vs-fp32 validator again: pass a 6th CLI arg of `1` (e.g. `... 16 4
    /root/models/qwen3-30b-a3b.hp.imecache 1`) — adds a "router fp16-vs-fp32" summary line but
    roughly doubles the router bucket's cost (computes both paths), so leave it off (`0` or omit)

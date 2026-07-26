@@ -93,27 +93,58 @@ static void pack_B_q4_0x32(q4_0_native rows[32], uint8_t*out /* 576 bytes */){
         for(int j=0;j<8;j++) qs[i*16+8+j]   = ((rows[i].qs[j*2]&0xF0)>>4) | (rows[i].qs[j*2+1]&0xF0);
     }
 }
-/* activation pack: portable scalar port of quantize_a_row_i8_hp (rvv_kernels.cpp:1989, vlenb==128) */
+/* activation pack: RVV port of the real vendor quantize_a_row_i8_hp (rvv_kernels.cpp:1989,
+ * vlenb==128 branch -- this board's A100 cores, VLEN=1024, one 32-wide subblock per e32m1 vsetvl).
+ * Validated byte-identical against the prior scalar port across 200k random trials spanning 5
+ * distributions (generic/tiny-magnitude/outlier/all-zero/alternating-sign), 3.90x faster hot
+ * (bench/vendor_ime_actpack_probe.c). The all-zero-row case needed an explicit 1e-6f amax floor
+ * to match the scalar port exactly -- the vendor code omits it (numerically inconsequential, an
+ * all-zero block contributes 0 to the matmul regardless of the stored scale, but matching it here
+ * keeps this a true drop-in rather than merely equivalent). MUST run on a hart that has called
+ * bind_ai()+pinned to harts 8-15 (A100/VLEN=1024) -- on an unpinned/X100 hart (VLEN=256) the
+ * vsetvl_e32m1(32) calls below silently clamp to vl=8, only packing 8 of each 32-wide subblock's
+ * elements. All call sites (lin_mm, forward()'s router block) run on the main thread, which main()
+ * already bind_ai()+pins to hart 8 before the decode loop starts. */
+__attribute__((noinline,optimize("no-tree-vectorize")))
 static void pack_A_hp(const float*a, uint8_t*out /* 290 bytes */){
-    float scale_temp[NSUB]; int8_t qa[NSUB][32]; int16_t asum[NSUB];
-    float scale_avg=0;
+    float scale_temp[NSUB];
+    float scale_avg=0.0f;
     for(int kk=0;kk<NSUB;kk++){
-        float amax=1e-6f; for(int i=0;i<32;i++){ float v=fabsf(a[kk*32+i]); if(v>amax)amax=v; }
-        scale_temp[kk]=amax/127.0f; scale_avg+=scale_temp[kk];
+        size_t vl=__riscv_vsetvl_e32m1(32);
+        vfloat32m1_t v_a=__riscv_vle32_v_f32m1(a+kk*32,vl);
+        vfloat32m1_t v_a_abs=__riscv_vfabs_v_f32m1(v_a,vl);
+        vfloat32m1_t tmp=__riscv_vfmv_v_f_f32m1(0.0f,vl);
+        vfloat32m1_t v_a_max=__riscv_vfredmax_vs_f32m1_f32m1(v_a_abs,tmp,vl);
+        float max_abs_a=__riscv_vfmv_f_s_f32m1_f32(v_a_max);
+        if(max_abs_a<1e-6f) max_abs_a=1e-6f;
+        scale_temp[kk]=max_abs_a/127.0f;
+        scale_avg+=scale_temp[kk];
     }
     scale_avg/=NSUB;
-    float scale_factor = scale_avg? 1.0f/scale_avg : 0.0f;
-    for(int kk=0;kk<NSUB;kk++){
-        float rep=scale_temp[kk]? 1.0f/scale_temp[kk] : 0.0f;
-        int32_t s=0;
-        for(int i=0;i<32;i++){ int q=(int)lrintf(a[kk*32+i]*rep); if(q>127)q=127; if(q<-128)q=-128; qa[kk][i]=(int8_t)q; s+=q; }
-        asum[kk]=(int16_t)s;
-        uint16_t ssub=f32_to_f16(scale_temp[kk]*scale_factor);
-        memcpy(out+kk*34,&ssub,2); memcpy(out+kk*34+2,qa[kk],32);
-    }
-    for(int kk=0;kk<NSUB;kk++){ uint16_t as=f32_to_f16(-(float)asum[kk]*8.0f); memcpy(out+272+kk*2,&as,2); }
+    const float scale_factor = scale_avg? 1.0f/scale_avg : 0.0f;
     uint16_t blkscale=f32_to_f16(scale_avg);
     memcpy(out+288,&blkscale,2);
+
+    for(int kk=0;kk<NSUB;kk++){
+        uint8_t*base=out+kk*34;
+        size_t vl=__riscv_vsetvl_e32m1(32);
+        vfloat32m1_t v_a=__riscv_vle32_v_f32m1(a+kk*32,vl);
+        float rep_scale_a = scale_temp[kk]? 1.0f/scale_temp[kk] : 0.0f;
+        uint16_t ssub=f32_to_f16(scale_temp[kk]*scale_factor);
+        memcpy(base,&ssub,2);
+
+        vfloat32m1_t v_a_scale = __riscv_vfmul_vf_f32m1(v_a, rep_scale_a, vl);
+        vint16mf2_t  v_a_quant = __riscv_vfncvt_x_f_w_i16mf2(v_a_scale, vl);
+        vint8mf4_t   v_a_quant_i8 = __riscv_vncvt_x_x_w_i8mf4(v_a_quant, vl);
+
+        vint16m1_t tmp_sum = __riscv_vmv_v_x_i16m1(0, vl);
+        vint16m1_t v_a_sum = __riscv_vwredsum_vs_i8mf4_i16m1(v_a_quant_i8, tmp_sum, vl);
+        int16_t a_sum = __riscv_vmv_x_s_i16m1_i16(v_a_sum);
+        uint16_t as = f32_to_f16(-(float)a_sum*8.0f);
+        memcpy(out+272+kk*2,&as,2);
+
+        __riscv_vse8_v_i8mf4(base+2, v_a_quant_i8, vl);
+    }
 }
 /* verbatim asm port of gemm_kernel_i8i4_hp_m1, generalized to k_blks superblocks */
 static void run_hp_m1(const uint8_t*a_data, const uint8_t*b_data, float*dst_c, long k_blks){
