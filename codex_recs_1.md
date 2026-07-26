@@ -1746,3 +1746,72 @@ router bucket 16.2ms, unchanged decode correctness.
 sigmoid/SwiGLU implementation"), not started. The harness is general enough to evaluate it the same
 way (teacher-forced NLL/divergence against the fp32 reference) once a candidate implementation
 exists, without needing a rewrite.
+
+### 22.16 Memory corruption root-caused (it was the autovec bug all along) + systematic toolchain hardening
+
+Per explicit direction after the int8 promotion: "next should be memory-corruption/toolchain
+hardening, then SwiGLU evaluation." Two findings, closing out both at once.
+
+**The "unresolved" `argv[7]` memory-corruption bug (§22.15) was never a separate bug.** It was the
+same vmadot-adjacent autovectorization collision already documented twice in this file, just
+manifesting as corrupted-but-not-crashing memory instead of an immediate SIGSEGV. Confirmed
+directly: rebuilt a reproduction harness (`argv[7]` restored, printed at the point that used to
+show corruption) three ways —
+
+| Build | `v[7]` at the crash-adjacent point |
+|---|---|
+| `-fsanitize=address -O1` | correct (`"1"`) |
+| `-O3`, current (harness-fixed) source | correct (`"1"`) |
+| `-O3`, source *before* the §22.15 `noinline` fixes | corrupted (`0x358637bd49742400`) |
+
+The `noinline,optimize("no-tree-vectorize")` attributes added in §22.15 to fix the *unconditional
+baseline crash* had **already fixed the argv corruption too** — this was one bug with two
+symptoms, not two bugs. §22.15's "not root-caused" note was written before circling back to
+re-verify `argv[7]` specifically after that fix landed; it should have been retested then. No
+remaining open memory-safety item from this investigation.
+
+**Systematic hardening: found the per-function attribute approach is not just reactive but
+provably incomplete, adopted a global build flag instead.** Even with every function this session
+has individually patched (`pack_A_hp`, `vdot_f32`, `vaxpy_f32`, all `harness_*` functions), the
+*now-default* int8-M1 router path was still running dramatically slower than it should — not
+crashing, just silently paying a large, real performance tax. Bisected two contributing functions
+directly (`pack_A_i8`, `lin_mm_hp_worker_run`), each independently unguarded and each responsible
+for only part of the effect (16.2ms→15.1ms and →15.6ms respectively when patched alone) — meaning
+**at least one more contributing function was never found**, because a third confirmed fact made
+further one-by-one hunting not worth it: a global `-fno-tree-vectorize` build flag captured the
+*entire* effect at once (router 16.2ms→4.4ms, a ~4x cut) and, as a side effect, *also* measurably
+improved the fp32 router path (~18-19ms→11.1ms) — a path none of the individually-tested functions
+even touch, proving there's real, uncaught exposure elsewhere in the file that per-function
+patching was never going to fully close.
+
+Verified safe and net-positive across all three router modes, repeated runs each:
+
+| Mode | Router bucket, before | Router bucket, with `-fno-tree-vectorize` |
+|---|---|---|
+| int8-M1 (default) | 16.2ms | **4.3-4.4ms** |
+| fp32 (revert flag) | ~18.7-19.0ms | **11.1ms** |
+| int4-HP (rejected, still available) | ~12.5-16.0ms (historical) | **1.5ms** |
+
+Net decode: **8.84-9.25 → 9.5-9.9 tok/s**, all with `' Tokyo'` PASS and identical generation —
+correctness unaffected, as expected (this flag only touches gcc's *automatic* vectorization pass;
+every real hot-path vectorization in this file is explicit RVV intrinsics or hand-written asm,
+neither of which the tree-vectorize pass produces or can remove). One small, consistently observed
+regression: `rope+qknorm` ~2.0ms→~3.1-3.2ms (rope's scalar `sinf`/`cosf` loop apparently was
+getting *legitimate*, correct autovectorization benefit) and `rest(other)` ~2.2ms→~8.0ms — both
+real but small relative to the router/fp32 gains, and net wall-clock is unambiguously better in
+every mode tested.
+
+**Adopted as the standing build flag** (`qwen_moe_hp.c`'s header comment): `gcc -O3
+-fno-tree-vectorize -march=rv64gcv_zvfh_xsmtvdotii -fopenmp ...`. Existing per-function
+`noinline,optimize("no-tree-vectorize")` attributes are left in place (harmless alongside the
+global flag, and useful as documentation of specifically-confirmed-affected functions), but **the
+global flag is now the load-bearing fix, not the per-function attributes** — any future function
+added to this file is automatically covered without needing to remember the attribute.
+
+**One thing this did NOT do**: fully explain *why* ordinary scalar code — no custom instructions,
+no inline asm — gets miscompiled or de-optimized by `-O3`'s tree-vectorizer specifically in this
+translation unit. Three confirmed incidents (a SIGSEGV, a corruption, a silent 4x slowdown) and a
+working fix, but the actual gcc/RVV-backend interaction responsible was never isolated further
+than "vectorizing ordinary code near vmadot-using code is unsafe on this toolchain" — that
+empirical rule has now held three times and is the operative one, whether or not the precise
+compiler-internals mechanism is ever found.

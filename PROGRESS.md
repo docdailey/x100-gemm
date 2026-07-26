@@ -2,12 +2,15 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 8.84-9.25 tok/s
+## HEADLINE: qwen_moe_hp.c is the current best engine — 9.5-9.9 tok/s
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
-untouched) for comparison. `qwen_moe_hp.c` is now **~6.1x faster**, same correctness bar (`' Tokyo'`
-PASS, coherent generation), closing in on the real vendor *binary*'s 11.71-12.89 tok/s.
+untouched) for comparison. `qwen_moe_hp.c` is now **~6.4-6.6x faster**, same correctness bar
+(`' Tokyo'` PASS, coherent generation), closing in on the real vendor *binary*'s 11.71-12.89 tok/s.
+**Build now REQUIRES `-fno-tree-vectorize`** (see the toolchain-hardening entry below and the
+file's own header comment) — this is not optional, it's a correctness/performance fix, not a
+tuning knob.
 
 **Quick start**: `ssh root@192.168.68.24` (static IP on wired Ethernet, confirmed persistent across
 reboots via NetworkManager — see Board State below); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
@@ -17,14 +20,31 @@ memory-bandwidth-bound workload, more threads just adds bus contention, see belo
 
 **Router default changed (2026-07-26): int8-M1 is now the default router (`g_router_mode` 0→2),
 router bucket ~19ms→~16ms.** Built a multi-prompt teacher-forced quality harness
-(`QWEN_HARNESS=1` env var — see `codex_recs_1.md` §22.15 for full methodology and the three real
-bugs found building it, including a still-unresolved pre-existing memory-corruption bug in the
-model-load path, flagged under Toolchain gotchas below) and ran it against int8-M1 with four
-promotion thresholds fixed in advance. **All four passed**: router expert-set mismatch 6.1%
-(<10%), avg NLL delta -0.0034 nats/tok (<0.5), token divergence 2.1% (<15%), speed 13.7% faster
-(>=10%). `g_router_mode=0` remains available as an explicit exact-fp32 revert flag; int4-HP
-(`g_router_mode=1`) remains rejected per §22.7, not promoted. SwiGLU approximation evaluation is
-the explicit next step, using the same harness, not yet started.
+(`QWEN_HARNESS=1` env var — see `codex_recs_1.md` §22.15 for full methodology) and ran it against
+int8-M1 with four promotion thresholds fixed in advance. **All four passed**: router expert-set
+mismatch 6.1% (<10%), avg NLL delta -0.0034 nats/tok (<0.5), token divergence 2.1% (<15%), speed
+13.7% faster (>=10%). `g_router_mode=0` remains available as an explicit exact-fp32 revert flag;
+int4-HP (`g_router_mode=1`) remains rejected per §22.7, not promoted. SwiGLU approximation
+evaluation is the explicit next step, using the same harness, not yet started.
+
+**Memory-corruption root-caused + systematic toolchain hardening (2026-07-26): router bucket
+16.2ms→4.4ms (int8 default), ~19ms→11.1ms (fp32), net 8.84-9.25→9.5-9.9 tok/s.** The `argv[7]`
+memory-corruption bug flagged as "unresolved" right above/below turned out to be **the same
+vmadot-adjacent autovectorization bug already documented twice in this section** — the
+`noinline,optimize("no-tree-vectorize")` fixes that resolved the harness's unconditional-crash bug
+had *already* fixed the corruption too (confirmed by rebuilding a repro three ways: ASan, current
+source, and pre-fix source — only the last one still shows corrupted `argv[7]`). One bug, two
+symptoms, not two bugs — §22.15's "not root-caused" note should have been retested and wasn't.
+Separately: even with every function individually patched so far, the *now-default* int8-M1
+router path was still silently paying a large performance tax from unguarded functions
+(`pack_A_i8`, `lin_mm_hp_worker_run`, confirmed contributors, each explaining only part of the
+effect) — a global `-fno-tree-vectorize` build flag captures the *entire* effect at once and, as a
+bonus, also sped up the untouched fp32 router path, proving real exposure remained that
+per-function patching was never going to fully close. **Adopted as the standing build flag** (see
+the file's own header comment) — every hot path in this file is explicitly vectorized (RVV
+intrinsics or asm) already, so gcc's auto-vectorizer was never buying real performance, only risk.
+Verified safe across all three router modes, correctness unaffected (`' Tokyo'` PASS throughout).
+See `codex_recs_1.md` §22.16 for the full writeup.
 
 **Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
 Per the standing review item ("otherwise move to activation packing or attention"), reused the
@@ -369,19 +389,23 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
   caused the *unconditional* baseline decode path to segfault, confirmed by reverting to the clean
   committed file (works) vs the harness-added version with the harness never even invoked
   (crashes identically). Same fix, same lesson: **any new function added to this file, however
-  innocuous, needs the attribute.**
-- **A genuine, still-UNRESOLVED pre-existing memory-corruption bug, found 2026-07-26 building the
-  quality harness (§22.15), not caused by it — just newly exposed.** An 8th positional CLI
-  argument (`argv[7]`) read back correctly at the very top of `main()` but was reproducibly
-  clobbered — to what looks like reinterpreted weight data (`0x358637bd49742400`) — by the time
-  execution reached `lin_mm_pool_init()`, somewhere during `cache_load`/model setup. Confirmed via
-  `dmesg` (the crashing `badaddr` matched the corrupted pointer value exactly) and by printing
-  every `argv[i]` at both ends of `main()`. **Never manifested before because nothing previously
-  read past `argv[6]`** (`g_router_mode`) — this is not new corruption, just newly observed.
-  **Not root-caused.** Worked around (not fixed) by switching the harness trigger to a
-  `QWEN_HARNESS=1` environment variable instead of a new CLI arg. Whoever next touches
-  `cache_load`/`model_load`/the buffer-allocation chain between them should keep this in mind — a
-  real heap or stack overflow is happening somewhere in that path.
+  innocuous, needs the attribute.** **RESOLVED SYSTEMATICALLY 2026-07-26 (§22.16)**: per-function
+  attributes proved incomplete — a global `-fno-tree-vectorize` build flag is now REQUIRED (see
+  the file's header comment), catching every past and future instance of this bug class at once
+  instead of requiring it to be remembered per new function.
+- **RESOLVED 2026-07-26 (§22.16) — the "unresolved" memory-corruption bug below was the SAME bug
+  as the autovectorization gotcha above, not a separate one.** An 8th positional CLI argument
+  (`argv[7]`) read back correctly at the very top of `main()` but was reproducibly clobbered — to
+  what looks like reinterpreted weight data (`0x358637bd49742400`) — by the time execution reached
+  `lin_mm_pool_init()`, somewhere during `cache_load`/model setup (confirmed via `dmesg`: the
+  crashing `badaddr` matched the corrupted pointer value exactly). Never manifested before because
+  nothing previously read past `argv[6]`. The `noinline,optimize("no-tree-vectorize")` fixes that
+  resolved the harness's unconditional-crash bug (above) had *already* fixed this too — confirmed
+  by rebuilding a repro three ways (ASan/`-O1`: correct; current `-O3` source: correct; pre-fix
+  `-O3` source: still corrupted). The original "not root-caused, worked around via `QWEN_HARNESS=1`
+  env var" note was written before circling back to retest `argv[7]` after that fix landed — it
+  should have been retested then. The env-var-based harness trigger is kept (cleaner CLI design
+  regardless), but the underlying corruption is understood and fixed, not just avoided.
 - **RVV widening instructions (`vfwcvt.f.f.v` etc.) read the ACTIVE vtype at the instruction's
   execution, not at the time the source register was loaded.** Second bug from the same session:
   `vle16.v` under `e16,mf2`, then a `vsetvli` to `e32,m1` for an unrelated load, THEN `vfwcvt.f.f.v`

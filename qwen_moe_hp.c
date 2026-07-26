@@ -14,8 +14,22 @@
  * against qwen3moe d=2048 qd=4096 kvd=512 moe_ffn=768 vocab=151936 -- so no remainder/padding
  * handling is needed anywhere.
  *
- * Build: gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm
+ * Build: gcc -O3 -fno-tree-vectorize -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread
  * Run  : LD_LIBRARY_PATH=/usr/lib ./qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf [ngen] [nt]
+ *
+ * -fno-tree-vectorize is REQUIRED, not optional (codex_recs_1.md §22.16): this file hand-schedules
+ * RVV vector-register state across custom vmadot asm blocks and RVV intrinsics; gcc's -O3
+ * auto-vectorizer repeatedly collides with that state when applied to ordinary nearby scalar code
+ * (three confirmed incidents this session: a SIGSEGV from an unrelated f32->f16 loop, a baseline
+ * decode crash from new harness functions, and a ~4x slowdown -- not a crash -- on the int8-M1
+ * router path from unguarded pack_A_i8/lin_mm_hp_worker_run, only found by comparing against this
+ * flag). Per-function `__attribute__((noinline,optimize("no-tree-vectorize")))` on individual hot
+ * functions was the original, narrower mitigation and is kept in place where already applied, but
+ * proved incomplete -- disabling the pass for the whole translation unit is the systematic fix.
+ * All hot-path vectorization in this file is explicit (RVV intrinsics or inline asm), so gcc's
+ * auto-vectorizer was never buying real performance here; disabling it is close to free and,
+ * empirically, was a net ~8% *speedup* (9.2->9.9 tok/s) by removing whatever pathological
+ * interaction was slowing unrelated scalar code down.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
