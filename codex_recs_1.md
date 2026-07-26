@@ -1849,3 +1849,82 @@ this same mandatory build and compared against the numbers in this table, not §
 
 **Next, per explicit instruction**: implement one flagged fast-SwiGLU candidate with quality and
 speed gates predeclared before implementation, evaluated with this same harness once it exists.
+
+### 22.18 Fast-SwiGLU candidate: hard-swish, promoted to default
+
+Per explicit instruction, only starting this after §22.17 confirmed the router promotion holds
+under the mandatory `-fno-tree-vectorize` build. Gates predeclared, in the source, before writing
+`swiglu_hswish_rvv` — not tuned after seeing results:
+
+1. Avg NLL delta < **0.3** nats/token — stricter than the router's 0.5, because SwiGLU runs on
+   *every* selected expert at *every* layer (pervasive), unlike routing, which only affects which
+   experts get chosen once per layer.
+2. Token-argmax divergence < **15%** — same bar as the router.
+3. SwiGLU bucket ≥**15%** faster than exact — stricter than the router's 10%, since replacing a
+   known-exact nonlinearity with a coarse approximation is a bigger quality gamble than an
+   already-somewhat-lossy int8 quantization, so a bigger performance case is required to accept it.
+
+**Candidate: hard-swish** (Howard et al. 2019, MobileNetV3) — `x * hard_sigmoid(x)`,
+`hard_sigmoid(x) = clamp((x+3)/6, 0, 1)`. Chosen over alternatives (a bit-manipulation fast-exp
+trick, a minimax polynomial fit) specifically because it needs **zero transcendentals** — just
+add/mul/clamp, all plain RVV float ops (`vfadd`/`vfmul`/`vfmax`/`vfmin`), genuinely vectorized
+rather than relying on gcc's autovectorizer (which §22.16 established is actively unsafe in this
+file). It's also a well-established, production-proven approximation, not something invented for
+this session.
+
+```c
+static void swiglu_hswish_rvv(float*g,const float*u,int n){
+    int i=0;
+    while(i<n){ size_t vl=__riscv_vsetvl_e32m1(n-i);
+        vfloat32m1_t vx=__riscv_vle32_v_f32m1(g+i,vl), vu=__riscv_vle32_v_f32m1(u+i,vl);
+        vfloat32m1_t vh=__riscv_vfadd_vf_f32m1(vx,3.0f,vl);
+        vh=__riscv_vfmul_vf_f32m1(vh,1.0f/6.0f,vl);
+        vh=__riscv_vfmax_vf_f32m1(vh,0.0f,vl);
+        vh=__riscv_vfmin_vf_f32m1(vh,1.0f,vl);
+        vfloat32m1_t vy=__riscv_vfmul_vv_f32m1(vx,vh,vl);
+        vy=__riscv_vfmul_vv_f32m1(vy,vu,vl);
+        __riscv_vse32_v_f32m1(g+i,vy,vl); i+=vl; }
+}
+```
+
+**Two-tier validation, matching this file's established discipline but adapted for a genuinely
+lossy approximation** (unlike every other RVV port in this file, there's no bit-exact oracle to
+check against here):
+1. **Vectorization correctness** (`bench/swiglu_hswish_probe.c`): compares the RVV implementation
+   against a scalar implementation of the *same* hard-swish formula, across 50,000 trials × 768
+   elements (the real `moe_ffn` width), spanning wide/near-zero/exact-zero/extreme-saturating
+   input distributions. **0 mismatches, max abs diff 3.8e-6** (float rounding noise) — the vector
+   code is a correct implementation of the formula. This catches implementation bugs, separately
+   from asking whether the formula itself is a good enough approximation.
+2. **Approximation quality**: the multi-prompt harness, extended with a new phase — reference
+   generation held at *today's actual production default* (int8-M1 router + exact SwiGLU, not the
+   original fp32 ground truth, since the question is "does adding this on top of what already
+   ships cause a problem," not a re-litigation of the router decision), then hard-swish
+   teacher-forced against that reference.
+
+**Result, 10 prompts, 192 tokens:**
+
+| Metric | Threshold | Result | Verdict |
+|---|---|---|---|
+| Avg NLL delta | < 0.3 nats/tok | **+0.0969** | PASS |
+| Token-argmax divergence | < 15% | **5.7%** (11/192) | PASS |
+| SwiGLU bucket speedup | ≥ 15% | **96.2%** (14.00→0.53ms) | PASS |
+
+All three thresholds pass, though — worth stating plainly rather than burying it — both quality
+metrics are meaningfully higher than the router's corresponding numbers (NLL delta +0.0969 vs the
+router's ±0.006-0.01; divergence 5.7% vs the router's 1.6-2.1%). This is expected and was
+anticipated when the stricter thresholds were set: hard-swish is a real, coarser approximation of
+an actual nonlinearity, not a numerically-close quantization of weights. It clears the
+predeclared, stricter bar comfortably, but by a smaller margin than the router did. The speedup is
+dramatic (96.2%, removing per-element `expf()` transcendental calls entirely) — `moe_ffn`=768
+elements × 8 experts × 48 layers × every generated token, previously the single most
+expensive-per-element scalar operation in the file after activation packing was fixed (§22.10).
+
+**Promoted to production default** (`g_swiglu_fast` default 0→1), per the standing instruction
+("keep both [router and SwiGLU] behind flags until they pass the harness"). `g_swiglu_fast=0`
+remains available as an explicit exact-SiLU revert flag (8th CLI arg). Verified on the board,
+repeated runs: `' Tokyo'` PASS, identical generation, swiglu bucket 14.0ms→0.4-0.6ms, **decode
+9.5-9.9→11.49-11.5 tok/s** — the single largest per-token-time win of the session, on top of
+everything already landed.
+
+**Session cumulative, from the original 1.49 tok/s pure-scalar baseline: ~7.7x.**

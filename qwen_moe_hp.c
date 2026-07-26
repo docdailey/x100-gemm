@@ -585,6 +585,34 @@ static void vaxpy_f32(float*y,const float*x,float scale,int n){
         vy=__riscv_vfmacc_vf_f32m1(vy,scale,vx,vl);
         __riscv_vse32_v_f32m1(y+i,vy,vl); i+=vl; }
 }
+/* SwiGLU (codex_recs_1.md §22.18): g_swiglu_fast selects exact SiLU(x)*u (default, `expf`-based,
+ * matches the original engine exactly) or a candidate fast approximation, gated behind the flag
+ * per standing instruction ("avoid approximate SwiGLU until broader quality tests exist" --
+ * that broader test now exists, codex_recs_1.md §22.15/17). Unlike every other RVV port in this
+ * file, the fast path is NOT validated bit-exact against the exact path -- it's a deliberate lossy
+ * approximation; its quality is judged by the multi-prompt harness against the gates predeclared
+ * in §22.18, not an oracle. The RVV implementation itself IS validated against a scalar reference
+ * of the SAME formula (bench/swiglu_hswish_probe.c) to catch vectorization bugs, separately from
+ * asking whether the approximation itself is good enough. */
+static void swiglu_exact(float*g,const float*u,int n){
+    for(int i=0;i<n;i++){ float x=g[i]; g[i]=(x/(1.0f+expf(-x)))*u[i]; }
+}
+/* hard-swish (Howard et al. 2019, MobileNetV3): x*hard_sigmoid(x), hard_sigmoid(x)=clamp((x+3)/6,0,1).
+ * No transcendentals -- pure add/mul/clamp, so this is genuinely RVV-vectorized (not relying on
+ * gcc autovec, matching this file's explicit-vectorization-only policy, codex_recs_1.md §22.16). */
+static void swiglu_hswish_rvv(float*g,const float*u,int n){
+    int i=0;
+    while(i<n){ size_t vl=__riscv_vsetvl_e32m1(n-i);
+        vfloat32m1_t vx=__riscv_vle32_v_f32m1(g+i,vl), vu=__riscv_vle32_v_f32m1(u+i,vl);
+        vfloat32m1_t vh=__riscv_vfadd_vf_f32m1(vx,3.0f,vl);
+        vh=__riscv_vfmul_vf_f32m1(vh,1.0f/6.0f,vl);
+        vh=__riscv_vfmax_vf_f32m1(vh,0.0f,vl);
+        vh=__riscv_vfmin_vf_f32m1(vh,1.0f,vl);
+        vfloat32m1_t vy=__riscv_vfmul_vv_f32m1(vx,vh,vl);
+        vy=__riscv_vfmul_vv_f32m1(vy,vu,vl);
+        __riscv_vse32_v_f32m1(g+i,vy,vl); i+=vl; }
+}
+static int g_swiglu_fast=0; /* global default; main() sets the real default (1, hard-swish) -- see §22.18 for gates/results */
 /* Router-as-HP-Lin experiment (research_feed_paths.md/codex_recs_1.md): router is itself a 128xd
  * Lin, same shape family as q/k/v/eg/eu/ed/lm. First attempt (retracted) hand-wrote a standalone
  * fp16-weight dot product run single-threaded on the main thread -- NOT representative of how
@@ -757,7 +785,7 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
               lin_mm_hp(&ly->eg[e],Abuf2,g,nt); lin_mm_hp(&ly->eu[e],Abuf2,u,nt);
               if(gT_on) lin_add(now()-_tb);
               double _ts=gT_on?now():0;
-              for(int i=0;i<moe;i++){ float x=g[i]; g[i]=(x/(1.0f+expf(-x)))*u[i]; }
+              if(g_swiglu_fast) swiglu_hswish_rvv(g,u,moe); else swiglu_exact(g,u,moe);
               if(gT_on) gT_swiglu+=now()-_ts;
               lin_mm(&ly->ed[e],g,tmp,nt,Abuf); /* attributes to gT_lin_exp via g_lin_class */
               g_lin_class=LIN_NONE;
@@ -844,6 +872,41 @@ static void harness_run_fp32(Model*m,const HarnessPrompt*hp,int*out_toks,float*o
         forward(m,cur,hp->n+s-1,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
         cur=argmax(logits,m->vocab); out_toks[s]=cur; out_selfnll[s]=harness_nll(logits,m->vocab,cur);
     }
+}
+/* SwiGLU evaluation (§22.18): reference generation under TODAY's production default (int8-M1
+ * router, g_router_mode=2 -- NOT fp32/mode=0 like harness_run_fp32 above, which is the original
+ * router-promotion ground truth, kept as-is for history) with exact SwiGLU. This is deliberately a
+ * separate function rather than a parameterized reuse of harness_run_fp32: the SwiGLU question is
+ * "does adding fast SwiGLU on top of what's already shipping cause a problem", not a re-litigation
+ * of the router decision, so the reference must match current production exactly, router included. */
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void harness_run_prod_reference(Model*m,const HarnessPrompt*hp,int*out_toks,float*out_selfnll,Kv*kv,
+        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
+    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
+    g_router_mode=2; g_router_validate=0; g_swiglu_fast=0;
+    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    int cur=argmax(logits,m->vocab); out_toks[0]=cur; out_selfnll[0]=harness_nll(logits,m->vocab,cur);
+    for(int s=1;s<hp->gen;s++){
+        forward(m,cur,hp->n+s-1,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+        cur=argmax(logits,m->vocab); out_toks[s]=cur; out_selfnll[s]=harness_nll(logits,m->vocab,cur);
+    }
+}
+/* teacher-forces under production router (int8-M1, held constant) with the given SwiGLU mode --
+ * isolates the SwiGLU delta specifically, same teacher-forcing methodology as the router harness
+ * (feed the reference token regardless of what this config would itself pick, so one divergence
+ * never compounds into a different context for later positions). No router validation needed here
+ * (not testing router quality), so no do_validate split like the router version required. */
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void harness_run_swiglu_teacherforced(Model*m,const HarnessPrompt*hp,const int*ref,int swiglu_fast,int*out_div,float*out_nll,Kv*kv,
+        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
+    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
+    g_router_mode=2; g_router_validate=0; g_swiglu_fast=swiglu_fast;
+    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    for(int s=0;s<hp->gen;s++){
+        out_div[s]=(argmax(logits,m->vocab)!=ref[s]); out_nll[s]=harness_nll(logits,m->vocab,ref[s]);
+        forward(m,ref[s],hp->n+s,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    }
+    g_swiglu_fast=0;
 }
 /* do_validate=1 also computes router expert-set mismatch stats (g_router_validate=1), which
  * makes EVERY forward() call additionally compute the other router variants plus O(experts)
@@ -946,6 +1009,56 @@ static void run_quality_harness(Model*m){
     printf("  [%s] router bucket >=10%% faster than fp32   (got %.1f%%)\n",p4?"PASS":"FAIL",speedup_pct);
     printf("VERDICT: int8-M1 router %s promotion to default.\n",(p1&&p2&&p3&&p4)?"PASSES all thresholds -- ELIGIBLE FOR":"FAILS at least one threshold -- NOT ELIGIBLE FOR");
 
+    /* ===== SwiGLU evaluation (codex_recs_1.md §22.18) — gates predeclared BEFORE this code was
+     * written: avg NLL delta < 0.3 nats/tok (stricter than router's 0.5 -- SwiGLU runs on every
+     * selected expert at every layer, far more pervasive than routing, which only affects WHICH
+     * experts are chosen), token divergence < 15% (same bar as router), swiglu bucket >=15%
+     * faster (stricter than router's 10% -- a coarser approximation needs a bigger performance
+     * case). Reference is TODAY's production default (int8-M1 router + exact SwiGLU), not the
+     * original fp32 ground truth -- this tests one additional change on top of what already
+     * ships, not a re-litigation of the router decision. */
+    static int swiglu_ref[HARNESS_NP][HARNESS_GEN_SHORT];
+    static float swiglu_selfnll[HARNESS_NP][HARNESS_GEN_SHORT];
+    printf("\n=== quality harness: SwiGLU phase 1/3 -- production reference (int8 router + exact SwiGLU) ===\n");
+    gT_on=1; gT_tok=0; gT_actpack=gT_lin=gT_attn=gT_rope=gT_router=gT_swiglu=gT_rest=0;
+    for(int i=0;i<HARNESS_NP;i++){
+        harness_run_prod_reference(m,&g_hprompts[i],swiglu_ref[i],swiglu_selfnll[i],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        printf("  [%2d/%d] %-24s done\n",i+1,HARNESS_NP,g_hprompts[i].name);
+    }
+    long tok_exact=gT_tok; double swiglu_exact_t=gT_swiglu;
+
+    printf("\n=== quality harness: SwiGLU phase 2/3 -- hard-swish candidate, teacher-forced ===\n");
+    typedef struct { const char*name; int gen,divergent; float nll_fast,nll_exact; } SRes;
+    SRes sres[HARNESS_NP];
+    for(int i=0;i<HARNESS_NP;i++){
+        int div[HARNESS_GEN_SHORT]; float nll[HARNESS_GEN_SHORT];
+        harness_run_swiglu_teacherforced(m,&g_hprompts[i],swiglu_ref[i],1,div,nll,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        SRes*r=&sres[i]; r->name=g_hprompts[i].name; r->gen=g_hprompts[i].gen; r->divergent=0; r->nll_fast=0; r->nll_exact=0;
+        for(int s=0;s<r->gen;s++){ r->divergent+=div[s]; r->nll_fast+=nll[s]; r->nll_exact+=swiglu_selfnll[i][s]; }
+        printf("  [%2d/%d] %-24s divergent=%2d/%-2d  nll_delta=%+.4f\n",i+1,HARNESS_NP,r->name,r->divergent,r->gen,(r->nll_fast-r->nll_exact)/r->gen);
+    }
+    long tok_fast=gT_tok-tok_exact; double swiglu_fast_t=gT_swiglu-swiglu_exact_t;
+    gT_on=0;
+
+    int total_gen2=0,total_div2=0; double total_nll_fast=0,total_nll_exact2=0;
+    for(int i=0;i<HARNESS_NP;i++){ total_gen2+=sres[i].gen; total_div2+=sres[i].divergent; total_nll_fast+=sres[i].nll_fast; total_nll_exact2+=sres[i].nll_exact; }
+    double div_rate2=100.0*total_div2/total_gen2, nll_delta2=(total_nll_fast-total_nll_exact2)/total_gen2;
+    double exact_ms=tok_exact?swiglu_exact_t/tok_exact*1e3:0, fast_ms=tok_fast?swiglu_fast_t/tok_fast*1e3:0;
+    double swiglu_speedup=exact_ms?100.0*(exact_ms-fast_ms)/exact_ms:0;
+
+    printf("\n=== SWIGLU HARNESS REPORT (hard-swish vs exact, production router held constant, %d prompts, %d tokens) ===\n",HARNESS_NP,total_gen2);
+    printf("token-argmax divergence: %d/%d (%.1f%%)\n",total_div2,total_gen2,div_rate2);
+    printf("avg NLL delta (fast tf - exact self): %+.4f nats/token\n",nll_delta2);
+    printf("speed: exact swiglu %.2fms/tok, fast swiglu %.2fms/tok (%.1f%% %s)\n",
+        exact_ms,fast_ms,swiglu_speedup>=0?swiglu_speedup:-swiglu_speedup,swiglu_speedup>=0?"faster":"slower");
+
+    printf("\n--- SwiGLU promotion thresholds (fixed before implementation, codex_recs_1.md §22.18) ---\n");
+    int q1=nll_delta2<0.3, q2=div_rate2<15.0, q3=swiglu_speedup>=15.0;
+    printf("  [%s] avg NLL delta < 0.3 nats/token          (got %+.4f)\n",q1?"PASS":"FAIL",nll_delta2);
+    printf("  [%s] token divergence < 15%%                  (got %.1f%%)\n",q2?"PASS":"FAIL",div_rate2);
+    printf("  [%s] swiglu bucket >=15%% faster than exact    (got %.1f%%)\n",q3?"PASS":"FAIL",swiglu_speedup);
+    printf("VERDICT: hard-swish SwiGLU %s promotion to default.\n",(q1&&q2&&q3)?"PASSES all thresholds -- ELIGIBLE FOR":"FAILS at least one threshold -- NOT ELIGIBLE FOR");
+
     free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
     free(kv.Kc);free(kv.Vc);
 }
@@ -961,6 +1074,7 @@ int main(int c,char**v){
     const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.hp.imecache";
     g_router_validate=(c>5)?atoi(v[5]):0; /* router HP-Lin/int8-vs-fp32 expert-selection validation, off by default (extra compute) */
     g_router_mode=(c>6)?atoi(v[6]):2; /* 0=fp32(exact, revert flag) 1=int4-HP(rejected, see §22.7) 2=int8-M1(DEFAULT since 2026-07-26 -- passed the multi-prompt quality harness, codex_recs_1.md §22.15: 6.1% router mismatch, -0.0034 nats/tok NLL delta, 2.1% token divergence, 13.7% faster, all four pre-registered thresholds PASS) */
+    g_swiglu_fast=(c>7)?atoi(v[7]):1; /* 0=exact(revert flag) 1=hard-swish(DEFAULT since 2026-07-26 -- passed the multi-prompt harness, codex_recs_1.md §22.18: +0.0969 nats/tok NLL delta, 5.7% token divergence, 96.2% faster, all three pre-registered thresholds PASS) */
     Model m; double tl=now(); int cached=0;
     if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
     else { model_load(&m,&g,nt); fprintf(stderr,"requant loaded in %.1fs\n",now()-tl); }

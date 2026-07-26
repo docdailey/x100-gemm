@@ -2,15 +2,15 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 9.5-9.9 tok/s
+## HEADLINE: qwen_moe_hp.c is the current best engine — 11.49-11.5 tok/s
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
-untouched) for comparison. `qwen_moe_hp.c` is now **~6.4-6.6x faster**, same correctness bar
-(`' Tokyo'` PASS, coherent generation), closing in on the real vendor *binary*'s 11.71-12.89 tok/s.
-**Build now REQUIRES `-fno-tree-vectorize`** (see the toolchain-hardening entry below and the
-file's own header comment) — this is not optional, it's a correctness/performance fix, not a
-tuning knob.
+untouched) for comparison. `qwen_moe_hp.c` is now **~7.7x faster**, same correctness bar
+(`' Tokyo'` PASS, coherent generation) — within ~2% of the real vendor *binary*'s 11.71-12.89
+tok/s, the closest this session has gotten. **Build now REQUIRES `-fno-tree-vectorize`** (see the
+toolchain-hardening entry below and the file's own header comment) — this is not optional, it's a
+correctness/performance fix, not a tuning knob.
 
 **Quick start**: `ssh root@192.168.68.24` (static IP on wired Ethernet, confirmed persistent across
 reboots via NetworkManager — see Board State below); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
@@ -57,6 +57,27 @@ dropping proportionally further — consistent with, not contradicting, §22.16'
 `codex_recs_1.md` §22.17. **Next**: implement one flagged fast-SwiGLU candidate with quality/speed
 gates predeclared before implementation, per explicit instruction not started until this
 confirmation landed.
+
+**Fast-SwiGLU promoted to default (2026-07-26): swiglu bucket 14.0ms→0.4-0.6ms, decode
+9.5-9.9→11.49-11.5 tok/s — the largest single per-token win this session.** Implemented
+hard-swish (Howard et al. 2019, MobileNetV3 — `x*clamp((x+3)/6,0,1)`, zero transcendentals, pure
+RVV vector ops) as `g_swiglu_fast`, gates predeclared before writing any code: avg NLL delta <0.3
+nats/tok (stricter than the router's 0.5 — SwiGLU runs on every expert at every layer, not once
+per layer like routing), token divergence <15%, swiglu bucket ≥15% faster. Validated the RVV
+implementation against a scalar reference of the *same* hard-swish formula first (0/38.4M element
+mismatches, `bench/swiglu_hswish_probe.c`) — this checks vectorization correctness, not
+approximation quality, since unlike every other RVV port in this file there's no bit-exact oracle
+for a deliberate approximation. Extended the harness with a new phase, reference held at *today's*
+production default (int8 router + exact SwiGLU) rather than the original fp32 ground truth, since
+the question is whether adding this on top of what already ships causes a problem. **Result: NLL
+delta +0.0969 (<0.3), divergence 5.7% (<15%), speed 96.2% faster (<15% required) — all three PASS**,
+though both quality numbers are meaningfully higher than the router's (expected — a real
+approximation of a nonlinearity, not a numerically-close weight quantization; the stricter
+thresholds were set anticipating this and it cleared them with real but smaller margin than the
+router did). **Promoted** (`g_swiglu_fast` default 0→1) per the standing instruction ("keep both
+[router and SwiGLU] behind flags until they pass the harness"); `g_swiglu_fast=0` remains an
+explicit exact-SiLU revert flag. See `codex_recs_1.md` §22.18 for the full writeup. **Session
+cumulative from the original 1.49 tok/s baseline: ~7.7x.**
 
 **Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
 Per the standing review item ("otherwise move to activation packing or attention"), reused the
