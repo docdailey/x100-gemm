@@ -1264,3 +1264,63 @@ than int4's 60.3%, but it isn't clean zero, and the same limitation applies as i
 Unlike int4 (where the modest speedup plus high perturbation made the call fairly easy), int8's
 tradeoff is closer and worth an explicit decision now that both are quantified on the actual model
 — not left as another open item to revisit blind.
+
+### 22.9 Attention vectorized (RVV) — reused the router's own primitives, bigger win than the router got
+
+With the router default settled at fp32 (§22.7-22.8, both quantized modes kept experimental), the
+standing review item was: "otherwise move to activation packing or attention." Chose attention over
+activation-packing (`pack_A_hp`/`pack_act_hp`) because attention's cost scales with context length —
+a fixed win here compounds as generations get longer, unlike a fixed per-call packing cost.
+
+The attention inner loop (`forward()`) was still fully scalar: a triple-nested loop computing the
+QK dot product per (head, position) pair, then the AV weighted-sum accumulation, both by hand with
+no vectorization at all — despite the router matvec next to it having already been vectorized in
+§22.4. Two changes, both **exact vectorization of the same math, zero approximation risk** (same
+class as the RoPE-cache and router-RVV fixes in §22.4, not a lossy approximation like SwiGLU would
+require):
+
+- **QK dot product**: reused `vdot_f32` as-is — the same RVV `vfmacc_vv_f32m1` +
+  `vfredusum_vs_f32m1_f32m1` helper written for the router matvec in §22.4, now called once per
+  (head, position) pair instead of a hand-written scalar accumulation loop.
+- **AV weighted accumulation**: no existing helper matched the `y[i] += scale*x[i]` (axpy) shape, so
+  added `vaxpy_f32(float*y, const float*x, float scale, int n)` — vector-length-agnostic RVV
+  `vfmacc_vf_f32m1` (scalar-broadcast multiply-accumulate), the vector-length-agnostic loop pattern
+  already established in this file (`__riscv_vsetvl_e32m1` driving the tail).
+
+```c
+static void vaxpy_f32(float*y,const float*x,float scale,int n){
+    int i=0;
+    while(i<n){ size_t vl=__riscv_vsetvl_e32m1(n-i);
+        vfloat32m1_t vx=__riscv_vle32_v_f32m1(x+i,vl), vy=__riscv_vle32_v_f32m1(y+i,vl);
+        vy=__riscv_vfmacc_vf_f32m1(vy,scale,vx,vl);
+        __riscv_vse32_v_f32m1(y+i,vy,vl); i+=vl; }
+}
+```
+
+Neither change needed the `noinline,optimize("no-tree-vectorize")` isolation from §22.6's toolchain
+gotchas — both are plain e32m1 same-width RVV (load/fmacc/store), not a widening convert, and the
+existing `vdot_f32` already proved this same instruction shape compiles and runs correctly here.
+
+**Result: attention 18.7ms→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.** Two independent runs on
+the board, both `' Tokyo'` PASS with identical continued generation (Brasília, Ottawa):
+
+| Run | attention | wall | tok/s |
+|---|---|---|---|
+| 1 | 9.2ms | 130.3ms | 7.68 |
+| 2 | 9.1ms | 126.8ms | 7.89 |
+
+The 9.1-9.2ms spread is run-to-run noise, not a regression — both are consistent with the same
+~51% cut from the 18.7ms baseline that had held since §22.4.
+
+**Notably bigger win than the router's own RVV pass got (1.6x, §22.4)**, despite reusing the exact
+same `vdot_f32` primitive. The difference is access pattern, not the vectorization itself: the
+router matvec streams ~1MB/layer from a memory-bandwidth-bound gather (§22.4's conclusion — the
+1.6x ceiling was DRAM streaming, not the scalar multiply), while attention's QK/AV arrays are dense,
+small (`hd`-sized per head), and sequentially accessed — squarely compute-bound at this scale, so
+the same instruction-level vectorization has far more room to help.
+
+Bucket ranking is now: `linear(kernel)` 59.0ms (~47% of wall, unchanged) > `router` 22.1ms (fp32) >
+`act-pack` 17.4ms > `swiglu` 14.0ms (still untouched, still deferred pending broader quality
+validation) > `attention` 9.1ms (no longer tied with router) > `rope` 2.0ms > `rest(other)` 2.1ms.
+Activation-packing remains the other, still-unaddressed half of this review item — a candidate for
+a follow-up pass, not yet attempted.

@@ -2,22 +2,35 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 7.51-7.54 tok/s
+## HEADLINE: qwen_moe_hp.c is the current best engine — 7.68-7.89 tok/s
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
-untouched) for comparison. `qwen_moe_hp.c` is **5.06x faster**, same correctness bar (`' Tokyo'`
+untouched) for comparison. `qwen_moe_hp.c` is now **~5.2x faster**, same correctness bar (`' Tokyo'`
 PASS, coherent generation), still below the real vendor *binary*'s 11.71-12.89 tok/s.
 
-**Quick start**: `ssh root@192.168.68.24` (IP not reliably static right now — check the "IP is not
-reliably static" note under Board State below if this fails); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
+**Quick start**: `ssh root@192.168.68.24` (static IP on wired Ethernet, confirmed persistent across
+reboots via NetworkManager — see Board State below); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
 → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache`
 reloads in ~22s and prints buckets. **nt=4 is the right default** (nt=8 measured slightly worse —
 memory-bandwidth-bound workload, more threads just adds bus contention, see below).
 
-**Current bucket ranking** (wall ~132.6ms/tok): `linear(kernel)` 58.5ms (44%, still dominant) >
-`router`≈`attention` 18.7ms each > `act-pack` 17.3ms > `swiglu` 14.2ms (untouched) > `rope` 2.0ms
-> `rest(other)` 2.2ms (confirms the bucket split is essentially complete).
+**Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
+Per the standing review item ("otherwise move to activation packing or attention"), reused the
+router's proven `vdot_f32` (RVV `vfmacc`+`vfredusum`) for the QK dot product and added a new
+`vaxpy_f32` (`y[i]+=scale*x[i]`, RVV `vfmacc_vf`) for the AV weighted accumulation — replacing the
+fully scalar triple-nested attention loop. Chosen over activation-packing because attention cost
+scales with context length. Bigger win than the router's RVV pass (1.6x) because attention's access
+pattern is dense/sequential (cache-friendly), unlike the router's ~1MB/layer memory-bandwidth-bound
+gather. Correctness confirmed on two separate runs: `' Tokyo'` PASS, identical generation (Brasília,
+Ottawa) both times; attention held at 9.2ms then 9.1ms (noise-level difference, not regression).
+Zero approximation risk (exact vectorization of the same math, same as the RoPE-cache and router-RVV
+fixes) — consistent with the standing instruction to leave approximate SwiGLU alone until broader
+quality validation exists.
+
+**Current bucket ranking** (wall ~125.8-126.8ms/tok): `linear(kernel)` 59.0ms (~47%, still dominant) >
+`router` 22.1ms (fp32 default) > `act-pack` 17.4ms > `swiglu` 14.0ms (untouched) > `attention` 9.1ms
+(down from 18.7ms — no longer tied with router) > `rope` 2.0ms > `rest(other)` 2.1ms.
 
 **Router-as-quantized-Lin fp16 experiment — real result, but the "stop here" conclusion was
 premature (self-correction, flagged by review).** Weight-only fp16 (activation stays fp32),
@@ -156,23 +169,26 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
 - `bench/{decode_layer,moe_decode,q4_gemv,gguf_dump}.c` — throughput harnesses (synthetic ceilings, NOT real tok/s).
 - `codex_recs_1.md` §20-22 = appended findings (§22 = the vendor-kernel integration, this session). `research_feed_paths.md` = feeding research + §12 results log (review before next branch).
 
-## Board state (root@192.168.68.88 *usually* -- see IP note below; A100 harts 8-15 VLEN=1024, X100 harts 0-7 VLEN=256)
-- **IP is not reliably static anymore (2026-07-26).** After hours of sustained heavy compute (full
-  30B model loads, repeated multi-threaded kernel benchmarking at max core utilization), the board
-  went fully unreachable — not just SSH refusing, but no response on IPv4 ARP/ICMP *or* IPv6 NDP/
-  link-local from any interface on this Mac. Power-cycling brought it back on **Wi-Fi at
-  192.168.68.92** (its usual static-IP port was occupied when it rejoined, per the person
-  physically at the board) rather than .88. **Check both .88 and .92** (or `arp -a` /
-  `nmap -sn 192.168.68.0/24`) if SSH to .88 fails before assuming the board is down.
+## Board state (root@192.168.68.24 static, wired Ethernet; A100 harts 8-15 VLEN=1024, X100 harts 0-7 VLEN=256)
+- **IP is now static on wired Ethernet (fixed 2026-07-26).** After the board bounced between .88
+  (wired) and .92 (Wi-Fi) across several power-cycles, set a persistent static IP via
+  NetworkManager on the wired interface: **192.168.68.24**. Confirmed reachable and stable across
+  a subsequent unexpected reboot (board came back up on .24 with no manual intervention). If SSH to
+  .24 ever fails, fall back to `arp -a` / `nmap -sn 192.168.68.0/24` to find where it landed before
+  assuming the board is down — the underlying cause of the earlier IP bouncing (a full power-cycle
+  changing which interface came up first) was never root-caused, just worked around.
 - **Thermal: fan was governor-controlled and NOT running at full speed under sustained load, likely
-  contributing to the crash above.** `thermal_zone3` (type `thermal_cluster0`) is the ONLY zone
-  bound to `cooling_device1` (pwm-fan, all 8 of its trip points) — it has no cpufreq/GPU role, so
-  its `step_wise` governor exists purely to modulate fan speed. **Fixed 2026-07-26**: disabled that
-  zone's governor (`echo disabled > .../thermal_zone3/mode`) and pinned the fan to max
+  contributing to earlier unreachability incidents.** `thermal_zone3` (type `thermal_cluster0`) is
+  the ONLY zone bound to `cooling_device1` (pwm-fan, all 8 of its trip points) — it has no cpufreq/
+  GPU role, so its `step_wise` governor exists purely to modulate fan speed. **Fixed 2026-07-26**:
+  disabled that zone's governor (`echo disabled > .../thermal_zone3/mode`) and pinned the fan to max
   (`cooling_device1/cur_state=8`, `hwmon8/pwm1=255`, confirmed 6666 RPM vs the ~3724 RPM baseline)
   — this does NOT affect CPU/GPU overheat throttling, which lives in the other 6 zones and is
   untouched. Made persistent via `/etc/systemd/system/fan-max.service` (oneshot, `enabled`,
-  survives reboot) running `/usr/local/bin/fan-max.sh`. Verify after any reboot:
+  survives reboot) running `/usr/local/bin/fan-max.sh`. **Reconfirmed working after an unexpected
+  reboot on 2026-07-26**: service was `enabled`/`active`, `thermal_zone3/mode=disabled`,
+  `cooling_device1/cur_state=8/8`, temps 53-58°C — the persistence mechanism holds across reboots,
+  not just across sessions. Verify after any reboot:
   `systemctl status fan-max.service; cat /sys/class/hwmon/hwmon7/fan1_input` (expect ~6000+ RPM).
 - Model: `/root/models/Qwen3-30B-A3B-Q4_0.gguf` (17GB, unsloth base — NOT the Coder variant on NAS).
 - **Current (qwen_moe_hp.c)**: binary `/root/qwen_moe_hp`. Build: `gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread`.
@@ -235,12 +251,16 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
 
 ## Next-session quick start
 See HEADLINE at the top of this doc — `qwen_moe_hp.c` is current, `qwen_moe.c` is superseded.
-1. `ssh root@192.168.68.88`; HP cache exists → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache` reloads in ~22s and prints buckets.
-2. Router-as-Lin fp16 experiment is DONE (validated 0/1344 expert-set mismatches, but no speedup —
-   don't pursue W4 router, see HEADLINE). SwiGLU (14.2ms, now the largest untouched bucket)
-   deliberately deferred — needs quality validation beyond the single-prompt coherence check
-   before approximating `expf`/sigmoid. `linear(kernel)` (58.5ms, 44% of wall) is still the single
-   biggest item and hasn't been revisited since A3's hot-timing validation.
+1. `ssh root@192.168.68.24` (static, wired); HP cache exists → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache` reloads in ~22s and prints buckets.
+2. Router: fp32 is the production default; int4-HP and int8-M1 are both real, validated, and kept
+   behind the `g_router_mode` experimental flag (7th CLI arg) — see HEADLINE and codex_recs_1.md
+   §22.7-22.8 for the full quality-vs-speed tradeoff on each. Attention is now vectorized (9.1ms,
+   see HEADLINE) — no longer tied with router as a bottleneck. SwiGLU (14.0ms) is now the largest
+   fully-untouched bucket, deliberately deferred — needs quality validation beyond the
+   single-prompt coherence check before approximating `expf`/sigmoid. `linear(kernel)` (59.0ms,
+   ~47% of wall) is still the single biggest item and hasn't been revisited since A3's hot-timing
+   validation. Activation-packing (`pack_act_hp`) remains unvectorized — the other half of the
+   "activation packing or attention" item, not yet attempted.
 3. To run the router fp16-vs-fp32 validator again: pass a 6th CLI arg of `1` (e.g. `... 16 4
    /root/models/qwen3-30b-a3b.hp.imecache 1`) — adds a "router fp16-vs-fp32" summary line but
    roughly doubles the router bucket's cost (computes both paths), so leave it off (`0` or omit)

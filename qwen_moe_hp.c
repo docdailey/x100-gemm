@@ -515,6 +515,17 @@ static float vdot_f32(const float*a,const float*b,int n){
     vfloat32m1_t vsum=__riscv_vfredusum_vs_f32m1_f32m1(vacc,vzero,__riscv_vsetvlmax_e32m1());
     return __riscv_vfmv_f_s_f32m1_f32(vsum);
 }
+/* y[i] += scale*x[i], vector-length-agnostic. Attention's QK-dot (vdot_f32, reused) and AV
+ * weighted-accumulate (this) are the same unvectorized-dot/axpy patterns already vectorized for
+ * the router matvec -- same technique, applied to the other scalar-C hot loop (item 5 of the
+ * router review: "otherwise move to activation packing or attention"). */
+static void vaxpy_f32(float*y,const float*x,float scale,int n){
+    int i=0;
+    while(i<n){ size_t vl=__riscv_vsetvl_e32m1(n-i);
+        vfloat32m1_t vx=__riscv_vle32_v_f32m1(x+i,vl), vy=__riscv_vle32_v_f32m1(y+i,vl);
+        vy=__riscv_vfmacc_vf_f32m1(vy,scale,vx,vl);
+        __riscv_vse32_v_f32m1(y+i,vy,vl); i+=vl; }
+}
 /* Router-as-HP-Lin experiment (research_feed_paths.md/codex_recs_1.md): router is itself a 128xd
  * Lin, same shape family as q/k/v/eg/eu/ed/lm. First attempt (retracted) hand-wrote a standalone
  * fp16-weight dot product run single-threaded on the main thread -- NOT representative of how
@@ -629,9 +640,9 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         memcpy(Kc+(size_t)pos*kvd,k,kvd*4); memcpy(Vc+(size_t)pos*kvd,vv,kvd*4);
         float scale=1.0f/sqrtf(hd); double _at=gT_on?now():0;
         for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q+hh*hd,*sc=tmp;
-            for(int j=0;j<=pos;j++){ float*kj=Kc+(size_t)j*kvd+kvh*hd,dd=0; for(int t=0;t<hd;t++)dd+=qh[t]*kj[t]; sc[j]=dd*scale; }
+            for(int j=0;j<=pos;j++){ float*kj=Kc+(size_t)j*kvd+kvh*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
             softmax(sc,pos+1); float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-            for(int j=0;j<=pos;j++){ float w=sc[j],*vj=Vc+(size_t)j*kvd+kvh*hd; for(int t=0;t<hd;t++)oh[t]+=w*vj[t]; } }
+            for(int j=0;j<=pos;j++){ float*vj=Vc+(size_t)j*kvd+kvh*hd; vaxpy_f32(oh,vj,sc[j],hd); } }
         if(gT_on) gT_attn += now()-_at;
         lin_mm(&ly->o,att,tmp,nt,Abuf); for(int i=0;i<d;i++)h[i]+=tmp[i];
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
