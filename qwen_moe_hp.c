@@ -766,6 +766,176 @@ static void tok_print(Gguf*g,int id){ if(!g_bi)bdec_init(); if(id<0||id>=g->ntok
         else if((c>>4)==14){cp=((c&0xf)<<12)|(((unsigned char)s[i+1]&0x3f)<<6)|((unsigned char)s[i+2]&0x3f);i+=3;} else {cp=c;i+=1;}
         if(cp<0x200)putchar(g_bdec[cp]); } }
 
+/* ===== Multi-prompt quality harness (codex_recs_1.md §22.15) =====
+ * Replaces single-prompt ' Tokyo' coherence with teacher-forced evaluation across a fixed prompt
+ * set spanning factual/reasoning/code/multilingual/long-context. "First use it to decide the int8
+ * router" (int4-HP already decided against via the single-prompt test, not retested here).
+ *
+ * Promotion thresholds are fixed HERE, before any harness run -- not tuned after seeing results:
+ *   1. router expert-set mismatch < 10% of layer-token decisions
+ *   2. avg NLL delta (int8 teacher-forced on fp32's tokens, minus fp32's own self-NLL) < 0.5 nats/token
+ *   3. token-argmax divergence (does int8 predict the same next token fp32 chose?) < 15%
+ *   4. router bucket must be >=10% faster than fp32 -- no quality risk is worth taking for free
+ * All four must PASS for a promotion verdict; any single FAIL blocks it.
+ *
+ * Methodology: for each prompt, (1) generate a reference continuation greedily under fp32
+ * (g_router_mode=0), recording each chosen token's own self-NLL (a confidence baseline, not a
+ * comparison metric by itself); (2) replay the SAME prompt+reference-token sequence under int8
+ * (g_router_mode=2) via TEACHER FORCING -- at each step, feed the REFERENCE token regardless of
+ * what int8 itself would have picked, so divergence never compounds into a different context for
+ * later positions. At each step, before feeding, compare argmax(int8_logits) against the
+ * reference token (divergence) and compute NLL of the reference token under int8's distribution.
+ * Router expert-set mismatch stats come from the SAME int8 pass (g_router_validate=1), so they
+ * reflect genuine in-context behavior (hidden states already perturbed by int8's own earlier
+ * routing), not a counterfactual-only comparison against fp32 hidden states. */
+#define HARNESS_NP 10
+#define HARNESS_MAXCTX 160
+#define HARNESS_GEN_SHORT 20
+#define HARNESS_GEN_LONG 16
+
+static const int hp1[]={785,6722,315,9625,374,12095,13,576,6722,315,6323,374};
+static const int hp2[]={28253,374,23415,315,34684,323};
+static const int hp3[]={2679,678,19423,525,55569,11,323,678,55569,525,9898,11,1221,678,19423,525};
+static const int hp4[]={785,8500,374,220,17,11,220,19,11,220,23,11,220,16,21,11,220,18,17,13,576,1790,1372,374};
+static const int hp5[]={750,75698,1445,982,262,421,308,2651,220,16,510,286,470,308,198,262,470,75698,1445,12,16,8,488};
+static const int hp6[]={2,5712,311,1779,421,264,1372,374,10250,198,750,374,38217,1445,982,262,421,308,366,220,17,510,286,470};
+static const int hp7[]={8747,60410,1574,409,1187,9625,1788};
+static const int hp8[]={107513,20412};
+static const int hp9[]={641,264,2613,14126,88677,1948,1378,23501,11,1052,12163,458,2310,8866,25766,6941,85656,13,7209,6556,11,566,1035,1787,806,8061,518,6896,8094,297,62410,11,44029,279,36038,53160,3080,807,557,603,1075,6623,11,323,40786,1817,6002,448,264,8205,15289,13,3776,1899,11,264,25382,33958,10636,806,8061,15331,264,10865,17822,3736,429,1030,10497,6896,518,32333,2326,1635,4134,13,576,33958,11247,429,279,3736,1030,45859,311,806,37850,11,323,902,1008,8866,25766,304,279,5537,1030,1012,2952,311,12733,432,13,85656,24109,279,3736,15516,1212,806,8455,7766,8991,11,323,1283,264,1293,21162,11,566,5499,1053,11};
+static const int hp10[]={785,3840,315,24231,44295,3807,1376,2714,300,13,758,279,220,16,24,19,15,82,11,279,1156,14346,4586,58238,18495,1075,5190,40,1706,1033,5798,1667,28202,32983,11,892,1033,3460,11,11392,11,323,36997,311,7901,13,576,27130,315,279,97941,304,220,16,24,19,22,13791,1506,279,2070,11,6388,311,9155,323,803,14720,12645,6814,279,220,16,24,20,15,82,323,220,16,24,21,15,82,13,576,220,16,24,22,15,82,5485,279,10000,315,8003,81748,11,892,18250,458,4453,13940,8630,264,3175,16392,11,81468,279,1616,369,4345,18495,304,279,2701,13212,13,3216,279,220,16,24,24,15,82,11,279,7602,1030,23507,24231,504,24203,12645,1119,264,30450,8433,3922,13,21131,1182,518,419,32724,11,279,3175,1429,2989,27130,572};
+
+typedef struct { const int*toks; int n; const char*name; int gen; } HarnessPrompt;
+static const HarnessPrompt g_hprompts[HARNESS_NP] = {
+    {hp1,12,"factual/capitals",HARNESS_GEN_SHORT}, {hp2,6,"factual/chemistry",HARNESS_GEN_SHORT},
+    {hp3,15,"reasoning/syllogism",HARNESS_GEN_SHORT}, {hp4,22,"reasoning/sequence",HARNESS_GEN_SHORT},
+    {hp5,23,"code/fibonacci",HARNESS_GEN_SHORT}, {hp6,24,"code/is_prime",HARNESS_GEN_SHORT},
+    {hp7,7,"multilingual/french",HARNESS_GEN_SHORT}, {hp8,2,"multilingual/chinese",HARNESS_GEN_SHORT},
+    {hp9,113,"long-context/narrative",HARNESS_GEN_LONG}, {hp10,113,"long-context/technical",HARNESS_GEN_LONG},
+};
+
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static double harness_logsumexp(const float*l,int n){ float mx=l[0]; for(int i=1;i<n;i++) if(l[i]>mx) mx=l[i];
+    double s=0; for(int i=0;i<n;i++) s+=exp((double)(l[i]-mx)); return (double)mx+log(s); }
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static float harness_nll(const float*logits,int n,int target){ return (float)(harness_logsumexp(logits,n)-(double)logits[target]); }
+
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void harness_run_fp32(Model*m,const HarnessPrompt*hp,int*out_toks,float*out_selfnll,Kv*kv,
+        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
+    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
+    g_router_mode=0; g_router_validate=0;
+    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    int cur=argmax(logits,m->vocab); out_toks[0]=cur; out_selfnll[0]=harness_nll(logits,m->vocab,cur);
+    for(int s=1;s<hp->gen;s++){
+        forward(m,cur,hp->n+s-1,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+        cur=argmax(logits,m->vocab); out_toks[s]=cur; out_selfnll[s]=harness_nll(logits,m->vocab,cur);
+    }
+}
+/* do_validate=1 also computes router expert-set mismatch stats (g_router_validate=1), which
+ * makes EVERY forward() call additionally compute the other router variants plus O(experts)
+ * sentinel-argmax/mismatch-counting overhead -- real cost, but not part of what int8's own
+ * decode buckets cost in actual production use. Call with do_validate=0 for a clean, apples-to-
+ * apples SPEED comparison against the fp32 pass; call again with do_validate=1 (timing discarded)
+ * to harvest router-mismatch stats separately. Mixing the two in one pass is exactly the kind of
+ * "measure the wrong thing" bug this session has hit before (research_feed_paths.md §12) -- the
+ * first version of this harness did that and produced a bogus "int8 router is 29% slower" result
+ * (all in the untimed 'rest' bucket, from validation overhead, not real work). */
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void harness_run_teacherforced(Model*m,const HarnessPrompt*hp,const int*ref,int mode,int do_validate,int*out_div,float*out_nll,
+        int*out_rtr_cmp,int*out_rtr_mm,int*out_rtr_dc,float*out_rtr_ma,Kv*kv,
+        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
+    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
+    g_router_mode=mode; g_router_validate=do_validate;
+    long cmp0=g_rtr_cmp, mm0=(mode==1?g_rtr_hp_mismatch:g_rtr_i8_mismatch), dc0=(mode==1?g_rtr_hp_diffcount:g_rtr_i8_diffcount);
+    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    for(int s=0;s<hp->gen;s++){
+        out_div[s]=(argmax(logits,m->vocab)!=ref[s]); out_nll[s]=harness_nll(logits,m->vocab,ref[s]);
+        forward(m,ref[s],hp->n+s,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    }
+    *out_rtr_cmp=(int)(g_rtr_cmp-cmp0); *out_rtr_mm=(int)((mode==1?g_rtr_hp_mismatch:g_rtr_i8_mismatch)-mm0);
+    *out_rtr_dc=(int)((mode==1?g_rtr_hp_diffcount:g_rtr_i8_diffcount)-dc0); *out_rtr_ma=(mode==1?g_rtr_hp_maxabs:g_rtr_i8_maxabs);
+    g_router_validate=0;
+}
+
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void run_quality_harness(Model*m){
+    int ctx=HARNESS_MAXCTX; Kv kv; kv.kvd=m->nkv*m->hd; kv.ctx=ctx;
+    kv.Kc=calloc((size_t)m->nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m->nl*ctx*kv.kvd,4);
+    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
+    float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
+         *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m->vocab*4);
+    uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
+
+    static int ref_toks[HARNESS_NP][HARNESS_GEN_SHORT];
+    static float self_nll[HARNESS_NP][HARNESS_GEN_SHORT];
+
+    printf("\n=== quality harness: phase 1/2 -- fp32 reference generation (%d prompts) ===\n",HARNESS_NP); fflush(stdout);
+    gT_on=1; gT_tok=0; gT_actpack=gT_lin=gT_attn=gT_rope=gT_router=gT_swiglu=gT_rest=0;
+    double t0=now();
+    for(int i=0;i<HARNESS_NP;i++){
+        harness_run_fp32(m,&g_hprompts[i],ref_toks[i],self_nll[i],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        printf("  [%2d/%d] %-24s prefill=%3d gen=%2d done\n",i+1,HARNESS_NP,g_hprompts[i].name,g_hprompts[i].n,g_hprompts[i].gen);
+    }
+    long tok_fp32=gT_tok; double lin_fp32=gT_lin,attn_fp32=gT_attn,rope_fp32=gT_rope,router_fp32=gT_router,swiglu_fp32=gT_swiglu,actpack_fp32=gT_actpack,rest_fp32=gT_rest;
+    fprintf(stderr,"  phase 1 wall: %.1fs\n",now()-t0);
+
+    printf("\n=== quality harness: phase 2a/2 -- int8-M1 router expert-set mismatch (validate on, timing discarded) ===\n");
+    typedef struct { const char*name; int gen,divergent,rtr_cmp,rtr_mm,rtr_dc; float nll_i8,nll_fp32,rtr_ma; } HRes;
+    HRes res[HARNESS_NP];
+    for(int i=0;i<HARNESS_NP;i++){
+        int div[HARNESS_GEN_SHORT]; float nll[HARNESS_GEN_SHORT]; int rc,rm,rd; float rma;
+        int save_gTon=gT_on; gT_on=0; /* this pass's cost must not leak into any speed bucket */
+        harness_run_teacherforced(m,&g_hprompts[i],ref_toks[i],2,1,div,nll,&rc,&rm,&rd,&rma,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        gT_on=save_gTon;
+        HRes*r=&res[i]; r->name=g_hprompts[i].name; r->gen=g_hprompts[i].gen; r->divergent=0; r->nll_i8=0; r->nll_fp32=0;
+        for(int s=0;s<r->gen;s++){ r->divergent+=div[s]; r->nll_i8+=nll[s]; r->nll_fp32+=self_nll[i][s]; }
+        r->rtr_cmp=rc; r->rtr_mm=rm; r->rtr_dc=rd; r->rtr_ma=rma;
+        printf("  [%2d/%d] %-24s divergent=%2d/%-2d  nll_delta=%+.4f  rtr_mismatch=%3d/%-4d\n",
+            i+1,HARNESS_NP,r->name,r->divergent,r->gen,(r->nll_i8-r->nll_fp32)/r->gen,r->rtr_mm,r->rtr_cmp);
+    }
+
+    printf("\n=== quality harness: phase 2b/2 -- int8-M1 router speed (validate off, clean apples-to-apples timing) ===\n");
+    t0=now();
+    for(int i=0;i<HARNESS_NP;i++){
+        int div[HARNESS_GEN_SHORT]; float nll[HARNESS_GEN_SHORT]; int rc,rm,rd; float rma;
+        harness_run_teacherforced(m,&g_hprompts[i],ref_toks[i],2,0,div,nll,&rc,&rm,&rd,&rma,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        printf("  [%2d/%d] %-24s done\n",i+1,HARNESS_NP,g_hprompts[i].name);
+    }
+    long tok_i8=gT_tok-tok_fp32; double lin_i8=gT_lin-lin_fp32,attn_i8=gT_attn-attn_fp32,rope_i8=gT_rope-rope_fp32,
+        router_i8=gT_router-router_fp32,swiglu_i8=gT_swiglu-swiglu_fp32,actpack_i8=gT_actpack-actpack_fp32,rest_i8=gT_rest-rest_fp32;
+    fprintf(stderr,"  phase 2 wall: %.1fs\n",now()-t0);
+    gT_on=0;
+
+    int total_gen=0,total_div=0,total_rc=0,total_rm=0,total_rd=0; double total_nll_i8=0,total_nll_fp32=0; float max_rma=0;
+    for(int i=0;i<HARNESS_NP;i++){ total_gen+=res[i].gen; total_div+=res[i].divergent; total_nll_i8+=res[i].nll_i8; total_nll_fp32+=res[i].nll_fp32;
+        total_rc+=res[i].rtr_cmp; total_rm+=res[i].rtr_mm; total_rd+=res[i].rtr_dc; if(res[i].rtr_ma>max_rma)max_rma=res[i].rtr_ma; }
+    double div_rate=100.0*total_div/total_gen, nll_delta=(total_nll_i8-total_nll_fp32)/total_gen, rtr_rate=100.0*total_rm/total_rc;
+    double fp32_router_ms=tok_fp32?router_fp32/tok_fp32*1e3:0, i8_router_ms=tok_i8?router_i8/tok_i8*1e3:0;
+    double speedup_pct=fp32_router_ms?100.0*(fp32_router_ms-i8_router_ms)/fp32_router_ms:0;
+
+    printf("\n=== QUALITY HARNESS REPORT (int8-M1 router vs fp32, %d prompts, %d total generated tokens, teacher-forced) ===\n",HARNESS_NP,total_gen);
+    printf("token-argmax divergence:  %d/%d (%.1f%%)\n",total_div,total_gen,div_rate);
+    printf("avg NLL delta (int8 tf - fp32 self): %+.4f nats/token\n",nll_delta);
+    printf("router expert-set mismatch: %d/%d (%.1f%%), max abs logit delta %e\n",total_rm,total_rc,rtr_rate,max_rma);
+    printf("speed: fp32 router %.1fms/tok, int8 router %.1fms/tok (%.1f%% %s)\n",
+        fp32_router_ms,i8_router_ms,speedup_pct>=0?speedup_pct:-speedup_pct,speedup_pct>=0?"faster":"slower");
+    printf("fp32 buckets (avg/%ld tok, ms): act-pack %.1f | linear %.1f | attention %.1f | rope %.1f | router %.1f | swiglu %.1f | rest %.1f\n",
+        tok_fp32,actpack_fp32/tok_fp32*1e3,lin_fp32/tok_fp32*1e3,attn_fp32/tok_fp32*1e3,rope_fp32/tok_fp32*1e3,router_fp32/tok_fp32*1e3,swiglu_fp32/tok_fp32*1e3,rest_fp32/tok_fp32*1e3);
+    printf("int8 buckets (avg/%ld tok, ms): act-pack %.1f | linear %.1f | attention %.1f | rope %.1f | router %.1f | swiglu %.1f | rest %.1f\n",
+        tok_i8,actpack_i8/tok_i8*1e3,lin_i8/tok_i8*1e3,attn_i8/tok_i8*1e3,rope_i8/tok_i8*1e3,router_i8/tok_i8*1e3,swiglu_i8/tok_i8*1e3,rest_i8/tok_i8*1e3);
+
+    printf("\n--- promotion thresholds (fixed before this run, codex_recs_1.md §22.15) ---\n");
+    int p1=rtr_rate<10.0, p2=nll_delta<0.5, p3=div_rate<15.0, p4=speedup_pct>=10.0;
+    printf("  [%s] router expert-set mismatch < 10%%      (got %.1f%%)\n",p1?"PASS":"FAIL",rtr_rate);
+    printf("  [%s] avg NLL delta < 0.5 nats/token         (got %+.4f)\n",p2?"PASS":"FAIL",nll_delta);
+    printf("  [%s] token divergence < 15%%                 (got %.1f%%)\n",p3?"PASS":"FAIL",div_rate);
+    printf("  [%s] router bucket >=10%% faster than fp32   (got %.1f%%)\n",p4?"PASS":"FAIL",speedup_pct);
+    printf("VERDICT: int8-M1 router %s promotion to default.\n",(p1&&p2&&p3&&p4)?"PASSES all thresholds -- ELIGIBLE FOR":"FAILS at least one threshold -- NOT ELIGIBLE FOR");
+
+    free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
+    free(kv.Kc);free(kv.Vc);
+}
+
 int main(int c,char**v){
     if(c<2){ printf("usage: %s model.gguf [ngen] [nt]\n",v[0]); return 1; }
     int ngen=(c>2)?atoi(v[2]):16, nt=(c>3)?atoi(v[3]):4;
@@ -776,7 +946,7 @@ int main(int c,char**v){
     fflush(stderr);
     const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.hp.imecache";
     g_router_validate=(c>5)?atoi(v[5]):0; /* router HP-Lin/int8-vs-fp32 expert-selection validation, off by default (extra compute) */
-    g_router_mode=(c>6)?atoi(v[6]):0; /* EXPERIMENTAL: 0=fp32(default) 1=int4-HP 2=int8-M1 -- see codex_recs_1.md §22.7-22.8 */
+    g_router_mode=(c>6)?atoi(v[6]):2; /* 0=fp32(exact, revert flag) 1=int4-HP(rejected, see §22.7) 2=int8-M1(DEFAULT since 2026-07-26 -- passed the multi-prompt quality harness, codex_recs_1.md §22.15: 6.1% router mismatch, -0.0034 nats/tok NLL delta, 2.1% token divergence, 13.7% faster, all four pre-registered thresholds PASS) */
     Model m; double tl=now(); int cached=0;
     if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
     else { model_load(&m,&g,nt); fprintf(stderr,"requant loaded in %.1fs\n",now()-tl); }
@@ -788,6 +958,16 @@ int main(int c,char**v){
     uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
     lin_mm_pool_init(nt); /* PR8: persistent workers, spawned once, spin-dispatched per lin_mm_hp call */
 
+    /* QWEN_HARNESS=1 (env var, not an 8th CLI arg) triggers the multi-prompt quality harness --
+     * see codex_recs_1.md §22.15. NOTE: an 8th positional CLI arg was tried first and reproducibly
+     * read back as a corrupted/wild pointer by the time execution reached here (valid at main()
+     * entry, clobbered somewhere during cache_load/model setup) -- a real, pre-existing memory
+     * bug this exposed, not a bug in the harness itself; never manifested before because nothing
+     * previously read past argv[6]. Root cause not yet found -- flagged in
+     * research_feed_paths.md/codex_recs_1.md for follow-up, worked around here via getenv instead
+     * of argv so the harness isn't blocked on debugging it. */
+    { const char*hv=getenv("QWEN_HARNESS"); if(hv && atoi(hv)){ run_quality_harness(&m); return 0; } }
+
     int prompt[]={785,6722,315,9625,374,12095,13,576,6722,315,6323,374}; int np=12;
     double tp=now(); int first=0;
     for(int p=0;p<np;p++){ forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); if(p==np-1)first=argmax(logits,m.vocab); }
@@ -798,7 +978,7 @@ int main(int c,char**v){
     int cur=first; double tg=now(); gT_on=1;
     for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
     double dt=now()-tg; gT_on=0;
-    const char*router_names[]={"fp32(default)","int4-HP(experimental)","int8-M1(experimental)"};
+    const char*router_names[]={"fp32(exact,revert-flag)","int4-HP(rejected)","int8-M1(default)"};
     printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, vendor IME-2-HP int4 W4A8, nt=%d, router=%s)\n", ngen/dt, nt, router_names[g_router_mode]);
     if(gT_tok){
         printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rope+qknorm %.1f | router %.1f | swiglu %.1f | rest(other) %.1f | sum %.1f | wall %.1f\n",

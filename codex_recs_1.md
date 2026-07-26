@@ -1655,3 +1655,94 @@ one before it shipped.
 high-value branch is a real multi-prompt quality harness — it unlocks safely evaluating SwiGLU
 approximation and promoting the int8 router (§22.8) past "experimental," neither of which the
 current single-prompt `' Tokyo'`-coherence check can responsibly settle.
+
+### 22.15 Multi-prompt quality harness built, int8-M1 router promoted to default
+
+Built `run_quality_harness()` (`qwen_moe_hp.c`, `QWEN_HARNESS=1` env var), replacing single-prompt
+`' Tokyo'`-coherence with teacher-forced evaluation across 10 fixed prompts spanning factual (2),
+reasoning (2), code (2), multilingual — French + Chinese (2), and long-context ≥113-token prefills
+(2). Prompts were tokenized with the real tokenizer (`llama-tokenize --ids --no-bos`, already on
+the board) rather than hand-guessed IDs, and cross-checked against the existing golden prompt's
+known-correct token array before use.
+
+**Promotion thresholds fixed in the code before any run** (not tuned after seeing results):
+router expert-set mismatch < 10%; avg NLL delta < 0.5 nats/token; token-argmax divergence < 15%;
+router bucket ≥10% faster than fp32. All four must PASS.
+
+**Methodology**: for each prompt, (1) generate a reference continuation greedily under fp32,
+recording each token's own self-NLL; (2) replay the same prompt + reference tokens under int8 via
+**teacher forcing** — feed the reference token at every step regardless of what int8 itself would
+pick, so one divergence can never compound into a different context for later positions; compare
+`argmax(int8_logits)` against the reference token and compute NLL of the reference token under
+int8's distribution at each step.
+
+**Three real bugs found and fixed while building this, none in the eventual harness logic itself:**
+
+1. **A genuine pre-existing memory-corruption bug**, newly exposed, not caused, by this work. The
+   first version passed the harness trigger as an 8th positional CLI arg (`argv[7]`). It read back
+   correctly at the very top of `main()` but was clobbered — reproducibly, to what looks like
+   reinterpreted weight data (`0x358637bd49742400`) — by the time execution reached
+   `lin_mm_pool_init()`, somewhere during `cache_load`/model setup. Confirmed via `dmesg` (the
+   crashing `badaddr` matched the corrupted pointer exactly) and by printing every `argv[i]` at
+   both ends of `main()`. **Never manifested before because nothing previously read past
+   `argv[6]`** (`g_router_mode`). **Not root-caused — worked around**, not fixed: switched the
+   harness trigger to `QWEN_HARNESS=1` (env var via `getenv`, read once, not stored in a
+   heap/stack region apparently shared with something in the load path) instead of a new CLI arg.
+   **This is a real, open finding**, flagged here and in `research_feed_paths.md` for whoever next
+   touches `cache_load`/`model_load` — the corruption is real regardless of which mechanism
+   triggers the harness, it was just invisible before.
+2. **The exact "vmadot-adjacent autovectorization" toolchain gotcha this file already documents**
+   (Toolchain gotchas, `PROGRESS.md`), hit a third time. The new harness functions are full of
+   plain scalar accumulation/comparison loops — nothing touching custom instructions — yet adding
+   them caused the *unconditional* baseline decode path (harness never invoked) to segfault right
+   after `lin_mm_pool_init()`. Confirmed by reverting to the clean committed `qwen_moe_hp.c` on the
+   board (worked perfectly) vs the harness-added version (crashed identically with zero harness
+   code executed). Fixed with the established mitigation:
+   `__attribute__((noinline,optimize("no-tree-vectorize")))` on every new harness function. Worth
+   restating plainly since this is the third time: **any new function added to this file, however
+   innocuous, needs this attribute** — the compiler doesn't know the file contains hand-scheduled
+   vector-register state that ordinary `-O3` autovectorization can silently corrupt.
+3. **A measurement-contamination bug of the same class this session has hit repeatedly**
+   (`research_feed_paths.md` §12's "always suspect the measurement before the hardware"). The
+   first harness run enabled `g_router_validate=1` for the entire int8 teacher-forced pass, since
+   that flag is also what's needed to collect router expert-set mismatch stats. But
+   `g_router_validate=1` makes *every* `forward()` call additionally compute the fp32 and int4-HP
+   router variants too, plus O(experts) sentinel-argmax/mismatch-counting overhead — none of it
+   wrapped in a named timing bucket, so it all landed in the untimed `rest(other)` bucket
+   (1.4ms→38.1ms/tok) and produced a bogus **"int8 router is 29.1% slower"** result — the opposite
+   sign from every other measurement of this router this session. Fixed by splitting into two
+   passes: phase 2a (`g_router_validate=1`, timing explicitly discarded via a `gT_on` save/restore)
+   for the mismatch stats, phase 2b (`g_router_validate=0`, clean apples-to-apples timing) for
+   speed. Corrected result (13.7% faster) closely matches this session's independently-measured
+   §22.8 number (int8 router ~16.0ms vs fp32 ~18.3-18.9ms), confirming the fix rather than just
+   flipping the sign to what was expected.
+
+**Final result, 10 prompts, 192 total generated tokens, 25,392 router comparisons:**
+
+| Metric | Threshold | Result | Verdict |
+|---|---|---|---|
+| Router expert-set mismatch | < 10% | **6.1%** (1557/25392) | PASS |
+| Avg NLL delta (int8 tf − fp32 self) | < 0.5 nats/tok | **−0.0034** | PASS |
+| Token-argmax divergence | < 15% | **2.1%** (4/192) | PASS |
+| Router bucket speedup | ≥ 10% | **13.7%** (18.7→16.1ms) | PASS |
+
+The 6.1% mismatch rate is notably *better* than §22.8's single-prompt estimate (7.8%) now that
+it's measured across a real diversity of prompt types and lengths — the earlier number wasn't
+wrong, just thin evidence (1344 comparisons on one 28-token prompt vs 25,392 here). The NLL delta
+being slightly *negative* (int8 marginally more confident in fp32's own token choices than fp32
+itself) is noise around zero, not a meaningful effect, but it's a strong signal there's no
+systematic quality degradation. Only the multilingual/French and long-context/narrative prompts
+showed any token divergence at all (1/20 and 3/16 respectively) — no divergence on factual,
+reasoning, code, or the Chinese prompt.
+
+**All four thresholds pass. Per the standing instruction ("keep both behind flags until they pass
+the harness"), int8-M1 router is now the production default** (`g_router_mode` default changed
+from 0 to 2; `g_router_mode=0` remains available as an explicit exact-fp32 revert flag; int4-HP
+stays available as `g_router_mode=1` but remains rejected per §22.7, not promoted). Verified on the
+board post-change: default invocation now reports `router=int8-M1(default)`, `' Tokyo'` PASS,
+router bucket 16.2ms, unchanged decode correctness.
+
+**Not done**: SwiGLU approximation evaluation — explicitly the next step ("then evaluate a fast
+sigmoid/SwiGLU implementation"), not started. The harness is general enough to evaluate it the same
+way (teacher-forced NLL/divergence against the fp32 reference) once a candidate implementation
+exists, without needing a rewrite.

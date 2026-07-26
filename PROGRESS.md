@@ -15,6 +15,17 @@ reboots via NetworkManager — see Board State below); cache exists at `/root/mo
 reloads in ~22s and prints buckets. **nt=4 is the right default** (nt=8 measured slightly worse —
 memory-bandwidth-bound workload, more threads just adds bus contention, see below).
 
+**Router default changed (2026-07-26): int8-M1 is now the default router (`g_router_mode` 0→2),
+router bucket ~19ms→~16ms.** Built a multi-prompt teacher-forced quality harness
+(`QWEN_HARNESS=1` env var — see `codex_recs_1.md` §22.15 for full methodology and the three real
+bugs found building it, including a still-unresolved pre-existing memory-corruption bug in the
+model-load path, flagged under Toolchain gotchas below) and ran it against int8-M1 with four
+promotion thresholds fixed in advance. **All four passed**: router expert-set mismatch 6.1%
+(<10%), avg NLL delta -0.0034 nats/tok (<0.5), token divergence 2.1% (<15%), speed 13.7% faster
+(>=10%). `g_router_mode=0` remains available as an explicit exact-fp32 revert flag; int4-HP
+(`g_router_mode=1`) remains rejected per §22.7, not promoted. SwiGLU approximation evaluation is
+the explicit next step, using the same harness, not yet started.
+
 **Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
 Per the standing review item ("otherwise move to activation packing or attention"), reused the
 router's proven `vdot_f32` (RVV `vfmacc`+`vfredusum`) for the QK dot product and added a new
@@ -353,7 +364,24 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
   corruption was to something else entirely (traced via `dmesg`+`strace`, not obvious from the
   crash site). Fix: isolate ANY hot loop that touches memory a vmadot/router-adjacent function
   also touches into its own `noinline,optimize("no-tree-vectorize")` function, even if it looks
-  too simple to need it.
+  too simple to need it. **Hit a THIRD time (2026-07-26) building the quality harness (§22.15)**:
+  a batch of plain scalar accumulation/comparison loops (no asm at all) in new harness functions
+  caused the *unconditional* baseline decode path to segfault, confirmed by reverting to the clean
+  committed file (works) vs the harness-added version with the harness never even invoked
+  (crashes identically). Same fix, same lesson: **any new function added to this file, however
+  innocuous, needs the attribute.**
+- **A genuine, still-UNRESOLVED pre-existing memory-corruption bug, found 2026-07-26 building the
+  quality harness (§22.15), not caused by it — just newly exposed.** An 8th positional CLI
+  argument (`argv[7]`) read back correctly at the very top of `main()` but was reproducibly
+  clobbered — to what looks like reinterpreted weight data (`0x358637bd49742400`) — by the time
+  execution reached `lin_mm_pool_init()`, somewhere during `cache_load`/model setup. Confirmed via
+  `dmesg` (the crashing `badaddr` matched the corrupted pointer value exactly) and by printing
+  every `argv[i]` at both ends of `main()`. **Never manifested before because nothing previously
+  read past `argv[6]`** (`g_router_mode`) — this is not new corruption, just newly observed.
+  **Not root-caused.** Worked around (not fixed) by switching the harness trigger to a
+  `QWEN_HARNESS=1` environment variable instead of a new CLI arg. Whoever next touches
+  `cache_load`/`model_load`/the buffer-allocation chain between them should keep this in mind — a
+  real heap or stack overflow is happening somewhere in that path.
 - **RVV widening instructions (`vfwcvt.f.f.v` etc.) read the ACTIVE vtype at the instruction's
   execution, not at the time the source register was loaded.** Second bug from the same session:
   `vle16.v` under `e16,mf2`, then a `vsetvli` to `e32,m1` for an unrelated load, THEN `vfwcvt.f.f.v`
