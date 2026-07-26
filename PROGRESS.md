@@ -72,25 +72,84 @@ weight stream is the majority of remaining linear time. Prefer expert-path sched
 fusion / any vendor feed difference over more QKV/O micro-opts.
 
 **Follow-up check before touching the kernel (2026-07-26): is `linear(kernel)` actually
-memory-bandwidth-bound, or just assumed to be?** This session has repeatedly invoked "memory-
-bandwidth-bound" to explain the router's modest 1.6x RVV ceiling and nt=8's regression — worth
-checking against a real number before using it again to justify (or defer) expert-path work.
-`bench/ram_bw_probe.c`: real nt=4 concurrent sequential-read ceiling (harts 8,10,12,14, same
-pinning as production) is **17.05 GB/s**. `linear(kernel)` only achieves **3.26 GB/s effective
-(58.5ms for 191.1MB/tok) — 19% of that ceiling.** An nt=1 rerun of the real engine gives
-**1.13 GB/s** (consistent with A3's original 446.4ns/call kernel-only rate), so nt=4 is only a
-**2.90x speedup over nt=1, not 4x** — despite nt=4 already giving one thread per physical IME-2
-unit (no unit-sharing; nt=8's regression is the well-understood *different* case of 2 harts
-sharing each unit). **DRAM bandwidth is not the limiter here — 81% of the streaming-read ceiling
-sits idle.** The real cause of the sub-linear nt=1→nt=4 scaling is still open: candidates are
-pool-dispatch/sync overhead accumulating over ~1392 small Lin calls/token, each Lin's weight
-buffer being a separate small heap allocation (no row-buffer/prefetcher continuity between calls,
-unlike a clean 256MB streaming probe), or the kernel's own fp16-accumulation compute path being
-the real per-thread ceiling rather than the memory fetch. **This revises, not confirms,** the
-"memory-bandwidth-bound" framing used elsewhere in this doc — real headroom may exist, but the
-next step is isolating dispatch overhead from kernel-compute time (e.g. instrument the pool's
-wait-for-dispatch time separately from the kernel's own execution time), not a kernel rewrite on
-faith that more bandwidth is unreachable. See `research_feed_paths.md` §12 for the full writeup.
+memory-bandwidth-bound, or just assumed to be?** First pass at this had a real bug (caught by
+external review, see the retraction below) — corrected version and the two decisive follow-up
+experiments below.
+
+**RETRACTED: "linear(kernel) uses only 19% of DRAM bandwidth."** That number came from a
+factor-of-8 byte-count error: the per-token weight-volume calculation multiplied superblock counts
+by `BREC` (576B, the size of one 32-wide-K × 32-wide-N sub-record) instead of `BSUPER`
+(`NSUB*BREC`=4608B, the size of one full 256-wide-K × 32-wide-N superblock — `NSUB=8` sub-records
+per superblock). **Corrected: 1.529 GB/token** (was wrongly 191.1MB — the corrected figure matches
+this doc's own much-earlier "Honest perf model" estimate of ~1.5-1.9GB/token, which the wrong
+number should have been sanity-checked against the first time). Corrected effective bandwidth:
+**nt=4 → 26.13 GB/s** (was wrongly "3.26 GB/s, 19% of ceiling"), **nt=1 → 9.00 GB/s** (was wrongly
+"1.13 GB/s") — nt=1's corrected rate now closely matches A3's original single-call kernel rate
+reinterpreted correctly (446.4ns for one full N32×K256 call = 4608B ≈ 10.32 GB/s). The
+`bench/ram_bw_probe.c` "17.05 GB/s ceiling" used to call this "19% utilized" is also not
+trustworthy as an upper bound on its own terms — it's a scalar `volatile` dependent load
+(latency/outstanding-request limited), not representative of the real kernel's wide vector loads;
+tellingly, the corrected 26.13 GB/s actually *exceeds* that supposed ceiling.
+
+**Decisive follow-up (2026-07-26): does the kernel itself scale linearly with thread count when
+there's no dispatch and no cold memory access?** Two new probes, both using small (36-221KB),
+reused, cache-resident per-thread buffers (deliberately isolating "the kernel's own concurrent
+execution" from "streaming a huge cold working set"):
+
+| Probe | nt=1 | nt=2 | nt=4 | nt=1→nt=4 |
+|---|---|---|---|---|
+| `bench/run_hp_m1_scaling_probe.c` (raw kernel, no dispatch) | 10.54 GB/s | 20.70 GB/s | 41.13 GB/s | **3.90x** |
+| `bench/pool_dispatch_overhead_probe.c` (real pool mechanism, same hot buffers) | 10.23 GB/s | 20.62 GB/s | 39.49 GB/s | **3.86x** |
+
+Both scale almost perfectly linearly and land within ~4% of each other. **This rules out both
+remaining candidate explanations at once**: the kernel/tensor-engine isn't a shared bottleneck
+under concurrency (kernel-only already scales near-4x with zero contention), and the dispatch
+pool's atomics/spin-wait cost is negligible (pool-dispatched throughput barely differs from
+kernel-only-no-dispatch). **Neither probe reproduces production's real access pattern, though** —
+both reuse small buffers hundreds of thousands of times (cache-resident), while real decode
+streams a genuinely huge (multi-GB, scattered across many separate `malloc`'d `Lin.B` buffers)
+working set exactly once per token, with no reuse. The most likely remaining explanation for
+production's 2.90x (not ~4x) scaling and its gap to the ~39-41 GB/s "hot" ceiling is **cold-access
+behavior at the real working-set size** — DRAM row-buffer misses jumping between the many separate
+weight allocations, TLB pressure across a multi-GB span — not raw DRAM-controller bandwidth
+(plentiful when data is hot, per these two probes) and not dispatch (now cleanly ruled out). This
+is a narrower, more specific claim than either the retracted "not bandwidth-bound" conclusion or
+the original blanket "memory-bandwidth-bound" framing. See `research_feed_paths.md` §12 and
+`codex_recs_1.md` §22.12-§22.13 for the full writeup, including exactly how the byte-count error
+happened.
+
+**Cold-access follow-up, closed out (2026-07-26): five probes, one concrete finding, rest recorded
+as an unresolved gap — not pursued further.** `bench/cold_streaming_probe.c` (256-320MB/thread,
+private per-thread buffers, single cold pass): contiguous 35.68 GB/s, production-shape/order 30.60
+GB/s, randomized order 30.13 GB/s, hugepage 29.97 GB/s (all at nt=4) — cold access alone reaches
+30-36 GB/s, above production's 26.13 GB/s; randomized-vs-ordered and hugepage-vs-normal both show
+no real difference (rules out call-order predictability and TLB/page-size pressure).
+`bench/shared_buffer_scheduling_probe.c` (same cold working set, SHARED across threads through the
+real dispatch pool): production's real cyclic panel stride (`np=tn;np+=nt`) vs blocked (contiguous
+per-thread range) — **no meaningful difference across q/k/v/o/experts** (29.34 vs 29.09 GB/s), and
+a real per-panel-unique output write (vs a reused scratch buffer) also made no difference (28.95 vs
+28.76 GB/s) — both ruled out.
+
+**One real exception: `lm_head` in isolation.** `Np=4748` panels (~40x the next-largest Lin tested)
+— cyclic **26.18 GB/s** vs blocked **29.45 GB/s**, a genuine ~12% gap, and cyclic's number lands
+almost exactly on production's overall measured rate. **Phrased carefully**: this shows a real
+*scheduling* effect, not a confirmed hardware mechanism — cyclic gives each hart an ~147KB stride
+between consecutive `lm_head` panels repeated ~1187 times across a 175MB span, which *apparently*
+defeats per-hart streaming/prefetch behavior over that unusually long traversal; DRAM row-buffer
+behavior specifically was not directly observed. The smaller Lins never accumulate enough stride
+distance (≤30 strides within a ≤4.5MB buffer) for the same effect to appear.
+
+**Stopping here — recorded as an unresolved ~10% delivery gap, not a new optimization target.**
+`lm_head` is only ~10% of `linear(kernel)`'s time; even a full fix there is worth roughly half a
+millisecond per token, not the whole 26→30 GB/s gap. Remaining untested candidates (real
+all-1344-buffers-at-once allocation pattern, A-buffer/pack interaction) are being deliberately left
+untested — judged too small and too poorly localized to justify further speculative probes.
+
+**One actionable, NOT YET APPLIED candidate**: switch `lin_mm_hp_worker_run`'s panel assignment
+from cyclic to blocked — for `lm_head` specifically, or as the new general default (blocked did not
+regress any smaller Lin in the probe, and is simpler code). This needs a real production A/B before
+adopting — expect `lm_head`'s bucket (currently 5.7ms) dropping toward ~5.1ms with no regression
+elsewhere, if the probe result holds. See `codex_recs_1.md` §22.13 for the full five-probe chain.
 
 **Router-as-quantized-Lin fp16 experiment — real result, but the "stop here" conclusion was
 premature (self-correction, flagged by review).** Weight-only fp16 (activation stays fp32),
