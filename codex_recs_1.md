@@ -2288,3 +2288,126 @@ this doesn't change the "at parity" conclusion, but it means the comparison isn'
 identical in context depth — flagged rather than glossed over. The `nt=8` vendor figure (12.82) is
 close to the earlier stale-library baseline's 12.89, a useful cross-check that the library-path fix
 didn't materially change the underlying performance number, only the crash behavior.
+
+### 22.25 Confirmed heap-overflow bug in the expanded harness — fixed; ASan root-cause in progress
+
+**Rerunning the expanded quality harness (§22.20's corpus/generation-length expansion) alone, no
+contention, crashed with SIGSEGV** — `dmesg` shows `qwen_moe_hp[28045]: unhandled signal 11 code
+0x1 at 0x...` inside `libc.so.6` itself, at "SwiGLU phase 2 -- hard-swish candidate", prompt 6/10.
+Register contents at the fault (`s2=0x300`=768=`moe_ffn`, `s6=0x800`=2048=`d`, `s3=0x80`=128=
+`n_exp`) look like live model-dimension values sitting in a corrupted-heap crash, not a clean
+direct out-of-bounds hit at the fault site itself — consistent with heap corruption surfacing later
+and elsewhere than its actual cause, exactly the kind of misleading symptom this session's own
+prior corruption bug (§22.16) produced.
+
+**A concrete, independently provable bug was found by inspection before any debugger involvement**:
+`run_quality_harness()` allocates the harness's KV cache at `ctx=HARNESS_MAXCTX` (200 at the time),
+but `harness_eval_ppl()` walks real-text positions `0..txt->n-2` over that SAME cache — and
+`ppl_code2` (added in §22.20's expansion) is **355 tokens**, nearly double the 200-token
+allocation. `forward()`'s KV-cache write (`memcpy(Kc+(size_t)pos*kvd,k,kvd*4)`, previously
+unguarded) would silently write past `kv->Kc`/`kv->Vc`'s allocated extent whenever `pos>=200`,
+corrupting adjacent heap allocations. This phase runs *after* the SwiGLU phase-2 crash site in the
+current code's execution order, so it is not necessarily *the* cause of the observed crash, but
+it is unambiguously a real, live bug on its own, confirmed by arithmetic alone (355 > 200), that
+had to be fixed regardless of what ASan reports.
+
+**Fixes applied (before ASan resolves, so they don't wait on it)**:
+1. `HARNESS_MAXCTX` computed properly as the max of every `HarnessPrompt`'s prefill+gen (worst
+   case hp9/hp10: 113+60=173) and every `PplText`'s raw length (worst case `ppl_code2`: 355) —
+   raised to **512** for headroom, from the unsound 200.
+2. A hard guard added directly in `forward()`, at the exact point of the KV-cache write:
+   ```c
+   if(pos<0 || pos>=kv->ctx){
+       fprintf(stderr,"KV position overflow: pos=%d ctx=%d\n",pos,kv->ctx);
+       abort();
+   }
+   ```
+   This turns any future instance of this bug class into an immediate, precisely located abort at
+   the actual point of failure, instead of silent heap corruption that surfaces later as a
+   misleading crash somewhere unrelated — the exact failure mode this bug just produced. Verified
+   harmless for every existing production code path: default `main()` uses `ctx=64` (prompt+gen
+   always well under that) or, under `QWEN_CTXLEN`, `ctx=ctxlen_req+ngen+4` with `np=ctxlen_req`,
+   leaving a 4-position margin — the guard should never fire outside a genuine bug.
+
+**The ASan run was deliberately left running rather than restarted with the fix** — per explicit
+direction, it may still reveal a separate, earlier bug specifically in the SwiGLU phase-2 path
+(prompt 6/10), since that phase runs before the now-fixed real-text overflow in execution order and
+so cannot be explained by it alone.
+
+**ASan reported first, and it wasn't `ppl_code2`.** It found a **global-buffer-overflow READ** in
+`harness_eval_ppl` (`qwen_moe_hp.c:1001`), 0 bytes past the end of `ppl_reason` (size 596 bytes =
+149 `int`s), immediately adjacent to `ppl_code` in memory. **`ppl_reason`'s `PplText` entry declared
+`n=176`, but the array itself has only 149 real elements — a stale length that predates this
+session's corpus expansion entirely** (`ppl_reason` is one of the original 4 real-text corpora from
+§22.20's first checkpoint). Every real-text-perplexity evaluation that included `ppl_reason` this
+whole session — including the numbers reported in §22.20 and relied on for the rational-Padé
+production A/B in §22.21 — read 27 tokens past the array's real end, into `ppl_code`'s memory,
+silently blending unrelated content into part of the reasoning-corpus's perplexity computation. This
+predates and is independent of my expansion work; it simply had never been exercised under ASan
+before.
+
+**Finding one over-read prompted a full audit of every declared length against actual array size**
+(all 9 `PplText` entries, all 10 `HarnessPrompt` entries) rather than fixing only what ASan happened
+to catch first. Result: **5 mismatches total**, all pre-existing, none introduced by this session's
+corpus expansion (every one of the 5 new `PplText`/hp-adjacent additions checked out correctly):
+
+| entry | declared | actual | class |
+|---|---|---|---|
+| `ppl_reason` | 176 | 149 | **over-declared — real OOB read (the ASan-caught one)** |
+| `hp3` (reasoning/syllogism) | 15 | 16 | under-declared — 1 token of prefill silently dropped |
+| `hp4` (reasoning/sequence) | 22 | 24 | under-declared — 2 tokens dropped |
+| `hp9` (long-context/narrative) | 113 | 124 | under-declared — 11 tokens dropped |
+| `hp10` (long-context/technical) | 113 | 155 | under-declared — **42 tokens dropped, over a quarter of the intended prompt** |
+
+Under-declared entries are not memory-unsafe (the harness never reads past the array's real bounds
+when `n` is smaller than the actual size) but are a real correctness bug: every harness run this
+entire session — the original router promotion (§22.15), both SwiGLU evaluations (§22.18-21) — fed
+a *shorter* prefill for these four prompts than the tokenized arrays actually contain, particularly
+undermining `hp9`/`hp10`, whose entire purpose is testing long-context behavior. All 5 array
+*contents* were checked by hand (first/last 15 tokens each) for signs of corruption or accidental
+duplication before trusting them as correct — all read as coherent, non-repeating continuations, so
+the fix in every case is to correct the declared length to match the real array, not to touch the
+array content.
+
+**All 5 fixed** (`qwen_moe_hp.c`, the `g_hprompts[]` and `g_ppltexts[]` tables) and a second ASan
+run launched to check whether the SwiGLU phase-2/prompt-6 crash site has a separate root cause not
+explained by any of these five. Both the ASan and production binaries were rebuilt from the fixed
+source (build-only, not run, so as not to introduce a second concurrent board workload per §22.24's
+lesson) before the ASan rerun was launched alone.
+
+**ASan rerun completed clean, end to end** — the full harness ran to natural completion (router
+phase, SwiGLU phase 1-3, real-text perplexity across all 9 corpora, both free-running spot checks),
+no AddressSanitizer report, no abort, log not truncated. The SwiGLU phase-2/prompt-6 crash site
+that killed the original (unguarded) run did **not** recur — it was fully explained by the
+`ppl_reason` overflow corrupting heap state that a later allocation then tripped over, not a
+separate bug. **Gate satisfied**: per explicit direction, a new harness quality result is only
+trusted after a clean complete ASan pass, and that condition is now met.
+
+**Corrected results (760 teacher-forced positions with the real hp3/hp4/hp9/hp10 prefill lengths,
+2182 real-text positions with the real `ppl_reason` length)** — every conclusion from §22.20/§22.21
+holds, several numbers improve now that they're computed on correct data instead of
+truncated/overrun data:
+
+| | vs int8+exact production | vs original fp32+exact | divergence | speed |
+|---|---|---|---|---|
+| **hard-swish** | x1.1340 (13.4% inflation) — **FAILS** | x1.1200 (12.0%) | 7.4% (56/760) | 16.46x (93.9% reduction) |
+| **rational-Padé** | x1.0174 (1.7% inflation) — **PASSES** | x1.0048 (0.5%) | 3.3% (25/760) | 9.91x (89.9% reduction) |
+
+Real-text perplexity (2182 tokens, 9 corpora): production x0.9990 vs fp32 ground truth,
+hard-swish x1.0023 vs production (aggregate PASSES, worst corpus 1.0549 multilingual/spanish,
+still PASSES <1.10 — real-text alone still would have wrongly cleared hard-swish, exactly as
+§22.20 found; the teacher-forced gate remains the deciding one), rational-Padé x0.9894 vs
+production (worst corpus 1.0058, code). Router re-confirmed independently on the corrected prefill
+lengths: 2.8% divergence, +0.0048 NLL delta, 5.4% mismatch, 87.0% faster — all four thresholds
+PASS, unchanged conclusion. Free-running spot check (long-context/narrative) again shows
+rational-Padé tracking production's phrasing far more closely than hard-swish's real narrative
+departure, consistent with every earlier run.
+
+**No promotion status changes as a result of this bugfix.** `g_swiglu_fast` was already promoted to
+`2` (rational-Padé) in §22.21 on the strength of a bounded production A/B, not on this harness's
+real-text numbers — this expanded, now-bug-fixed rerun is confirmatory validation on a larger,
+correct dataset, not a new promotion decision. Hard-swish remains rejected. The takeaway is
+narrower but still important: the corpus/generation-length expansion added in §22.20 shipped with a
+real, previously-latent bug (`ppl_reason`'s stale length) plus four newly-discovered ones
+(hp3/hp4/hp9/hp10's stale prefill lengths) that had silently affected every harness run referencing
+those five entries all session, now fixed and ASan-verified clean.

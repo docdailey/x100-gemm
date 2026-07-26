@@ -750,6 +750,10 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
           for(int hh=0;hh<nh;hh++){ rmsnorm(q+hh*hd,q+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q+hh*hd,hd,cosb,sinb); }
           for(int hh=0;hh<nkv;hh++){ rmsnorm(k+hh*hd,k+hh*hd,ly->k_norm,hd,m->eps); rope_apply(k+hh*hd,hd,cosb,sinb); }
           if(gT_on) gT_rope += now()-_tr; }
+        if(pos<0 || pos>=kv->ctx){
+            fprintf(stderr,"KV position overflow: pos=%d ctx=%d\n",pos,kv->ctx);
+            abort();
+        }
         float*Kc=kv->Kc+(size_t)l*kv->ctx*kvd,*Vc=kv->Vc+(size_t)l*kv->ctx*kvd;
         memcpy(Kc+(size_t)pos*kvd,k,kvd*4); memcpy(Vc+(size_t)pos*kvd,vv,kvd*4);
         float scale=1.0f/sqrtf(hd); double _at=gT_on?now():0;
@@ -861,10 +865,18 @@ static void tok_print(Gguf*g,int id){ if(!g_bi)bdec_init(); if(id<0||id>=g->ntok
 /* Expanded 2026-07-26 per explicit direction to grow quality validation well past the 1,063-token
  * checkpoint (§22.20-21): teacher-forced positions roughly double (376->752-ish) emphasizing the
  * two long-context/free-running prompts, real-text corpus grows separately (see PPL_NTEXTS below)
- * with a heavier weight on code/multilingual/reasoning. MAXCTX raised to fit the largest prefill
- * (113, hp9/hp10) plus the new HARNESS_GEN_LONG headroom. */
+ * with a heavier weight on code/multilingual/reasoning.
+ *
+ * MAXCTX MUST cover the max of (a) every HarnessPrompt's prefill+gen (worst case hp9/hp10:
+ * 113+60=173) and (b) every PplText's raw length, since harness_eval_ppl() walks positions
+ * 0..txt->n-2 over the SAME kv.ctx-sized cache (worst case ppl_code2: 355 tokens) -- confirmed
+ * real bug (codex_recs_1.md §22.25): with the prior HARNESS_MAXCTX=200, harness_eval_ppl's forward()
+ * calls at pos>=200 silently overran kv.Kc/kv.Vc (calloc'd to exactly nl*200*kvd floats), corrupting
+ * unrelated heap allocations -- the eventual segfault surfaced much later, in an unrelated SwiGLU
+ * phase, exactly the kind of delayed, misleading symptom heap corruption produces. 512 gives
+ * comfortable headroom past the actual 355-token requirement. */
 #define HARNESS_NP 10
-#define HARNESS_MAXCTX 200
+#define HARNESS_MAXCTX 512
 #define HARNESS_GEN_SHORT 80
 #define HARNESS_GEN_LONG 60
 #define HARNESS_GEN_MAX 80 /* = max(HARNESS_GEN_SHORT, HARNESS_GEN_LONG); sizes fixed local buffers */
@@ -880,13 +892,21 @@ static const int hp8[]={107513,20412};
 static const int hp9[]={641,264,2613,14126,88677,1948,1378,23501,11,1052,12163,458,2310,8866,25766,6941,85656,13,7209,6556,11,566,1035,1787,806,8061,518,6896,8094,297,62410,11,44029,279,36038,53160,3080,807,557,603,1075,6623,11,323,40786,1817,6002,448,264,8205,15289,13,3776,1899,11,264,25382,33958,10636,806,8061,15331,264,10865,17822,3736,429,1030,10497,6896,518,32333,2326,1635,4134,13,576,33958,11247,429,279,3736,1030,45859,311,806,37850,11,323,902,1008,8866,25766,304,279,5537,1030,1012,2952,311,12733,432,13,85656,24109,279,3736,15516,1212,806,8455,7766,8991,11,323,1283,264,1293,21162,11,566,5499,1053,11};
 static const int hp10[]={785,3840,315,24231,44295,3807,1376,2714,300,13,758,279,220,16,24,19,15,82,11,279,1156,14346,4586,58238,18495,1075,5190,40,1706,1033,5798,1667,28202,32983,11,892,1033,3460,11,11392,11,323,36997,311,7901,13,576,27130,315,279,97941,304,220,16,24,19,22,13791,1506,279,2070,11,6388,311,9155,323,803,14720,12645,6814,279,220,16,24,20,15,82,323,220,16,24,21,15,82,13,576,220,16,24,22,15,82,5485,279,10000,315,8003,81748,11,892,18250,458,4453,13940,8630,264,3175,16392,11,81468,279,1616,369,4345,18495,304,279,2701,13212,13,3216,279,220,16,24,24,15,82,11,279,7602,1030,23507,24231,504,24203,12645,1119,264,30450,8433,3922,13,21131,1182,518,419,32724,11,279,3175,1429,2989,27130,572};
 
+/* n fields audited against actual array length 2026-07-26 (codex_recs_1.md §22.25) after ASan
+ * caught a related mismatch elsewhere: hp3(15->16), hp4(22->24), hp9(113->124), hp10(113->155)
+ * were all stale/under-declared -- silently truncating the prefill actually fed to the model
+ * (not a memory-safety bug, since under-declaring stays within the array's real bounds, but a
+ * real correctness bug: every harness run all session used a shorter prefill than the tokenized
+ * text actually contains, especially hp10 -- 113 of 155 real tokens, over a quarter dropped).
+ * Array *content* verified sane (coherent continuation, no duplication) before trusting it as the
+ * correct length. */
 typedef struct { const int*toks; int n; const char*name; int gen; } HarnessPrompt;
 static const HarnessPrompt g_hprompts[HARNESS_NP] = {
     {hp1,12,"factual/capitals",HARNESS_GEN_SHORT}, {hp2,6,"factual/chemistry",HARNESS_GEN_SHORT},
-    {hp3,15,"reasoning/syllogism",HARNESS_GEN_SHORT}, {hp4,22,"reasoning/sequence",HARNESS_GEN_SHORT},
+    {hp3,16,"reasoning/syllogism",HARNESS_GEN_SHORT}, {hp4,24,"reasoning/sequence",HARNESS_GEN_SHORT},
     {hp5,23,"code/fibonacci",HARNESS_GEN_SHORT}, {hp6,24,"code/is_prime",HARNESS_GEN_SHORT},
     {hp7,7,"multilingual/french",HARNESS_GEN_SHORT}, {hp8,2,"multilingual/chinese",HARNESS_GEN_SHORT},
-    {hp9,113,"long-context/narrative",HARNESS_GEN_LONG}, {hp10,113,"long-context/technical",HARNESS_GEN_LONG},
+    {hp9,124,"long-context/narrative",HARNESS_GEN_LONG}, {hp10,155,"long-context/technical",HARNESS_GEN_LONG},
 };
 
 /* Real-text perplexity corpus (codex_recs_1.md §22.20 remediation, step 2: "perplexity-style
@@ -917,10 +937,15 @@ static const int ppl_spanish[]={1702,63459,11825,92823,409,97092,58763,11,1187,1
 static const int ppl_reason2[]={37175,279,3717,429,369,1449,6785,7546,308,11,279,2629,315,279,1156,308,10322,5109,16819,308,52263,13,2014,12118,419,553,37056,11,1156,10146,279,2331,1142,25,979,308,16819,825,11,279,2629,315,279,1156,10322,1372,374,4936,825,11,323,825,52263,374,1083,825,11,773,279,2331,1142,9982,13,9295,11,9658,279,5114,374,830,369,1045,24168,6785,7546,595,11,7290,279,2629,315,279,1156,595,10322,5109,16819,595,52263,26,419,24335,374,2598,279,304,67143,30078,13,576,5795,374,311,1473,429,279,5114,1221,9982,369,595,5519,825,13,576,2629,315,279,1156,595,5519,825,10322,5109,374,279,2629,315,279,1156,595,10322,5109,5519,279,595,10,16,7563,10322,1372,13,576,595,7563,10322,1372,304,279,8500,374,2661,553,1378,3039,595,27283,825,11,773,279,595,10,16,7563,10322,1372,374,1378,3039,595,10,16,27283,825,11,892,15491,9606,311,1378,595,5519,825,13,3216,279,304,67143,30078,11,279,2629,315,279,1156,595,10322,5109,374,595,52263,11,773,279,2629,315,279,1156,595,5519,825,10322,5109,9044,595,52263,5519,1378,595,5519,825,13,1096,7493,9363,62166,1119,595,10,16,52263,11,892,374,6896,279,897,279,3717,55878,369,308,6144,311,595,5519,825,13,8704,279,2331,1142,9982,323,279,304,67143,3019,12440,23377,279,8046,315,279,5114,504,595,311,595,5519,825,11,279,17508,315,35972,37056,35655,429,279,5114,9982,369,1449,6785,7546,308,13,1096,11064,5383,11,10146,264,2331,1142,323,1221,1473,279,3019,4637,74898,279,3343,11,24724,14971,6814,3614,17272,1211,11,1372,10126,11,323,279,6358,315,30819,25185,11,892,374,949,315,3170,432,374,3545,825,315,279,1156,46899,11064,12538,15599,311,4143,315,37596,13};
 static const int ppl_tech2[]={83466,5942,10326,11582,573,429,3769,5248,97782,12564,26968,8630,264,3175,2746,3579,264,24999,23504,1948,28659,63762,323,28387,1968,2966,13,362,16392,2578,28141,264,20524,8866,11639,1632,3403,1128,1181,23189,323,26917,6291,646,13879,55234,11,38561,389,264,28387,19044,311,3019,33773,1495,3055,389,1737,645,25092,5312,264,12171,13,1096,7709,374,5990,29447,2337,2805,62019,11,892,4583,1573,279,19044,30857,288,11,714,9044,279,24456,8168,304,894,53596,4303,369,22008,315,6486,476,5021,11,1741,438,264,4128,1614,47116,264,1293,2033,13,362,49665,28431,37052,429,10953,1172,264,22955,315,11211,1283,264,9255,1191,646,8916,1895,5109,429,525,59726,5080,1091,1128,264,1196,1035,3139,304,6588,11,4936,1576,279,50592,702,537,3602,8643,1181,24020,20733,10350,9315,13,576,4396,65760,374,311,37867,458,2856,8205,5239,3241,323,6629,1172,279,24020,20733,5537,315,264,38944,1293,1598,11,323,11,1380,3204,11,311,1487,2746,9315,476,8866,11639,16263,63762,773,429,264,28387,2852,31511,1598,646,387,38475,504,264,35197,2155,5068,17484,13,17439,93208,14431,912,264,4623,3112,35144,25,26968,646,42166,28135,11,773,264,53596,429,28635,2795,1948,26968,949,3117,1526,264,1598,1231,1473,264,3019,2297,304,63762,429,702,4302,311,653,448,279,3162,1815,4429,323,4297,311,653,448,892,10652,6932,311,387,37291,518,429,4445,13};
 
+/* ppl_reason's declared length was stale (176) vs its real 149 elements -- ASan caught the
+ * resulting global-buffer-overflow (codex_recs_1.md §22.25): harness_eval_ppl read 27 tokens past
+ * the array's end, into ppl_code's memory, for every real-text-perplexity evaluation that included
+ * ppl_reason this whole session (§22.20/§22.21 among them). Fixed here; content verified as a
+ * legitimate 149-token text, not truncated or duplicated. */
 typedef struct { const int*toks; int n; const char*name; } PplText;
 static const PplText g_ppltexts[PPL_NTEXTS] = {
     {ppl_lit,176,"literature(public-domain)"}, {ppl_tech,168,"technical(hand-composed)"},
-    {ppl_code,171,"code(hand-composed)"}, {ppl_reason,176,"reasoning(hand-composed)"},
+    {ppl_code,171,"code(hand-composed)"}, {ppl_reason,149,"reasoning(hand-composed)"},
     {ppl_code2,355,"code2(hand-composed,graph-algo)"}, {ppl_french,290,"multilingual(french)"},
     {ppl_spanish,269,"multilingual(spanish)"}, {ppl_reason2,345,"reasoning2(induction-proof)"},
     {ppl_tech2,268,"technical2(thermal-throttling)"},

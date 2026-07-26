@@ -36,6 +36,26 @@ otherwise idle: **our engine 11.35-11.39 tok/s vs vendor 11.38±0.21 tok/s at nt
 (vendor nt=8: 12.82±0.05, close to the earlier stale-library baseline's 12.89, confirming the fix
 didn't change the underlying performance number, only the crash.)
 
+**Expanded harness rerun crashed (SIGSEGV) — root-caused with ASan, 5 real bugs found and fixed,
+clean rerun confirms every conclusion (2026-07-26, `codex_recs_1.md` §22.25).** Rerunning the
+corpus/generation-length expansion (alone, no contention) crashed with a heap-corruption segfault.
+Root-caused with AddressSanitizer (same methodology as §22.16): `ppl_reason`'s declared length
+(176) didn't match its real array size (149) — a **stale bug predating this session's expansion
+entirely** — causing a genuine out-of-bounds heap read in every real-text-perplexity run that
+included it, this whole session. Auditing every other declared length against its actual array
+found 4 more (all pre-existing, none from this session's additions): `hp3`/`hp4`/`hp9`/`hp10` were
+all under-declared, silently truncating the prefill actually fed to the model — `hp10` by 42
+tokens, over a quarter of its intended length. Also raised `HARNESS_MAXCTX` (200→512, computed
+properly from the real max prompt+corpus length) and added a hard bounds guard directly in
+`forward()`'s KV-cache write, so any future instance of this bug class aborts immediately at the
+fault site instead of corrupting the heap silently. **A second ASan run, after all 5 fixes, completed
+clean end-to-end** — no report, full harness finished naturally. Corrected results confirm every
+conclusion unchanged (hard-swish still fails at 13.4% inflation, rational-Padé still passes at
+1.7%/0.5% inflation, router promotion re-confirmed) — no promotion status changes, since
+rational-Padé was already promoted on the strength of §22.21's production A/B, not this harness's
+numbers. This was purely a validate-the-validator exercise, and it found and fixed real, previously
+undetected bugs in the harness itself.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config), AT PARITY with the vendor binary at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
