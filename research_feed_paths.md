@@ -333,27 +333,32 @@ Copy a row per probe run. Prefer the fuller template in `codex_recs_1.md` §18 f
 
 **Superseded by events — kept for history, see the note at the bottom of this section.** Path A
 (§4, the vendor-shaped N32 native-int4 kernel) was pursued through A1-A5, ported, verified, and
-fully integrated as `qwen_moe_hp.c`: **1.49 → 7.51-7.54 tok/s (5.06x)**, still below the real
+fully integrated as `qwen_moe_hp.c`: **1.49 → 8.84-9.25 tok/s (~6.1x)**, closing in on the real
 vendor binary's 11.71-12.89. Current status and open branches: `codex_recs_1.md` §22,
 `PROGRESS.md` HEADLINE.
 
 1. **Decode remains weight-bandwidth-bound**, and the *original* 1.36-1.49 tok/s engine (our own
    q4-in-q8 interleave, `qwen_moe.c`) had substantial non-stream overhead on top of that — now
-   measured, not guessed (§21-22). Most of that overhead is closed in `qwen_moe_hp.c`; `linear`
-   (58.5ms, 44% of wall) is the current largest remaining bucket.
+   measured, not guessed (§21-22). Most of that overhead is closed in `qwen_moe_hp.c`; attention
+   and activation-packing (both former top-3 buckets) are now vectorized and closed out (§22.9,
+   §22.10); `linear(kernel)` (58.5ms, ~52% of wall) is the sole remaining large bucket, extensively
+   investigated (§22.11-§22.13) — see item 2 below.
 2. Path A is done (not "next"). The real router-as-HP-Lin test (through `lin_mm_hp`, pooled and
-   multi-threaded — not the earlier single-threaded fp16 experiment) is **also done**: real but
-   modest speedup (router 18.7→12.5ms, +3-4% overall tok/s) traded against routing quality that
-   does not cleanly hold (58.9% of decisions get >=1 expert swapped vs fp32, usually a near-tie).
-   **Decision recorded**: fp32 routing is the default in `qwen_moe_hp.c`; int4 HP routing is kept
-   behind an explicit experimental flag (`g_router_use_hp`, off by default), not promoted to
-   default. See `codex_recs_1.md` §22.7 for the full writeup, including two real bugs found along
-   the way (unsafe argmax sentinel for raw logits; a timing-boundary mismatch of the same class as
-   §21's). Remaining open items, ranked: SwiGLU (14.2ms, deferred pending quality validation beyond
-   single-prompt coherence), a possible vendor-style W8 HP router (could retain pooled/matrix-engine
-   speed while reducing routing error vs int4 — not yet attempted, no confirmed kernel path found
-   yet), and another look at `linear` itself now that A3's 446ns/call kernel-only number is several
-   tok/s-worth of changes old.
+   multi-threaded — not the earlier single-threaded fp16 experiment) is **also done**, and so is
+   the vendor-style int8-M1 router that follows it: real but modest speedups (int4: router
+   18.7→12.5ms, +3-4% tok/s; int8: router →16.0ms, +2-4% tok/s) traded against routing quality that
+   doesn't cleanly hold for int4 (60.3% of decisions get >=1 expert swapped vs fp32) but holds much
+   better for int8 (7.8%, ~8x fewer perturbed decisions). **Decision recorded**: fp32 routing is
+   the default in `qwen_moe_hp.c` (`g_router_mode=0`); int4-HP (`g_router_mode=1`) and int8-M1
+   (`g_router_mode=2`) are both kept behind the same experimental flag, neither promoted to
+   default. See `codex_recs_1.md` §22.7-§22.8 for the full writeup, including two real bugs found
+   along the way (unsafe argmax sentinel for raw logits; a timing-boundary mismatch of the same
+   class as §21's). Remaining open items, ranked: SwiGLU (14.0ms, still deferred pending quality
+   validation beyond single-prompt coherence — untouched since this row was first written);
+   `linear(kernel)` itself — its expert-FFN subclass is 61% of the bucket (§22.10 follow-up), and
+   the bandwidth investigation (§22.11-§22.13) closed out with one actionable-but-unapplied
+   candidate (blocked panel scheduling for `lm_head`, pending a real production A/B — see
+   `PROGRESS.md`'s cold-access section).
 3. Our **q4-in-q8 interleave remains a valid, working baseline** (`qwen_moe.c`, untouched,
    1.49 tok/s) — kept for comparison, not deleted.
 4. Record probe numbers here; promote winners into `codex_recs_1.md` as ordered findings only
