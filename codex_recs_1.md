@@ -1113,3 +1113,45 @@ traffic. Our actual per-call GEMV work is tiny and the shared LPDDR5 bus is the 
 doubling threads adds contention without touching that. Correctness held at nt=8 either way
 (`' Tokyo'` PASS, identical generation), so the fix itself is verified safe to use — it's just
 that more threads is not the lever here. **nt=4 remains the right default for this engine.**
+
+### 22.6 Router-as-Lin fp16 experiment: validated safe, zero speedup, two new toolchain gotchas
+
+The router is itself a 128xd `Lin`, same shape family as everything else in this engine, but kept
+full fp32 (~1MB/layer). Tried weight-only fp16 (activation stays fp32, matching this repo's
+W-lower/A-higher convention) as a lower-risk step before considering int4. Unlike RoPE-caching and
+router-vectorization (exact, zero numerical risk), this perturbs values feeding a **discrete**
+top-8 selection — quantization noise could flip which experts get chosen, not just perturb a
+smooth activation — so it needed an explicit expert-selection comparison against the fp32
+reference, not just "still says Tokyo."
+
+Two real bugs surfaced before getting a trustworthy result, both now folded into "Toolchain
+gotchas" (PROGRESS.md) as general lessons for any future RVV code in this file:
+
+1. **SIGSEGV before any reachable code ran.** `main()` crashed before its first `fprintf`, even
+   with explicit `fflush`. Traced via `dmesg` (SEGV_MAPERR at a stack-like address) and `strace`
+   (crash lands immediately after `bind_ai()`'s syscalls return, before `sched_setaffinity` is even
+   called) to gcc's `-O3` RVV auto-vectorizer mangling a **completely unrelated, plain-scalar**
+   `f32->f16` conversion loop (no asm, no custom instructions) — the existing "vmadot + autovec
+   collide" gotcha turned out to apply to any hot loop near vector code, not just custom-extension
+   asm. Fix: isolate it into its own `__attribute__((noinline,optimize("no-tree-vectorize")))`
+   function (`router_f16_build`). Bisection method: binary-search which lines mattered by
+   selectively removing code and re-testing — removing the malloc+loop (keeping the struct field)
+   fixed it; removing just the *user* of that data (`vdot_f16w_f32a`, keeping the loop) did not.
+2. **Wrong output, no crash** (`' 乾坤'` instead of `' Tokyo'`) once #1 was fixed. RVV widening
+   instructions (`vfwcvt.f.f.v`) read the **active vtype at the instruction's execution**, not at
+   the time the source register was loaded — had a `vsetvli` for an unrelated `e32,m1` load
+   sitting between the `e16,mf2` load and the widening convert that was supposed to interpret it,
+   so the convert silently used the wrong vtype. Fixed by moving the convert to immediately follow
+   the matching-width load, verified against `gemm_kernel_i8i4_hp_m1`'s already-proven ordering.
+
+**Result after both fixes**: `' Tokyo'` PASS, identical generation. Validation: **0/1344
+expert-set mismatches** (12 prefill + 16 decode positions x 48 layers), max abs/rel logit delta
+0.00000 vs the fp32 reference. **But the router bucket didn't move — 18.6ms fp16 vs 18.7ms fp32.**
+This disconfirms the pure-bytes-streamed/bandwidth-saturation theory (halving weight bytes should
+help if that were the bottleneck) and points at per-iteration loop-carried latency in the
+single-threaded (not pool-parallelized) sequential computation as the real constraint instead.
+
+**Conclusion: do not pursue W4 router.** Quality would likely hold up there too, but with zero
+speed benefit already from fp16, further byte reduction is very unlikely to help — the bottleneck
+isn't weight size. Kept the fp16 path in the codebase (validated, harmless, real if small memory
+saving: 512KB vs 1MB/layer) rather than reverting for zero net change.

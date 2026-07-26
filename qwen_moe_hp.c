@@ -55,6 +55,14 @@ static uint16_t f32_to_f16(float f){
     if(exp>=31) return (uint16_t)(sign|0x7c00);
     return (uint16_t)(sign|((uint32_t)exp<<10)|(mant>>13));
 }
+/* Toolchain gotcha (see PROGRESS.md): gcc -O3 with RVV ('v') enabled can auto-vectorize a plain
+ * scalar loop, and that auto-vec has caused vector-state corruption elsewhere in this file before.
+ * Isolate the router f32->f16 conversion loop (262144 iters/layer) into its own no-tree-vectorize
+ * function rather than let it inline into cache_load/model_load and get autovec'd there. */
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void router_f16_build(uint16_t*dst,const float*src,size_t n){
+    for(size_t i=0;i<n;i++) dst[i]=f32_to_f16(src[i]);
+}
 static float f16_to_f32(uint16_t h){
     uint32_t sign=(uint32_t)(h&0x8000)<<16, exp=(h>>10)&0x1f, mant=h&0x3ff, bits;
     if(exp==0){ if(mant==0) bits=sign; else { int e=-1; do{e++;mant<<=1;}while(!(mant&0x400)); mant&=0x3ff; bits=sign|((uint32_t)(127-15-e)<<23)|(mant<<13);} }
@@ -208,6 +216,9 @@ static void pack_act_hp(const float*x,int K,uint8_t*Abuf){
     int Sb=K/256; for(int sb=0;sb<Sb;sb++) pack_A_hp(x+sb*256, Abuf+(size_t)sb*AREC);
 }
 static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0, gT_rope=0, gT_router=0, gT_swiglu=0; static long gT_tok=0; static int gT_on=0;
+/* router fp16 validation counters (research_feed_paths.md router-quantization experiment) */
+static long g_rtr_cmp=0, g_rtr_mismatch=0; static float g_rtr_maxabs=0, g_rtr_maxrel=0;
+static int g_router_validate=0; /* set from main() via env/arg */
 
 /* PR8 (codex_recs_1.md §17/§22.3): with the vendor kernel at ~446ns/call, the ~1392 fresh
  * #pragma omp parallel spawns/token that lin_mm_hp used to do dominated wall-clock (100.3ms,
@@ -329,7 +340,7 @@ static float* gguf_dequant(Gguf*g,const char*name){ TInfo*ti=gguf_find(g,name); 
     float*out=malloc(total*4); gguf_dequant_into(g,ti,0,total,out); return out; }
 
 /* ===================== model ===================== */
-typedef struct { float*attn_norm,*ffn_norm,*q_norm,*k_norm,*router; Lin q,k,v,o; Lin*eg,*eu,*ed; } Layer;
+typedef struct { float*attn_norm,*ffn_norm,*q_norm,*k_norm,*router; uint16_t*router_f16; Lin q,k,v,o; Lin*eg,*eu,*ed; } Layer;
 typedef struct { int d,nl,nh,nkv,hd,vocab,nt,n_exp,n_act,moe; float rope_base,eps; float*tok_embd,*out_norm; Layer*L; Lin lm; } Model;
 
 static void rmsnorm(float*o,const float*x,const float*w,int n,float eps){ float s=0; for(int i=0;i<n;i++)s+=x[i]*x[i]; s=1.0f/sqrtf(s/n+eps); for(int i=0;i<n;i++)o[i]=x[i]*s*w[i]; }
@@ -355,6 +366,40 @@ static float vdot_f32(const float*a,const float*b,int n){
     vfloat32m1_t vsum=__riscv_vfredusum_vs_f32m1_f32m1(vacc,vzero,__riscv_vsetvlmax_e32m1());
     return __riscv_vfmv_f_s_f32m1_f32(vsum);
 }
+/* Router-as-quantized-Lin experiment (research_feed_paths.md/codex_recs_1.md): router is itself a
+ * 128xd Lin, same shape family as everything else here, currently kept full fp32 (~1MB/layer).
+ * fp16-packed weight first (not int4 yet) -- lower risk than W4, matching this repo's W-lower/
+ * A-higher convention (weight loses precision, activation stays fp32). Unlike RoPE-caching/router-
+ * vectorize (exact, zero risk), this DOES perturb values feeding a discrete top-8 selection, so it
+ * must be validated against the fp32 reference (see g_router_* counters + forward()) before being
+ * trusted, not just eyeballed via ' Tokyo' coherence. */
+/* Raw asm, not intrinsics -- first intrinsics-based attempt (__riscv_vle16_v_f16mf2 +
+ * __riscv_vfwcvt_f_f_v_f32m1) SIGSEGV'd (store page fault, dmesg cause=15) despite compiling
+ * clean; every other RVV routine in this file uses hand-written asm and works, so match that
+ * proven pattern instead of debugging the intrinsics header further. Fixed 32-wide chunks (VLMAX
+ * for e32m1/e16mf2 at VLEN=1024) -- valid because every K in this model is a multiple of 32 (in
+ * fact 256), so no remainder handling is needed, matching the rest of this file's assumptions.
+ * Widening convert mirrors the exact "vfwmul.vv v31,v30,v16" pattern already proven inside
+ * run_hp_m1 (e16mf2 source -> e32m1 dest). */
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static float vdot_f16w_f32a(const uint16_t*w16,const float*a,int n){
+    float result; long cnt=n/32;
+    __asm__ volatile(
+        "vsetvli t0,zero,e32,m1\n\t vxor.vv v2,v2,v2\n\t"
+        "1:\n\t"
+        "vsetvli t0,zero,e16,mf2\n\t vle16.v v30,(%[W])\n\t addi %[W],%[W],64\n\t"
+        "vfwcvt.f.f.v v6,v30\n\t"
+        "vsetvli t0,zero,e32,m1\n\t vle32.v v4,(%[A])\n\t addi %[A],%[A],128\n\t"
+        "vfmacc.vv v2,v6,v4\n\t"
+        "addi %[CNT],%[CNT],-1\n\t bnez %[CNT],1b\n\t"
+        "fmv.w.x ft0,zero\n\t"
+        "vfmv.s.f v3,ft0\n\t"
+        "vfredusum.vs v3,v2,v3\n\t"
+        "vfmv.f.s %[RES],v3\n\t"
+        : [W] "+r"(w16), [A] "+r"(a), [CNT] "+r"(cnt), [RES] "=f"(result)
+        : : "t0","v2","v3","v4","v5","v6","v7","v30","v31","ft0","memory");
+    return result;
+}
 
 static void model_load(Model*m,Gguf*g,int nt){
     m->d=g->embd; m->nl=g->block_count; m->nh=g->nh; m->nkv=g->nkv; m->hd=g->hd; m->vocab=g->vocab;
@@ -378,6 +423,8 @@ static void model_load(Model*m,Gguf*g,int nt){
         ly->q_norm=DQ("attn_q_norm.weight"); ly->k_norm=DQ("attn_k_norm.weight");
         ly->q=LN("attn_q.weight",qd,d); ly->k=LN("attn_k.weight",kvd,d); ly->v=LN("attn_v.weight",kvd,d); ly->o=LN("attn_output.weight",d,qd);
         ly->router=DQ("ffn_gate_inp.weight");
+        ly->router_f16=malloc((size_t)ne*d*2);
+        router_f16_build(ly->router_f16,ly->router,(size_t)ne*d);
         ly->eg=malloc(ne*sizeof(Lin)); ly->eu=malloc(ne*sizeof(Lin)); ly->ed=malloc(ne*sizeof(Lin));
         snprintf(nm,64,"blk.%d.ffn_gate_exps.weight",l); TInfo*tg=gguf_find(g,nm);
         snprintf(nm,64,"blk.%d.ffn_up_exps.weight",l);   TInfo*tu=gguf_find(g,nm);
@@ -429,6 +476,8 @@ static int cache_load(Model*m,const char*path,int nt){
         ly->attn_norm=malloc(m->d*4); fread(ly->attn_norm,4,m->d,f); ly->ffn_norm=malloc(m->d*4); fread(ly->ffn_norm,4,m->d,f);
         ly->q_norm=malloc(m->hd*4); fread(ly->q_norm,4,m->hd,f); ly->k_norm=malloc(m->hd*4); fread(ly->k_norm,4,m->hd,f);
         ly->router=malloc((size_t)m->n_exp*m->d*4); fread(ly->router,4,(size_t)m->n_exp*m->d,f);
+        ly->router_f16=malloc((size_t)m->n_exp*m->d*2);
+        router_f16_build(ly->router_f16,ly->router,(size_t)m->n_exp*m->d);
         ly->q=rlin(f); ly->k=rlin(f); ly->v=rlin(f); ly->o=rlin(f);
         ly->eg=malloc(m->n_exp*sizeof(Lin)); ly->eu=malloc(m->n_exp*sizeof(Lin)); ly->ed=malloc(m->n_exp*sizeof(Lin));
         for(int e=0;e<m->n_exp;e++){ ly->eg[e]=rlin(f); ly->eu[e]=rlin(f); ly->ed[e]=rlin(f); } }
@@ -464,7 +513,18 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         lin_mm(&ly->o,att,tmp,nt,Abuf); for(int i=0;i<d;i++)h[i]+=tmp[i];
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
         double _tr2=gT_on?now():0;
-        float rl[256]; for(int e=0;e<ne;e++){ rl[e]=vdot_f32(ly->router+(size_t)e*d,hn,d); }
+        float rl[256]; for(int e=0;e<ne;e++){ rl[e]=vdot_f16w_f32a(ly->router_f16+(size_t)e*d,hn,d); }
+        if(g_router_validate){
+            float rlf32[256]; for(int e=0;e<ne;e++) rlf32[e]=vdot_f32(ly->router+(size_t)e*d,hn,d);
+            for(int e=0;e<ne;e++){ float ad=fabsf(rl[e]-rlf32[e]),rel=ad/(fabsf(rlf32[e])+1e-6f);
+                if(ad>g_rtr_maxabs)g_rtr_maxabs=ad; if(rel>g_rtr_maxrel)g_rtr_maxrel=rel; }
+            int selr[32]; float bvr[32];
+            for(int a=0;a<na;a++){ int bi=-1; float bv=-1; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(selr[b]==e)used=1; if(!used&&rlf32[e]>bv){bv=rlf32[e];bi=e;} } selr[a]=bi; bvr[a]=bv; }
+            int selp[32]; float bvp[32];
+            for(int a=0;a<na;a++){ int bi=-1; float bv=-1; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(selp[b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } selp[a]=bi; bvp[a]=bv; }
+            int diff=0; for(int a=0;a<na;a++){ int found=0; for(int b=0;b<na;b++) if(selr[a]==selp[b]) found=1; if(!found) diff=1; }
+            g_rtr_cmp++; if(diff) g_rtr_mismatch++;
+        }
         softmax(rl,ne);
         int sel[32]; float sw[32];
         for(int a=0;a<na;a++){ int bi=-1; float bv=-1; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[a]=bi; sw[a]=bv; }
@@ -505,7 +565,9 @@ int main(int c,char**v){
     Gguf g; double t0=now(); gguf_open(&g,v[1]);
     fprintf(stderr,"qwen3moe (HP kernel): %d layers d=%d experts=%d/%d moe_ffn=%d heads=%d/%d hd=%d vocab=%d (parse %.1fs)\n",
         g.block_count,g.embd,g.n_exp,g.n_act,g.moe_ffn,g.nh,g.nkv,g.hd,g.vocab,now()-t0);
+    fflush(stderr);
     const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.hp.imecache";
+    g_router_validate=(c>5)?atoi(v[5]):0; /* router fp16-vs-fp32 expert-selection validation, off by default (extra compute) */
     Model m; double tl=now(); int cached=0;
     if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
     else { model_load(&m,&g,nt); fprintf(stderr,"requant loaded in %.1fs\n",now()-tl); }
@@ -531,6 +593,8 @@ int main(int c,char**v){
     if(gT_tok) printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rope+qknorm %.1f | router %.1f | swiglu %.1f | rest(other) %.1f | sum %.1f | wall %.1f\n",
         gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rope/gT_tok*1e3, gT_router/gT_tok*1e3, gT_swiglu/gT_tok*1e3, gT_rest/gT_tok*1e3,
         (gT_actpack+gT_lin+gT_attn+gT_rope+gT_router+gT_swiglu+gT_rest)/gT_tok*1e3, dt/ngen*1e3);
+    if(g_router_validate) printf("  router fp16-vs-fp32: %ld comparisons (layers x tokens), %ld expert-set mismatches, max abs logit delta %.5f, max rel %.5f\n",
+        g_rtr_cmp, g_rtr_mismatch, g_rtr_maxabs, g_rtr_maxrel);
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;
 }

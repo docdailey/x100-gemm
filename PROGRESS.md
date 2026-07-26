@@ -18,13 +18,17 @@ memory-bandwidth-bound workload, more threads just adds bus contention, see belo
 `router`≈`attention` 18.7ms each > `act-pack` 17.3ms > `swiglu` 14.2ms (untouched) > `rope` 2.0ms
 > `rest(other)` 2.2ms (confirms the bucket split is essentially complete).
 
-**In flight**: router-as-quantized-Lin experiment (fp16-packed RVV first, W4 only if fp16 proves
-safe) — the router (128x2048 fp32, ~1MB/layer, currently full-precision) is itself shaped exactly
-like every other `Lin` in this engine; running it through the same fast path could both shrink
-its memory footprint and reuse existing infrastructure. Real risk unlike the RoPE/router-vectorize
-fixes already shipped: routing is a **discrete** top-8 selection, so quantization noise could flip
-which experts get chosen, not just perturb a smooth activation — needs an explicit expert-choice
-comparison against the fp32 reference before shipping, not just "still says Tokyo."
+**Done, not just tried: router-as-quantized-Lin fp16 experiment.** Weight-only fp16 (activation
+stays fp32), validated with an explicit expert-selection comparison (not just eyeballing
+coherence): 0/1344 expert-set mismatches (12 prefill + 16 decode positions x 48 layers), max
+logit delta 0.00000 vs the fp32 reference. Routing is NOT sensitive to fp16 weight precision here.
+**But no speedup** — router bucket unchanged (18.6ms fp16 vs 18.7ms fp32) — disconfirms pure
+bytes-streamed/bandwidth-saturation as the bottleneck; looks like per-iteration loop-carried
+latency in the single-threaded sequential computation instead. **Conclusion: do not pursue W4
+router** — even if quality held up too, zero speed benefit from fp16 means further byte reduction
+is very unlikely to help. Kept in the codebase (validated, harmless, real if small memory saving).
+Found and fixed two real toolchain bugs along the way (see "Toolchain gotchas" below) — worth
+reading before writing any more RVV code in this file.
 
 Full narrative below (kept for the reasoning trail — what was tried, what turned out wrong, why).
 
@@ -122,6 +126,21 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
 
 ## Toolchain gotchas
 - vmadot asm fns MUST carry `__attribute__((optimize("no-tree-vectorize")))` (auto-vec RVV collides with asm vector state → heap corruption).
+- **This applies to PLAIN 'v'-extension code too, not just custom vmadot instructions.** Hit this
+  again 2026-07-26: a completely innocent scalar `f32->f16` bit-twiddling loop (no asm, no custom
+  instructions, nowhere near any vector code) got auto-vectorized by `-O3` and caused a SIGSEGV —
+  not in that loop, but crashing main() before it even reached its first line, because the
+  corruption was to something else entirely (traced via `dmesg`+`strace`, not obvious from the
+  crash site). Fix: isolate ANY hot loop that touches memory a vmadot/router-adjacent function
+  also touches into its own `noinline,optimize("no-tree-vectorize")` function, even if it looks
+  too simple to need it.
+- **RVV widening instructions (`vfwcvt.f.f.v` etc.) read the ACTIVE vtype at the instruction's
+  execution, not at the time the source register was loaded.** Second bug from the same session:
+  `vle16.v` under `e16,mf2`, then a `vsetvli` to `e32,m1` for an unrelated load, THEN `vfwcvt.f.f.v`
+  on the e16mf2-loaded register — silently wrong (garbage tokens, not a crash) because vfwcvt
+  interpreted its source under the now-active e32m1 vtype. Fix: do the widening convert
+  IMMEDIATELY after the matching-width load, before any other `vsetvli`. Verified correct against
+  `gemm_kernel_i8i4_hp_m1`'s proven ordering.
 - rustc static-link + `-fPIC` miscompiles the kernel (unbounded loop). gcc non-PIC only. → engines standalone C, Python via ctypes.
 
 ## P0 decode optimization (task #16) — DONE, 2026-07-26. Findings in codex_recs_1.md §21.
@@ -148,7 +167,12 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
 ## Next-session quick start
 See HEADLINE at the top of this doc — `qwen_moe_hp.c` is current, `qwen_moe.c` is superseded.
 1. `ssh root@192.168.68.88`; HP cache exists → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache` reloads in ~22s and prints buckets.
-2. In flight: router-as-quantized-Lin experiment (fp16-packed RVV first; compare expert selection
-   against the fp32 router before trusting it, then consider W4 only if that holds up). SwiGLU
-   (14.2ms, largest untouched bucket) deliberately deferred — needs quality validation beyond the
-   single-prompt coherence check before approximating `expf`/sigmoid.
+2. Router-as-Lin fp16 experiment is DONE (validated 0/1344 expert-set mismatches, but no speedup —
+   don't pursue W4 router, see HEADLINE). SwiGLU (14.2ms, now the largest untouched bucket)
+   deliberately deferred — needs quality validation beyond the single-prompt coherence check
+   before approximating `expf`/sigmoid. `linear(kernel)` (58.5ms, 44% of wall) is still the single
+   biggest item and hasn't been revisited since A3's hot-timing validation.
+3. To run the router fp16-vs-fp32 validator again: pass a 6th CLI arg of `1` (e.g. `... 16 4
+   /root/models/qwen3-30b-a3b.hp.imecache 1`) — adds a "router fp16-vs-fp32" summary line but
+   roughly doubles the router bucket's cost (computes both paths), so leave it off (`0` or omit)
+   for real tok/s numbers.
