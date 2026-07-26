@@ -46,6 +46,18 @@ intrinsics or asm) already, so gcc's auto-vectorizer was never buying real perfo
 Verified safe across all three router modes, correctness unaffected (`' Tokyo'` PASS throughout).
 See `codex_recs_1.md` §22.16 for the full writeup.
 
+**Quality harness re-confirmed under the mandatory build (2026-07-26) — THIS is now the reference
+baseline, not §22.15's numbers.** Re-ran the identical 10-prompt harness built with the exact
+mandatory command. **All four thresholds PASS again**: router mismatch 6.1% (1541/25392, <10%),
+NLL delta +0.0060 (<0.5), token divergence 1.6% (<15%), speed 57.2% faster (10.2→4.4ms, ≥10%).
+Quality metrics essentially unchanged from §22.15 as expected (the flag only affects performance,
+not numerics); the speed delta looks larger here than the ~14-30% seen in single-decode production
+runs because both fp32 and int8's absolute router-bucket time dropped under the flag, with int8
+dropping proportionally further — consistent with, not contradicting, §22.16's own table. See
+`codex_recs_1.md` §22.17. **Next**: implement one flagged fast-SwiGLU candidate with quality/speed
+gates predeclared before implementation, per explicit instruction not started until this
+confirmation landed.
+
 **Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
 Per the standing review item ("otherwise move to activation packing or attention"), reused the
 router's proven `vdot_f32` (RVV `vfmacc`+`vfredusum`) for the QK dot product and added a new

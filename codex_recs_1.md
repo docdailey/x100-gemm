@@ -1815,3 +1815,37 @@ working fix, but the actual gcc/RVV-backend interaction responsible was never is
 than "vectorizing ordinary code near vmadot-using code is unsafe on this toolchain" — that
 empirical rule has now held three times and is the operative one, whether or not the precise
 compiler-internals mechanism is ever found.
+
+### 22.17 Quality harness re-run under the mandatory build — confirmed, this run is now the baseline
+
+§22.15's promotion harness ran under the pre-hardening build (no `-fno-tree-vectorize`). Since
+§22.16 made that flag mandatory, re-ran the identical harness unchanged, built with the exact
+command now in `qwen_moe_hp.c`'s header comment, before doing anything else — per explicit
+instruction, SwiGLU work does not start until this confirms clean.
+
+**Quality metrics: essentially unchanged, as expected** (the flag only affects gcc's automatic
+vectorization pass, never explicit RVV intrinsics/asm, so no numeric difference should exist and
+none does beyond ordinary run-to-run noise):
+
+| Metric | §22.15 (pre-hardening build) | This run (production build) | Threshold |
+|---|---|---|---|
+| Router expert-set mismatch | 6.1% (1557/25392) | **6.1% (1541/25392)** | < 10% |
+| Avg NLL delta | −0.0034 | **+0.0060** | < 0.5 |
+| Token-argmax divergence | 2.1% (4/192) | **1.6% (3/192)** | < 15% |
+| Router speedup vs fp32 | 13.7% (18.7→16.1ms) | **57.2% (10.2→4.4ms)** | ≥ 10% |
+
+All four thresholds **PASS again**, cleanly, under the actual production compiler configuration.
+The speed delta looks dramatically larger here than the 13.7%→~14-30% range seen in single-prompt
+production runs — expected, not a discrepancy: this harness measures router cost in isolation
+across 10 varied prompts via the same phase-2b clean-timing methodology as §22.15, and both fp32's
+and int8's absolute bucket times dropped substantially under `-fno-tree-vectorize` (§22.16), with
+int8's dropping proportionally further — consistent with, not contradicting, the standalone
+single-decode numbers reported in §22.16's own table (int8 default: 16.2→4.4ms; fp32: ~19→11.1ms).
+
+**This run is now the reference baseline** for judging any future router or SwiGLU change — not
+§22.15's numbers, which were measured under a build configuration no longer in use. Any future
+harness comparison (SwiGLU candidates, a possible re-look at int4-HP, etc.) should be run under
+this same mandatory build and compared against the numbers in this table, not §22.15's.
+
+**Next, per explicit instruction**: implement one flagged fast-SwiGLU candidate with quality and
+speed gates predeclared before implementation, evaluated with this same harness once it exists.
