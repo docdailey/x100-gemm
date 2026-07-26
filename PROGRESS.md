@@ -50,6 +50,15 @@ polynomial approximation) or approximating the sigmoid outright, both of which c
 numerical/quality risk that caching and exact-vectorization didn't — needs more validation than
 the single-prompt coherence check used so far before touching it.
 
+**8-hart pinning fix + nt=8 test (2026-07-26).** `pin_once`'s old `8+(tn*2)%8` formula only worked
+by luck up to nt=4 (harts 8,10,12,14 — one per IME-2 unit, per `docs/HARDWARE.md`'s 4-units/
+2-cores-each topology) and collided for nt>4. Fixed with a lookup table (one-per-unit first, then
+paired partners), regression-tested clean at nt=4 (7.51 vs 7.54 tok/s, noise). **nt=8 tested for
+real: 7.27 tok/s — slightly worse than nt=4.** `linear(kernel)` went 58.7→62.9ms (up, not down).
+Matches the router finding and `docs/HARDWARE.md`'s own peak-TOPS table (4-across-pairs→8-cores is
+only +11% even for register-fed compute): our workload is memory-bandwidth-bound, so more threads
+just adds LPDDR5-bus contention. **nt=4 stays the default.**
+
 ## Headline status
 - **Qwen3-30B-A3B MoE runs COHERENT on the K3 IME-2**, pure C: prompt → ' Tokyo' PASS;
   "…Tokyo. The capital of Brazil is Brasília. The capital of Canada is Ottawa." **1.36 tok/s M=1 (nt=4)**.

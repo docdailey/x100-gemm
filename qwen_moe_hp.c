@@ -37,7 +37,13 @@
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static int bind_ai(void){ int fd=open("/proc/set_ai_thread",O_WRONLY); if(fd<0)return -1; int r=write(fd,"0",1); close(fd); return r<0?-1:0; }
 static __thread int g_pinned=0;
-static void pin_once(int tn){ if(g_pinned)return; bind_ai(); cpu_set_t cs;CPU_ZERO(&cs);CPU_SET(8+(tn*2)%8,&cs);sched_setaffinity(0,sizeof(cs),&cs); for(int i=0;i<5;i++)sched_yield(); g_pinned=1; }
+/* docs/HARDWARE.md: 4 IME-2 units, each shared by a core PAIR (8,9)(10,11)(12,13)(14,15); using
+ * both cores of one pair is measured CONTENDED (7.31 TOPS/2 units) vs one-per-unit (13.09/4 units).
+ * Old formula (8+(tn*2)%8) only worked by luck up to nt=4 (gives 8,10,12,14) and collides for
+ * nt>4 (tn=4 maps back to hart 8). This table fills one-per-unit first, then the paired partners,
+ * so it's collision-free and contention-aware for any nt in 1..8. */
+static const int g_hart_order[8]={8,10,12,14,9,11,13,15};
+static void pin_once(int tn){ if(g_pinned)return; bind_ai(); cpu_set_t cs;CPU_ZERO(&cs);CPU_SET(g_hart_order[tn%8],&cs);sched_setaffinity(0,sizeof(cs),&cs); for(int i=0;i<5;i++)sched_yield(); g_pinned=1; }
 
 /* ===================== fp16 helpers ===================== */
 static uint16_t f32_to_f16(float f){

@@ -1092,3 +1092,24 @@ means either a polynomial sigmoid approximation or a lookup table — both carry
 risk that caching and exact vectorization didn't. The single-prompt `' Tokyo'`-coherence check
 used throughout this session is not enough validation for that; needs a broader
 quality/perplexity-style check before shipping, not just "still generates something plausible."
+
+### 22.5 8-hart pinning: fixed a real collision bug, then measured that it doesn't matter here
+
+`pin_once`'s formula (`8+(tn*2)%8`) was not arbitrary — `docs/HARDWARE.md` documents 4 IME-2
+units, each shared by a core pair (8,9)(10,11)(12,13)(14,15), and measures using both cores of one
+pair as *contended* (7.31 TOPS for 2 units via pairs vs 13.09 for 4 units one-per-pair). The
+formula correctly picks one-per-unit (8,10,12,14) for nt=4 — but it only works by coincidence:
+for nt=8 it collides (tn=4 maps back to hart 8, same as tn=0), silently oversubscribing half the
+units instead of using all 8 harts. Replaced with a lookup table (`{8,10,12,14,9,11,13,15}`,
+indexed `tn%8`) — one-per-unit first, then paired partners, collision-free for any nt in 1..8.
+Regression-tested at nt=4: 7.51 vs 7.54 tok/s (noise, confirms no behavior change).
+
+**nt=8, tested for real on this workload: 7.27 tok/s — slightly worse than nt=4's 7.51.**
+`linear(kernel)` went 58.7→62.9ms, i.e. *up*, not down. This matches two independent signals
+already in hand: the router finding (vectorizing compute didn't help much because the bottleneck
+is memory bandwidth, not FLOPs) and `docs/HARDWARE.md`'s own peak-TOPS table, where going from
+4-across-pairs to all-8-cores gains only +11% even for pure register-fed compute with zero memory
+traffic. Our actual per-call GEMV work is tiny and the shared LPDDR5 bus is the real constraint;
+doubling threads adds contention without touching that. Correctness held at nt=8 either way
+(`' Tokyo'` PASS, identical generation), so the fix itself is verified safe to use — it's just
+that more threads is not the lever here. **nt=4 remains the right default for this engine.**
