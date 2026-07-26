@@ -2130,3 +2130,161 @@ takes effect through the actual default code path, not only when the flag is pas
 now materially closer to the real vendor binary's 11.71-12.89 tok/s window (11.37/11.71≈97.1% of
 the low endpoint, 11.37/12.89≈88.2% of the high endpoint — both stated, per the §22.19 phrasing
 correction).
+
+### 22.22 Release-quality checkpoint frozen (2026-07-26)
+
+Per explicit direction ("freeze this as a release-quality checkpoint"), recorded everything needed
+to exactly reproduce or re-verify the promoted state from §22.21, gathered directly from the board
+(not assumed from earlier notes):
+
+**Toolchain**
+- Compiler: `gcc (Bianbu 15.2.0-16ubuntu1bb5) 15.2.0`
+- Assembler/linker: `GNU Binutils for Bianbu 2.46`
+- OS: Bianbu 4.0.1 "Resolute Raccoon" (`PRETTY_NAME="Bianbu 4.0.1"`)
+- Kernel: `Linux k3 6.18.3-generic #1.0.1.4 SMP PREEMPT_DYNAMIC Thu May 21 16:47:06 CST 2026 riscv64`
+- Board: hostname `k3`, `192.168.68.24` (static, wired `end0`), SpacemiT K3 SoC — 8x A100 cores +
+  8x X100 cores (16 total, `riscv64`), the same board used for every measurement this session.
+
+**Exact build command** (mandatory flags, unchanged since §22.16's toolchain hardening):
+```
+gcc -O3 -fno-tree-vectorize -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread
+```
+
+**Artifact hashes** (`sha256sum`, gathered directly on-board, not computed locally then assumed
+unchanged):
+| artifact | size | sha256 |
+|---|---|---|
+| `qwen_moe_hp.c` (source) | — | `3b9bc183b62da66b01a1c603cad2a2811f87b7f0fd8af80e82f6c191288e50ef` |
+| `qwen_moe_hp` (binary) | 72744 B | `c28c1f66e21ff2f60e9fc3cb24ade29bc9a759c0c5fa7cccaab87a230755bae8` |
+| `Qwen3-30B-A3B-Q4_0.gguf` (model) | 17379988032 B (16.19 GiB) | `8b8e9febb6ed326d91a016f5d465cf5b55a0b328d157a43e2242fda71fde9c40` |
+| `qwen3-30b-a3b.hp.imecache` (requant cache) | 18288076356 B (17.03 GiB), format **v2** (vendor HP) | `f9da3b65e5adf34137ac35a922f0040fb43bfdcda070a23b7e4f2bd64da476d5` |
+
+The source hash **exactly matches `git show 0dde2f4:qwen_moe_hp.c`** (verified locally,
+`3b9bc183b6...` both ways) — the on-board binary being frozen here is provably built from the
+committed production-A/B-promotion commit, not from any uncommitted or in-flight edit.
+
+**Defaults and fallback flags, as of this checkpoint** (commit `0dde2f4`):
+| flag | default | fallback / alternatives |
+|---|---|---|
+| `g_router_mode` (7th CLI arg) | `2` = int8-M1 (§22.15, passed harness) | `0` = fp32 exact (explicit revert flag); `1` = int4-HP (REJECTED, §22.7, 60.3% routing perturbation) |
+| `g_swiglu_fast` (8th CLI arg) | `2` = rational-Padé (§22.20-21, passed harness + production A/B) | `0` = exact SiLU (explicit revert flag); `1` = hard-swish (REJECTED, §22.19-20, 11.0% perplexity inflation) |
+| `g_router_validate` (6th CLI arg) | `0` (off) | `1` enables the router fp32-vs-quantized validator, ~2x router bucket cost, diagnostic only |
+
+**Quick-start invocation, exact defaults, no positional overrides needed**:
+```
+ssh root@192.168.68.24
+LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache
+```
+Verified at freeze time: `' Tokyo'` PASS, `11.35 tok/s`, `swiglu 1.4ms` — matches §22.21's A/B
+figures exactly, confirming the frozen artifact reproduces the promoted result.
+
+### 22.23 Context-length scaling: attention overtakes linear(kernel) at ~59 tokens of context
+
+Every router/SwiGLU decision this session was measured at a **12-token prompt** — a short-context
+regime where `linear(kernel)` (weight streaming, independent of context length) dominates the
+per-token bucket breakdown. Per explicit direction ("benchmark context-length scaling ... to
+expose when attention replaces linear as the bottleneck"), added a `QWEN_CTXLEN` env var (same
+"avoid another positional production arg" convention as `QWEN_HARNESS`) that synthesizes a prefill
+of the requested length by tiling the harness's real 113-token narrative prompt (`hp9`), grows the
+KV cache to fit, and otherwise runs the unmodified production decode loop/build — no new benchmark
+harness, same binary. Swept ctx ∈ {32, 64, 128, 512, 1024} (plus the existing 12-token default as
+an implicit low point), all at the promoted default config (int8-M1 + rational-Padé), `nt=4`,
+16-token decode window per run:
+
+| ctx (tokens) | attention (ms/tok) | linear(kernel) (ms/tok) | wall (ms/tok) | tok/s | prefill (s) |
+|---|---|---|---|---|---|
+| 12 (default prompt) | 9.1 | 58.9 | 88.1 | 11.35 | 0.97 |
+| 32 | 28.1 | 58.8 | 107.0 | 9.34 | 2.71 |
+| 64 | 64.4 | 58.9 | 143.6 | 6.97 | 6.04 |
+| 128 | 143.9 | 59.3 | 223.7 | 4.47 | 17.40 |
+| 512 | 600.3 | 59.9 | 680.6 | 1.47 | 182.32 |
+| 1024 | 1216.0 | 60.7 | 1297.3 | 0.77 | 680.13 |
+
+`linear(kernel)` is flat (58.8-60.7ms) across nearly two orders of magnitude of context length, as
+expected — it streams a fixed set of weights per token regardless of KV cache size. `attention`
+scales linearly in context length: a least-squares fit over the 32-1024 points gives **~1.197
+ms per token of context, intercept ≈ -11ms** (R² not computed but the fit is visually tight — see
+raw points above), consistent with the expected O(context) per-decode-step cost of attending over
+a growing KV cache with no windowing/pruning in this implementation. Every other bucket (act-pack,
+rope+qknorm, router, swiglu, rest) stays within measurement noise of its short-context value at
+every context length tested — only attention and, trivially, wall time move.
+
+**Crossover point: attention overtakes linear(kernel) as the dominant per-token bucket at ~59
+tokens of context** (solving `1.197*ctx - 11 = 59.2` using the fitted line and the ~59.2ms average
+linear-kernel bucket). The ctx=64 measurement directly brackets this (attention 64.4ms already
+exceeds linear 58.9ms), consistent with the fit. **Every quality/speed decision made this session
+(router promotion, SwiGLU promotion, the A/B in §22.21) was measured well inside the
+linear-dominated regime** (12-token prompt, decode positions 12-27) — none of those results say
+anything about relative bucket weight at longer context, though the *quality* harness (§22.20) did
+separately validate up to 113-token prefills for its long-context prompts, so the quality
+conclusions are not context-length-limited the way the speed/bucket conclusions are.
+
+**Practical implication, not yet acted on**: for genuinely long-context workloads (multi-turn
+chat history, long documents, extended generations well past ~60 tokens of accumulated context),
+attention becomes the dominant cost and the two optimizations promoted this session (int8-M1
+router, rational-Padé SwiGLU) — both of which target buckets that stay flat with context — provide
+progressively smaller relative benefit; at ctx=1024 they touch only ~5% of the per-token wall time
+(4.2ms router + swiglu combined out of 1297ms) versus ~94% at the 12-token baseline. Prefill time
+also grows steeply (0.97s→680s from ctx=12 to ctx=1024) and was not the target of this sweep
+(prefill is O(context) work done once, not the per-token decode cost being profiled here) but is
+flagged for anyone using this engine on long documents. **Attention itself — not yet vectorized
+beyond the existing RVV QK/AV dot products from §22.9, and using no KV-cache pruning, windowing, or
+approximate-attention technique — is the natural next optimization target if long-context
+throughput becomes a priority**, distinct from and orthogonal to the short-context work done this
+session.
+
+### 22.24 Board OOM incident, a real vendor-binary bug found along the way, and a clean vendor A/B at parity
+
+**Incident (self-inflicted, root-caused).** Attempting to expand the quality harness (§22.20's
+next step) and get a fresh vendor `llama-bench` comparison in the same sitting, the two were
+launched concurrently — a sequencing mistake, not a deliberate stress test. The board has **32.8GB
+RAM and zero swap**; the harness alone holds ~18GB resident (the requant cache) and `llama-bench`
+loads its own separate ~17GB copy of the GGUF, so combined demand (~35GB) exceeded physical RAM
+with nothing to absorb the overage. `journalctl` confirms the kernel OOM-killer fired and killed
+the harness process directly (`Out of memory: Killed process ... (qwen_moe_hp)
+total-vm:35013040kB, anon-rss:17999616kB`), and per systemd's unit-level logs it took out
+additional processes across `user-0.slice`/`user.slice` — very likely `llama-bench` and, per the
+`journalctl -u ssh` timeline, `sshd`'s own listening socket, which explains why the board refused
+even a fresh SSH connection (banner-exchange timeouts) for roughly 15-20 minutes until `ssh.service`
+restarted. Board temperatures were 57-61°C throughout — never the cause, confirmed once
+reachable again. Lesson recorded in Claude's persistent memory: never run two model-loading
+processes on this board concurrently; always confirm one has fully exited before starting another.
+
+**A second, independent problem surfaced once the board recovered**: `llama-bench`, run completely
+alone with no contention, crashed reproducibly at both `-t 4` and `-t 8` with `ggml_abort()` —
+`"set thread affinity error for thread_n %d, cpu_id %d"` inside SpacemiT's `ime.cpp`. Tracing it
+down: `/root/llama.cpp/ggml/src/ggml-cpu/spacemit/ime.cpp` is a locally modified file (tracked as
+`M` in git status) that already has this exact call downgraded from `GGML_ABORT` to
+`GGML_LOG_ERROR` (an earlier session-local patch, alongside a `bind_ai_thread()` unlock call —
+`ime.cpp.orig`, the untouched original, still has the unpatched `GGML_ABORT` at the matching line).
+But `/usr/lib/libggml-cpu.so.0.13.1` — what `LD_LIBRARY_PATH=/usr/lib` (the invocation pattern used
+everywhere in this session, including the A5-equiv baseline in `research_feed_paths.md`) actually
+loads at runtime — is dated **Jul 7**, predating the patch; it was never rebuilt/reinstalled after
+the source was fixed. `/root/llama.cpp/build/bin/libggml-cpu.so.0.13.1` (the build tree's own
+copy, Jul 25) has the correct patched behavior. Fix: point `LD_LIBRARY_PATH` at the build tree
+instead of the stale system copy — `LD_LIBRARY_PATH=/root/llama.cpp/build/bin`, not `/usr/lib`.
+No source or system-file changes were needed, just the correct library path. This means the
+**A5-equiv baseline row in `research_feed_paths.md` §12** (11.71±0.19 tok/s @t=4, 12.89±0.03 @t=8,
+git SHA `31504f6`) was itself obtained against this same stale library — worth keeping in mind if
+that number is ever revisited, though it isn't necessarily wrong (the crash is a thread-affinity
+abort under specific conditions, not proof every prior run was corrupted).
+
+**Clean vendor A/B, obtained after both fixes, board otherwise idle, no contention**:
+
+| config | tok/s | conditions |
+|---|---|---|
+| our engine (production default: int8-M1 + rational-Padé) | 11.35-11.39 (repeated runs) | 12-token prefill (untimed) + 16-token timed decode, `nt=4` |
+| vendor `llama-bench` (patched lib) | **11.38 ± 0.21** (r=3) | `-p 0 -n 16` (empty-context decode, no prefill), `-t 4` |
+| vendor `llama-bench` (patched lib) | 12.82 ± 0.05 (r=3) | same, `-t 8` (our engine has no `nt=8` config tested today; history notes `nt=8` measured slightly worse for our engine, memory-bandwidth-bound) |
+
+**Our pure-C engine and the vendor's own compiled implementation are now at parity at `nt=4`** —
+11.35-11.39 vs 11.38±0.21, well within the vendor's own run-to-run noise band. One honest
+measurement-boundary caveat, per the "matching measurement boundaries" requirement: our number's
+decode window covers KV-cache positions 12-27 (after a 12-token prefill, ~9ms/token of attention
+cost per §22.23's bucket data), while vendor's `-p 0` starts from an empty context (positions
+0-15, attention cost ramping from ~0), so vendor's number has a slightly easier attention profile
+over its window than ours does. Given the two results already land within noise of each other,
+this doesn't change the "at parity" conclusion, but it means the comparison isn't byte-for-byte
+identical in context depth — flagged rather than glossed over. The `nt=8` vendor figure (12.82) is
+close to the earlier stale-library baseline's 12.89, a useful cross-check that the library-path fix
+didn't materially change the underlying performance number, only the crash behavior.

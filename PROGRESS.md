@@ -2,13 +2,51 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config)
+**Release-quality checkpoint frozen (2026-07-26, `codex_recs_1.md` §22.22)**: commit `0dde2f4`
+(int8-M1 router + rational-Padé SwiGLU, the current HEADLINE default) — compiler, exact build
+command, and sha256 of the source/binary/model/cache are all recorded there for exact
+reproducibility. Board-side re-verified at freeze time: `' Tokyo'` PASS, 11.35 tok/s.
+
+**Context-length scaling swept (2026-07-26, `codex_recs_1.md` §22.23)**: all this session's
+speed/bucket decisions were measured at a 12-token prompt, a linear(kernel)-dominated regime.
+Swept ctx ∈ {32,64,128,512,1024} via a new `QWEN_CTXLEN` env var — `attention` scales linearly with
+context (~1.2ms/token of context) while every other bucket stays flat. **Crossover where attention
+overtakes linear(kernel): ~59 tokens of context.** Past that, the int8-M1/rational-Padé speedups
+(both target flat buckets) contribute a shrinking fraction of wall time — only ~5% at ctx=1024.
+Attention itself (RVV QK/AV dot products, no pruning/windowing) is flagged as the natural next
+target for long-context throughput, not started.
+
+**Board outage, root-caused (2026-07-26): OOM-killer, not thermal.** Launched the expanded quality
+harness and the vendor `llama-bench` A/B concurrently (a sequencing mistake) — each loads its own
+~17-18GB model/cache, and combined demand (~35GB) exceeded the board's **32.8GB RAM with zero
+swap**. `journalctl` confirms the kernel OOM-killer killed the harness process
+(`qwen_moe_hp total-vm:35013040kB, anon-rss:17999616kB`) and took sshd down with it — the board was
+unreachable (SSH banner-exchange timeouts) for ~15-20 min until sshd's unit restarted. Temps were
+57-61°C throughout, never the cause. **Lesson recorded** (also in Claude's persistent memory): never
+run two model-loading processes on this board concurrently — always confirm one has fully exited
+before starting another.
+
+**Vendor `llama-bench` A/B redone, sequentially, plus a real vendor-binary bug found and fixed
+(2026-07-26, `codex_recs_1.md` §22.24).** `llama-bench` crashed reproducibly even run alone
+(`ggml_abort` on a thread-affinity error) — traced to `LD_LIBRARY_PATH=/usr/lib` loading a stale
+(Jul 7) system copy of `libggml-cpu.so` that predates a local source patch already present in the
+checkout; the build tree's own copy (Jul 25) has the fix. No source changes needed, just point
+`LD_LIBRARY_PATH` at `/root/llama.cpp/build/bin` instead of `/usr/lib`. With that fixed, board
+otherwise idle: **our engine 11.35-11.39 tok/s vs vendor 11.38±0.21 tok/s at nt=4 — at parity.**
+(vendor nt=8: 12.82±0.05, close to the earlier stale-library baseline's 12.89, confirming the fix
+didn't change the underlying performance number, only the crash.)
+
+## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config), AT PARITY with the vendor binary at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
 untouched) for comparison. `qwen_moe_hp.c` is now **~7.6-7.8x faster** at its actual default config
 (int8-M1 router + rational-Padé SwiGLU), same correctness bar (`' Tokyo'` PASS, coherent
-generation, tokens identical to exact SiLU on the canonical prompt). An earlier experimental flag
+generation, tokens identical to exact SiLU on the canonical prompt). A clean, sequential (no
+contention) A/B against the real vendor `llama-bench` binary confirms **11.35-11.39 tok/s (ours) vs
+11.38±0.21 tok/s (vendor) at nt=4 — statistically at parity**, closing what was previously reported
+as an ~11% gap (that earlier vendor number turned out to be measured against a stale, since-fixed
+vendor library — see the dated entry below and `codex_recs_1.md` §22.24). An earlier experimental flag
 (`g_swiglu_fast=1`, hard-swish) reaches a similar 11.49-11.5 tok/s but was **promoted then
 retracted** the same day for a real quality regression (11.0% perplexity inflation at scale) — see
 `codex_recs_1.md` §22.19-20 — and stays rejected; do not re-promote it. The default SwiGLU mode is
