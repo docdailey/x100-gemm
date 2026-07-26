@@ -185,7 +185,119 @@ static void run_hp_m1(const uint8_t*a_data, const uint8_t*b_data, float*dst_c, l
           "v24","v25","v26","v27","v28","v29","v30","v31","fa0","fa1","ft0","ft1");
 }
 
-typedef struct { int N,K; uint8_t*B; } Lin; /* B: (N/32)*(K/256)*BSUPER bytes */
+/* ===== vendor IME-2 int8 M1 kernel (gemm_kernel_i8i8_m1) -- validated in bench/vendor_ime_i8_full.c:
+ * max abs diff 0.00000, max rel diff 0.00001 vs an independent dequant oracle. Genuinely simpler
+ * than the int4 .hp kernel: plain signed vmadot (no zero-point trickery -- int8 has enough range
+ * to store signed values directly), and the SIMPLE fp32-scale/int16-asum/32B-data A-format (38B
+ * per K32-group, no two-level fp16 scheme -- that was specific to the int4 .hp kernel). Structural
+ * difference from the int4 kernel: this loop is FLAT over K32-groups (k_blks = K/32), not nested
+ * 256-wide-superblock-of-8-subblocks (int4's k_blks = K/256). B ground truth: make_block_q8_0x32
+ * (repack.cpp:357) is a plain row-major memcpy per row, no nibble interleaving needed. */
+#define BREC_I8 1088 /* bytes per 32-wide-K x 32-wide-N B record: 64B fp16 scale + 1024B int8 data */
+typedef struct { uint16_t d; int8_t qs[32]; } q8_0_native;
+static void quantize_q8_0_native(const float*w /*32 elems*/, q8_0_native*out){
+    float amax=1e-6f; for(int i=0;i<32;i++){ float v=fabsf(w[i]); if(v>amax)amax=v; }
+    float d=amax/127.0f; float inv=d?1.0f/d:0.0f;
+    out->d=f32_to_f16(d);
+    for(int i=0;i<32;i++){ int q=(int)lrintf(w[i]*inv); if(q>127)q=127; if(q<-128)q=-128; out->qs[i]=(int8_t)q; }
+}
+static void pack_B_q8_0x32(q8_0_native rows[32], uint8_t*out /* 1088 bytes */){
+    for(int i=0;i<32;i++) memcpy(out+i*2,&rows[i].d,2);
+    uint8_t*qs=out+64;
+    for(int i=0;i<32;i++) memcpy(qs+i*32, rows[i].qs, 32);
+}
+static void pack_A_i8(const float*x, uint8_t*out /* 38 bytes: 4B fp32 scale + 2B int16 asum + 32B int8 */){
+    float amax=1e-6f; for(int i=0;i<32;i++){ float v=fabsf(x[i]); if(v>amax)amax=v; }
+    float scale=amax/127.0f; float inv=scale?1.0f/scale:0.0f;
+    int8_t q[32]; int32_t sum=0;
+    for(int i=0;i<32;i++){ int v=(int)lrintf(x[i]*inv); if(v>127)v=127; if(v<-128)v=-128; q[i]=(int8_t)v; sum+=v; }
+    int16_t asum=(int16_t)sum;
+    memcpy(out,&scale,4); memcpy(out+4,&asum,2); memcpy(out+6,q,32);
+}
+static void run_i8_m1(const uint8_t*a_data, const uint8_t*b_data, float*dst_c, long k_blks){
+    __asm__ volatile(
+        "mv           t3, %[BCK]              \n\t"
+        "mv           t4, %[NBLKS]            \n\t"
+        "mv           s2, %[pA]               \n\t"
+        "addi         s3, %[pA], 4+2          \n\t"
+        "mv           s4, %[pB]               \n\t"
+        "addi         s5, %[pB], 32*2         \n\t"
+        "mv           s6, %[pC]               \n\t"
+
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vxor.vv      v2, v0, v0              \n\t"
+
+        ".align 4                             \n\t"
+        "_K_LPST%=:                           \n\t"
+
+        "vsetvli      t0, x0, e8, m1          \n\t"
+        "vl4r.v       v4, (s5)                \n\t"
+        "addi         s5, s5, 128*4           \n\t"
+        "vl4r.v       v8, (s5)                \n\t"
+        "addi         s5, s5, 128*4+64        \n\t"
+
+        "vsetvli      t0, x0, e8, mf2         \n\t"
+        "vle8.v       v0, (s4)                \n\t"
+        "addi         s4, s4, 64+128*8        \n\t"
+
+        "vsetvli      t0, x0, e8, mf4         \n\t"
+        "vle8.v       v3, (s3)                \n\t"
+        "addi         s3, s3, 32+6            \n\t"
+
+        "flw          f0, (s2)                \n\t"
+        "addi         s2, s2, 6+32            \n\t"
+
+        "vsetvli      t0, zero, e32, m1       \n\t"
+        "vupack.vv    v24, v4, v5, 1          \n\t"
+        "vupack.vv    v26, v6, v7, 1          \n\t"
+        "vupack.vv    v28, v8, v9, 1          \n\t"
+        "vupack.vv    v30, v10, v11, 1        \n\t"
+
+        "vslidedown.vi  v4, v3, 4             \n\t"
+
+        "vxor.vv      v16, v16, v16           \n\t"
+        "vxor.vv      v18, v16, v16           \n\t"
+        "vxor.vv      v20, v16, v16           \n\t"
+        "vxor.vv      v22, v16, v16           \n\t"
+
+        "vmadot       v16, v3, v24, i8         \n\t"
+        "vmadot       v18, v3, v26, i8         \n\t"
+        "vmadot       v20, v3, v28, i8         \n\t"
+        "vmadot       v22, v3, v30, i8         \n\t"
+
+        "vmadot       v16, v4, v25, i8         \n\t"
+        "vmadot       v18, v4, v27, i8         \n\t"
+        "vmadot       v20, v4, v29, i8         \n\t"
+        "vmadot       v22, v4, v31, i8         \n\t"
+
+        "vpack.vv     v24, v16, v18, 2        \n\t"
+        "vpack.vv     v26, v20, v22, 2        \n\t"
+        "vpack.vv     v16, v24, v26, 3        \n\t"
+
+        "vsetvli      t0, x0, e16, mf2        \n\t"
+        "vfwcvt.f.f.v v24, v0                 \n\t"
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vfcvt.f.x.v  v26, v16                \n\t"
+        "vfmul.vf     v1, v24, f0             \n\t"
+        "vfmacc.vv    v2, v1, v26             \n\t"
+
+        "addi         t3, t3, -1              \n\t"
+        "bgtz         t3, _K_LPST%=           \n\t"
+        "_K_LPND%=:                           \n\t"
+
+        "_ST32%=:                             \n\t"
+        "vsetvli      t0, t4, e32, m1         \n\t"
+        "vse32.v      v2, (s6)                \n\t"
+        "_FUNC_END%=:                         \n\t"
+
+        :
+        : [BCK] "r"(k_blks), [NBLKS] "r"(32L), [pA] "r"(a_data), [pB] "r"(b_data), [pC] "r"(dst_c)
+        : "cc","t0","t3","t4","f0","s2","s3","s4","s5","s6",
+          "v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11",
+          "v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory");
+}
+
+typedef struct { int N,K; uint8_t*B; } Lin; /* B: (N/32)*(K/256)*BSUPER bytes for int4-HP Lins; int8 Lins use BREC_I8*(K/32) per panel instead -- see lin_new_i8 */
 
 static Lin lin_new_hp(const float*wf32,int N,int K){
     Lin l; l.N=N; l.K=K; int Np=N/32, Sb=K/256;
@@ -207,21 +319,51 @@ static Lin lin_new_hp(const float*wf32,int N,int K){
 static void pack_act_hp(const float*x,int K,uint8_t*Abuf){
     int Sb=K/256; for(int sb=0;sb<Sb;sb++) pack_A_hp(x+sb*256, Abuf+(size_t)sb*AREC);
 }
+/* int8 Lin: same (N,K,B) shape as the int4 Lin, but B is packed flat -- (N/32) panels, each a
+ * contiguous run of (K/32) BREC_I8 (1088B) records, no 256-wide superblock grouping (that was
+ * specific to int4's nested BLK_LOOP/INNER_BLK_LOOP structure; int8's kernel loop is flat over
+ * K32-groups, k_blks = K/32). */
+static Lin lin_new_i8(const float*wf32,int N,int K){
+    Lin l; l.N=N; l.K=K; int Np=N/32, Kg=K/32;
+    l.B=malloc((size_t)Np*Kg*BREC_I8);
+    for(int np=0;np<Np;np++){
+        for(int kg=0;kg<Kg;kg++){
+            q8_0_native rows[32];
+            for(int r=0;r<32;r++){
+                int row=np*32+r;
+                quantize_q8_0_native(wf32+(size_t)row*K + kg*32, &rows[r]);
+            }
+            pack_B_q8_0x32(rows, l.B + ((size_t)np*Kg+kg)*BREC_I8);
+        }
+    }
+    return l;
+}
+static void pack_act_i8(const float*x,int K,uint8_t*Abuf){
+    int Kg=K/32; for(int kg=0;kg<Kg;kg++) pack_A_i8(x+kg*32, Abuf+(size_t)kg*38);
+}
 static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0, gT_rope=0, gT_router=0, gT_swiglu=0; static long gT_tok=0; static int gT_on=0;
-/* router fp16 validation counters (research_feed_paths.md router-quantization experiment) */
-static long g_rtr_cmp=0, g_rtr_mismatch=0, g_rtr_diffcount=0; static float g_rtr_maxabs=0, g_rtr_maxrel=0;
+/* router precision validation counters (research_feed_paths.md router-quantization experiments) */
+/* separate counters per experimental mode so one validate run reports both int4-vs-fp32 and
+ * int8-vs-fp32 quality independently -- directly answers "which tradeoff is better" */
+static long g_rtr_cmp=0;
+static long g_rtr_hp_mismatch=0, g_rtr_hp_diffcount=0; static float g_rtr_hp_maxabs=0, g_rtr_hp_maxrel=0;
+static long g_rtr_i8_mismatch=0, g_rtr_i8_diffcount=0; static float g_rtr_i8_maxabs=0, g_rtr_i8_maxrel=0;
 static int g_router_validate=0; /* set from main() via env/arg */
-static int g_router_use_hp=0; /* EXPERIMENTAL, off by default: use int4 HP-Lin router instead of
-    exact fp32 -- 33% faster router bucket but 58.9% of routing decisions perturbed vs fp32
-    (avg 1.38/8 experts, usually a near-tie swap); see codex_recs_1.md §22.7 before flipping this on. */
+/* router precision mode, EXPERIMENTAL, fp32 is the default: 0=fp32 (exact, matches the original
+ * engine), 1=int4 HP-Lin (33% faster router bucket but 58.9% of routing decisions perturbed vs
+ * fp32, avg 1.38/8 experts -- codex_recs_1.md §22.7), 2=int8 M1 (validated near-bit-exact
+ * standalone, bench/vendor_ime_i8_full.c max rel diff 1e-5, but not yet measured for real
+ * routing-quality impact on this model -- codex_recs_1.md §22.8). Set via 7th CLI arg. */
+static int g_router_mode=0;
 
 /* PR8 (codex_recs_1.md §17/§22.3): with the vendor kernel at ~446ns/call, the ~1392 fresh
  * #pragma omp parallel spawns/token that lin_mm_hp used to do dominated wall-clock (100.3ms,
  * 62%). Replace with a persistent spin-dispatch pool: threads created once, wait on a generation
  * counter instead of libgomp fork/join. Same round-robin panel partitioning as before (np=tn;
- * np<Np; np+=nt), so the actual math is unchanged -- only the dispatch mechanism differs. */
+ * np<Np; np+=nt), so the actual math is unchanged -- only the dispatch mechanism differs.
+ * Generalized (kind field) to also dispatch the int8 M1 kernel through the same pool. */
 #define MAXNT 16
-typedef struct { const Lin*l; const uint8_t*Abuf; float*y; int kb; } HpWork;
+typedef struct { int kind; const Lin*l; const uint8_t*Abuf; float*y; int kb; } HpWork; /* kind: 0=int4 HP, 1=int8 M1 */
 static _Atomic int g_pool_gen=0, g_pool_done=0;
 static HpWork g_pool_work;
 static int g_pool_nt=0;
@@ -229,8 +371,13 @@ static pthread_t g_pool_threads[MAXNT];
 
 static void lin_mm_hp_worker_run(int tn){
     int Np=g_pool_work.l->N/32;
-    for(int np=tn; np<Np; np+=g_pool_nt)
-        run_hp_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER, g_pool_work.y+np*32, g_pool_work.kb);
+    if(g_pool_work.kind==0){
+        for(int np=tn; np<Np; np+=g_pool_nt)
+            run_hp_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER, g_pool_work.y+np*32, g_pool_work.kb);
+    } else {
+        for(int np=tn; np<Np; np+=g_pool_nt)
+            run_i8_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BREC_I8, g_pool_work.y+np*32, g_pool_work.kb);
+    }
 }
 static void* lin_mm_hp_worker(void*arg){
     int tn=(int)(intptr_t)arg; pin_once(tn);
@@ -249,10 +396,17 @@ static void lin_mm_pool_init(int nt){
     for(int i=1;i<nt;i++) pthread_create(&g_pool_threads[i],NULL,lin_mm_hp_worker,(void*)(intptr_t)i);
 }
 static void lin_mm_hp(const Lin*l,const uint8_t*Abuf,float*y,int nt){
-    g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/256;
+    g_pool_work.kind=0; g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/256;
     atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
     atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release); /* wake workers 1..nt-1 */
     lin_mm_hp_worker_run(0); /* main thread does its own share (tn=0) */
+    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < nt-1) { /* spin */ }
+}
+static void lin_mm_i8(const Lin*l,const uint8_t*Abuf,float*y,int nt){
+    g_pool_work.kind=1; g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/32;
+    atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release);
+    lin_mm_hp_worker_run(0);
     while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < nt-1) { /* spin */ }
 }
 static void lin_mm(const Lin*l,const float*x,float*y,int nt,uint8_t*Abuf){
@@ -335,7 +489,7 @@ static float* gguf_dequant(Gguf*g,const char*name){ TInfo*ti=gguf_find(g,name); 
     float*out=malloc(total*4); gguf_dequant_into(g,ti,0,total,out); return out; }
 
 /* ===================== model ===================== */
-typedef struct { float*attn_norm,*ffn_norm,*q_norm,*k_norm,*router; Lin router_hp; Lin q,k,v,o; Lin*eg,*eu,*ed; } Layer;
+typedef struct { float*attn_norm,*ffn_norm,*q_norm,*k_norm,*router; Lin router_hp,router_i8; Lin q,k,v,o; Lin*eg,*eu,*ed; } Layer;
 typedef struct { int d,nl,nh,nkv,hd,vocab,nt,n_exp,n_act,moe; float rope_base,eps; float*tok_embd,*out_norm; Layer*L; Lin lm; } Model;
 
 static void rmsnorm(float*o,const float*x,const float*w,int n,float eps){ float s=0; for(int i=0;i<n;i++)s+=x[i]*x[i]; s=1.0f/sqrtf(s/n+eps); for(int i=0;i<n;i++)o[i]=x[i]*s*w[i]; }
@@ -393,6 +547,7 @@ static void model_load(Model*m,Gguf*g,int nt){
         ly->q=LN("attn_q.weight",qd,d); ly->k=LN("attn_k.weight",kvd,d); ly->v=LN("attn_v.weight",kvd,d); ly->o=LN("attn_output.weight",d,qd);
         ly->router=DQ("ffn_gate_inp.weight");
         ly->router_hp=lin_new_hp(ly->router,ne,d);
+        ly->router_i8=lin_new_i8(ly->router,ne,d);
         ly->eg=malloc(ne*sizeof(Lin)); ly->eu=malloc(ne*sizeof(Lin)); ly->ed=malloc(ne*sizeof(Lin));
         snprintf(nm,64,"blk.%d.ffn_gate_exps.weight",l); TInfo*tg=gguf_find(g,nm);
         snprintf(nm,64,"blk.%d.ffn_up_exps.weight",l);   TInfo*tu=gguf_find(g,nm);
@@ -445,6 +600,7 @@ static int cache_load(Model*m,const char*path,int nt){
         ly->q_norm=malloc(m->hd*4); fread(ly->q_norm,4,m->hd,f); ly->k_norm=malloc(m->hd*4); fread(ly->k_norm,4,m->hd,f);
         ly->router=malloc((size_t)m->n_exp*m->d*4); fread(ly->router,4,(size_t)m->n_exp*m->d,f);
         ly->router_hp=lin_new_hp(ly->router,m->n_exp,m->d);
+        ly->router_i8=lin_new_i8(ly->router,m->n_exp,m->d);
         ly->q=rlin(f); ly->k=rlin(f); ly->v=rlin(f); ly->o=rlin(f);
         ly->eg=malloc(m->n_exp*sizeof(Lin)); ly->eu=malloc(m->n_exp*sizeof(Lin)); ly->ed=malloc(m->n_exp*sizeof(Lin));
         for(int e=0;e<m->n_exp;e++){ ly->eg[e]=rlin(f); ly->eu[e]=rlin(f); ly->ed[e]=rlin(f); } }
@@ -479,19 +635,22 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         if(gT_on) gT_attn += now()-_at;
         lin_mm(&ly->o,att,tmp,nt,Abuf); for(int i=0;i<d;i++)h[i]+=tmp[i];
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
-        /* router precision (codex_recs_1.md §22.7): fp32 is the DEFAULT (exact, matches the
-         * original engine) -- W4 HP-Lin routing is real (33% router-bucket, ~3-4% overall tok/s)
-         * but 58.9% of routing decisions get >=1/8 expert swapped vs fp32 (avg 1.38/8 when they
-         * do -- usually one near-tie swap, not wholesale reshuffling). That doesn't cleanly clear
-         * "keep only if quality holds"; it's gated behind g_router_use_hp (off by default) until
-         * broader eval (longer generations, more prompts, ideally perplexity) settles whether the
-         * swaps are actually benign. router shares its activation pack with eg/eu below regardless
-         * (same hn, same K=d) -- pack once, matching the P0.2 pattern used for q/k/v. */
+        /* router precision mode (codex_recs_1.md §22.7-22.8): fp32 is the DEFAULT (exact, matches
+         * the original engine). int4 HP-Lin: 33% faster router-bucket but 58.9% of routing
+         * decisions get >=1/8 expert swapped vs fp32 (avg 1.38/8, usually a near-tie swap). int8
+         * M1: validated near-bit-exact standalone but real routing-quality impact not yet measured.
+         * Neither clears "keep only if quality holds" on its own yet -- both gated behind
+         * g_router_mode (0=fp32 default) until broader eval settles it. router shares its int4-HP
+         * activation pack with eg/eu below regardless of mode (same hn, same K=d) -- pack once,
+         * matching the P0.2 pattern used for q/k/v; int8 mode needs its own differently-shaped
+         * activation pack, computed separately only when needed. */
         { double _ta=gT_on?now():0; pack_act_hp(hn,d,Abuf2);
           double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
-        float rl_hp[256]; if(g_router_use_hp||g_router_validate) lin_mm_hp(&ly->router_hp,Abuf2,rl_hp,nt);
-        float rl_fp32[256]; if(!g_router_use_hp||g_router_validate) for(int e=0;e<ne;e++) rl_fp32[e]=vdot_f32(ly->router+(size_t)e*d,hn,d);
-        float rl[256]; memcpy(rl, g_router_use_hp?rl_hp:rl_fp32, (size_t)ne*4);
+        int need_hp=(g_router_mode==1)||g_router_validate, need_i8=(g_router_mode==2)||g_router_validate, need_fp32=(g_router_mode==0)||g_router_validate;
+        float rl_hp[256]; if(need_hp) lin_mm_hp(&ly->router_hp,Abuf2,rl_hp,nt);
+        float rl_i8[256]; if(need_i8){ uint8_t Abuf_i8[3000]; pack_act_i8(hn,d,Abuf_i8); lin_mm_i8(&ly->router_i8,Abuf_i8,rl_i8,nt); }
+        float rl_fp32[256]; if(need_fp32) for(int e=0;e<ne;e++) rl_fp32[e]=vdot_f32(ly->router+(size_t)e*d,hn,d);
+        float rl[256]; memcpy(rl, g_router_mode==1?rl_hp:(g_router_mode==2?rl_i8:rl_fp32), (size_t)ne*4);
         softmax(rl,ne);
         int sel[32]; float sw[32];
         for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[a]=bi; sw[a]=bv; }
@@ -502,17 +661,22 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
          * extra reference-only compute and must NOT land inside this bucket. */
         if(gT_on) gT_router += now()-_tb;
         if(g_router_validate){
-            for(int e=0;e<ne;e++){ float ad=fabsf(rl_hp[e]-rl_fp32[e]),rel=ad/(fabsf(rl_fp32[e])+1e-6f);
-                if(ad>g_rtr_maxabs)g_rtr_maxabs=ad; if(rel>g_rtr_maxrel)g_rtr_maxrel=rel; }
             /* argmax sentinel must be -inf-ish, not -1: these are raw logits (can run well below
              * -1, observed to ~-5), not post-softmax probabilities -- this exact bug caused a
              * 100% false-mismatch rate before it was found (codex_recs_1.md §22.7). */
-            int selr[32]; float bvr[32];
-            for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(selr[b]==e)used=1; if(!used&&rl_fp32[e]>bv){bv=rl_fp32[e];bi=e;} } selr[a]=bi; bvr[a]=bv; }
-            int selhp[32]; float bvhp[32];
-            for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(selhp[b]==e)used=1; if(!used&&rl_hp[e]>bv){bv=rl_hp[e];bi=e;} } selhp[a]=bi; bvhp[a]=bv; }
-            int diff=0,ndiff=0; for(int a=0;a<na;a++){ int found=0; for(int b=0;b<na;b++) if(selr[a]==selhp[b]) found=1; if(!found){ diff=1; ndiff++; } }
-            g_rtr_cmp++; if(diff) g_rtr_mismatch++; g_rtr_diffcount+=ndiff;
+            int selr[32]; for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(selr[b]==e)used=1; if(!used&&rl_fp32[e]>bv){bv=rl_fp32[e];bi=e;} } selr[a]=bi; }
+            g_rtr_cmp++;
+            for(int e=0;e<ne;e++){ float ad=fabsf(rl_hp[e]-rl_fp32[e]),rel=ad/(fabsf(rl_fp32[e])+1e-6f);
+                if(ad>g_rtr_hp_maxabs)g_rtr_hp_maxabs=ad; if(rel>g_rtr_hp_maxrel)g_rtr_hp_maxrel=rel; }
+            int selhp[32]; for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(selhp[b]==e)used=1; if(!used&&rl_hp[e]>bv){bv=rl_hp[e];bi=e;} } selhp[a]=bi; }
+            int diffhp=0,ndiffhp=0; for(int a=0;a<na;a++){ int found=0; for(int b=0;b<na;b++) if(selr[a]==selhp[b]) found=1; if(!found){ diffhp=1; ndiffhp++; } }
+            if(diffhp) g_rtr_hp_mismatch++; g_rtr_hp_diffcount+=ndiffhp;
+
+            for(int e=0;e<ne;e++){ float ad=fabsf(rl_i8[e]-rl_fp32[e]),rel=ad/(fabsf(rl_fp32[e])+1e-6f);
+                if(ad>g_rtr_i8_maxabs)g_rtr_i8_maxabs=ad; if(rel>g_rtr_i8_maxrel)g_rtr_i8_maxrel=rel; }
+            int seli8[32]; for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(seli8[b]==e)used=1; if(!used&&rl_i8[e]>bv){bv=rl_i8[e];bi=e;} } seli8[a]=bi; }
+            int diffi8=0,ndiffi8=0; for(int a=0;a<na;a++){ int found=0; for(int b=0;b<na;b++) if(selr[a]==seli8[b]) found=1; if(!found){ diffi8=1; ndiffi8++; } }
+            if(diffi8) g_rtr_i8_mismatch++; g_rtr_i8_diffcount+=ndiffi8;
         }
         for(int i=0;i<d;i++)eout[i]=0;
           for(int a=0;a<na;a++){ int e=sel[a]; float w=sw[a];
@@ -549,8 +713,8 @@ int main(int c,char**v){
         g.block_count,g.embd,g.n_exp,g.n_act,g.moe_ffn,g.nh,g.nkv,g.hd,g.vocab,now()-t0);
     fflush(stderr);
     const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.hp.imecache";
-    g_router_validate=(c>5)?atoi(v[5]):0; /* router HP-Lin-vs-fp32 expert-selection validation, off by default (extra compute) */
-    g_router_use_hp=(c>6)?atoi(v[6]):0; /* EXPERIMENTAL: int4 HP-Lin routing instead of exact fp32 default, off by default -- see codex_recs_1.md §22.7 */
+    g_router_validate=(c>5)?atoi(v[5]):0; /* router HP-Lin/int8-vs-fp32 expert-selection validation, off by default (extra compute) */
+    g_router_mode=(c>6)?atoi(v[6]):0; /* EXPERIMENTAL: 0=fp32(default) 1=int4-HP 2=int8-M1 -- see codex_recs_1.md §22.7-22.8 */
     Model m; double tl=now(); int cached=0;
     if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
     else { model_load(&m,&g,nt); fprintf(stderr,"requant loaded in %.1fs\n",now()-tl); }
@@ -572,12 +736,17 @@ int main(int c,char**v){
     int cur=first; double tg=now(); gT_on=1;
     for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
     double dt=now()-tg; gT_on=0;
-    printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, vendor IME-2-HP int4 W4A8, nt=%d, router=%s)\n", ngen/dt, nt, g_router_use_hp?"int4-HP(experimental)":"fp32(default)");
+    const char*router_names[]={"fp32(default)","int4-HP(experimental)","int8-M1(experimental)"};
+    printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, vendor IME-2-HP int4 W4A8, nt=%d, router=%s)\n", ngen/dt, nt, router_names[g_router_mode]);
     if(gT_tok) printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rope+qknorm %.1f | router %.1f | swiglu %.1f | rest(other) %.1f | sum %.1f | wall %.1f\n",
         gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rope/gT_tok*1e3, gT_router/gT_tok*1e3, gT_swiglu/gT_tok*1e3, gT_rest/gT_tok*1e3,
         (gT_actpack+gT_lin+gT_attn+gT_rope+gT_router+gT_swiglu+gT_rest)/gT_tok*1e3, dt/ngen*1e3);
-    if(g_router_validate) printf("  router HP-Lin-vs-fp32: %ld comparisons (layers x tokens), %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
-        g_rtr_cmp, g_rtr_mismatch, g_rtr_mismatch?(double)g_rtr_diffcount/g_rtr_mismatch:0.0, m.n_act, g_rtr_maxabs, g_rtr_maxrel);
+    if(g_router_validate){
+        printf("  router int4-HP-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
+            g_rtr_cmp, g_rtr_hp_mismatch, g_rtr_hp_mismatch?(double)g_rtr_hp_diffcount/g_rtr_hp_mismatch:0.0, m.n_act, g_rtr_hp_maxabs, g_rtr_hp_maxrel);
+        printf("  router int8-M1-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
+            g_rtr_cmp, g_rtr_i8_mismatch, g_rtr_i8_mismatch?(double)g_rtr_i8_diffcount/g_rtr_i8_mismatch:0.0, m.n_act, g_rtr_i8_maxabs, g_rtr_i8_maxrel);
+    }
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;
 }

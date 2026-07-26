@@ -1208,3 +1208,59 @@ not another short coherence check on 28 tokens.
 pattern. Given fp16's much smaller rounding error the "0/1344 mismatches" result is still plausibly
 correct, but it was never verified against this specific bug, and the code has since been replaced
 so it can't be re-checked directly.
+
+**Decision recorded**: fp32 restored as the router default; int4 HP routing kept behind
+`g_router_mode==1`, not promoted. See §22.8 for the int8 alternative that followed.
+
+### 22.8 Vendor int8 M1 router: found, validated, wired in — materially better than int4
+
+Per the review's item 4 ("try a vendor-style W8 HP router... could retain matrix-engine/pool speed
+while reducing routing error"): `gemm_kernel_i8i8_m1` (ime2_kernels.cpp:4773) is real, dispatched
+for `count_m<4` via the same pattern as the int4 kernel. Genuinely simpler, not just a wider
+version of the same trick:
+
+- Plain typed `vmadot ...,i8` — signed x signed, **no zero-point trickery at all**. int8's range is
+  wide enough to store signed values directly; int4 needed the unsigned-nibble+implicit-zp=8 hack
+  specifically because 4 bits isn't enough range otherwise.
+- Pairs with the **simple** A-format (fp32 scale + int16 asum + 32B int8 data, 38B/K32-group) that
+  §22.7's *first* (wrong) int4 attempt assumed. That format wasn't a wrong guess in the abstract —
+  it just belonged to a different kernel (`gemm_kernel_i8i8_m1`, not `gemm_kernel_i8i4_hp_m1`).
+- B-pack ground truth from `make_block_q8_0x32` (repack.cpp:357): plain row-major `memcpy` per row.
+  int8 doesn't need int4's nibble-interleave trick at all — one byte per value, no packing puzzle.
+- Structural difference from int4: the loop is **flat** over K32-groups (`k_blks = K/32`), not
+  int4's nested 256-wide-superblock-of-8-subblocks (`k_blks = K/256`). Easy to get wrong if porting
+  by pattern-matching against the int4 kernel instead of reading this kernel's own loop structure.
+
+Validated standalone before touching production (same discipline as A1-A2, `bench/
+vendor_ime_i8_probe.c` + `bench/vendor_ime_i8_full.c`): **max abs diff 0.00000, max rel diff
+0.00001 — essentially bit-exact against an independent dequant oracle, correct on the first pass**
+(no reordering bug this time — the byte layout was simple enough to get right from ground truth
+alone, unlike int4's `vfwcvt` ordering trap). Hot kernel-only timing: 791.7 ns/call vs int4's
+446.4ns/call (A3) — ~1.77x slower per call, consistent with streaming 2x the weight bytes.
+
+**Wired into production** as a third `g_router_mode` (0=fp32 default, 1=int4, 2=int8), reusing the
+existing pool dispatch infrastructure (`HpWork` generalized with a `kind` field, `lin_mm_i8`
+alongside `lin_mm_hp`) rather than duplicating it. One validate run now reports int4-vs-fp32 and
+int8-vs-fp32 independently from the same 1344 comparisons, so both tradeoffs are directly
+comparable from a single pass — no need to re-run and hope conditions matched.
+
+**Result on the real model: int8 is a materially better tradeoff than int4.**
+
+| | int4-HP | int8-M1 | fp32 |
+|---|---|---|---|
+| expert-set mismatches | 811/1344 (60.3%) | **105/1344 (7.8%)** | — reference — |
+| avg experts differ/mismatch | 1.38/8 | 1.16/8 | — |
+| max abs logit delta | 8.45 | **0.576** | — |
+| router bucket | 12.5ms (-33%) | 16.0ms (-14%) | ~18.7-21.9ms |
+| tok/s | 7.78 | 7.69 | 7.36-7.54 |
+
+int8 gives ~8x fewer perturbed routing decisions and a ~15x smaller worst-case logit delta than
+int4, for about half the speedup (14% vs 33% off the router bucket). Generation stayed coherent
+(`' Tokyo'` PASS) in every mode tested.
+
+**Still experimental, not promoted to default.** 7.8% mismatch is much closer to "quality holds"
+than int4's 60.3%, but it isn't clean zero, and the same limitation applies as it did for int4: a
+28-token single-prompt test can't fully settle whether even this level of perturbation is benign.
+Unlike int4 (where the modest speedup plus high perturbation made the call fairly easy), int8's
+tradeoff is closer and worth an explicit decision now that both are quantified on the actual model
+— not left as another open item to revisit blind.

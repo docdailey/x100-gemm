@@ -62,6 +62,26 @@ whether swapped experts typically carry low renormalized weight (→ low actual 
 before deciding. Any of these needs broader eval (longer generations, more prompts, ideally
 perplexity) to actually settle, not another short coherence check.
 
+**Decision recorded**: fp32 restored as the router default (exact, matches the original engine);
+int4 HP routing kept behind an experimental flag rather than promoted. Two real bugs fixed in the
+process (see "Toolchain gotchas" for the RVV autovec one; the argmax sentinel and timing-boundary
+bugs are documented in codex_recs_1.md §22.7) — both general lessons for this file, not one-offs.
+
+**Vendor int8 M1 router — a materially better tradeoff than int4 (2026-07-26).** Found and
+validated `gemm_kernel_i8i8_m1` (same M1-dispatch pattern as int4, but genuinely simpler: plain
+signed `vmadot`, no zero-point trickery, pairs with the *simple* A-format the first wrong int4
+attempt assumed — that format wasn't wrong, it belonged to a different kernel). Standalone
+validation: max abs diff 0.00000, max rel diff 0.00001 — essentially bit-exact, correct on the
+first try. Wired into production as `g_router_mode=2` (0=fp32 default, 1=int4, 2=int8), reusing
+the existing pool infrastructure (generalized with a `kind` field rather than duplicated).
+**On the real model: 105/1344 (7.8%) expert-set mismatches vs fp32** (int4: 811/1344, 60.3%) —
+**~8x fewer perturbed routing decisions, 15x smaller worst-case logit delta** (0.576 vs 8.45).
+Speed: router bucket 16.0ms (int4: 12.5ms, fp32: ~18.7-21.9ms) — smaller speedup than int4 (~14%
+vs ~33%) but real; 7.69 tok/s (int4: 7.78, fp32: 7.36-7.54). **Still experimental, not promoted to
+default** — 7.8% is much closer to "quality holds" than int4's 60.3% but isn't clean zero, and a
+28-token single-prompt test still can't fully settle whether it's truly benign. Worth a real
+decision now that both tradeoffs are quantified on the actual model.
+
 Full narrative below (kept for the reasoning trail — what was tried, what turned out wrong, why).
 
 ## Path A — vendor kernel port (2026-07-26, IN FLIGHT)
