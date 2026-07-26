@@ -110,7 +110,24 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
 - `bench/{decode_layer,moe_decode,q4_gemv,gguf_dump}.c` — throughput harnesses (synthetic ceilings, NOT real tok/s).
 - `codex_recs_1.md` §20-22 = appended findings (§22 = the vendor-kernel integration, this session). `research_feed_paths.md` = feeding research + §12 results log (review before next branch).
 
-## Board state (root@192.168.68.88, static; A100 harts 8-15 VLEN=1024, X100 harts 0-7 VLEN=256)
+## Board state (root@192.168.68.88 *usually* -- see IP note below; A100 harts 8-15 VLEN=1024, X100 harts 0-7 VLEN=256)
+- **IP is not reliably static anymore (2026-07-26).** After hours of sustained heavy compute (full
+  30B model loads, repeated multi-threaded kernel benchmarking at max core utilization), the board
+  went fully unreachable — not just SSH refusing, but no response on IPv4 ARP/ICMP *or* IPv6 NDP/
+  link-local from any interface on this Mac. Power-cycling brought it back on **Wi-Fi at
+  192.168.68.92** (its usual static-IP port was occupied when it rejoined, per the person
+  physically at the board) rather than .88. **Check both .88 and .92** (or `arp -a` /
+  `nmap -sn 192.168.68.0/24`) if SSH to .88 fails before assuming the board is down.
+- **Thermal: fan was governor-controlled and NOT running at full speed under sustained load, likely
+  contributing to the crash above.** `thermal_zone3` (type `thermal_cluster0`) is the ONLY zone
+  bound to `cooling_device1` (pwm-fan, all 8 of its trip points) — it has no cpufreq/GPU role, so
+  its `step_wise` governor exists purely to modulate fan speed. **Fixed 2026-07-26**: disabled that
+  zone's governor (`echo disabled > .../thermal_zone3/mode`) and pinned the fan to max
+  (`cooling_device1/cur_state=8`, `hwmon8/pwm1=255`, confirmed 6666 RPM vs the ~3724 RPM baseline)
+  — this does NOT affect CPU/GPU overheat throttling, which lives in the other 6 zones and is
+  untouched. Made persistent via `/etc/systemd/system/fan-max.service` (oneshot, `enabled`,
+  survives reboot) running `/usr/local/bin/fan-max.sh`. Verify after any reboot:
+  `systemctl status fan-max.service; cat /sys/class/hwmon/hwmon7/fan1_input` (expect ~6000+ RPM).
 - Model: `/root/models/Qwen3-30B-A3B-Q4_0.gguf` (17GB, unsloth base — NOT the Coder variant on NAS).
 - **Current (qwen_moe_hp.c)**: binary `/root/qwen_moe_hp`. Build: `gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread`.
   Run: `LD_LIBRARY_PATH=/usr/lib ./qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf <ngen> <nt> [cachepath]`.
