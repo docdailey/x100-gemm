@@ -1928,3 +1928,68 @@ repeated runs: `' Tokyo'` PASS, identical generation, swiglu bucket 14.0ms→0.4
 everything already landed.
 
 **Session cumulative, from the original 1.49 tok/s pure-scalar baseline: ~7.7x.**
+
+### 22.19 RETRACTED: hard-swish promotion was premature — default restored to exact SiLU
+
+Per external review, immediately after §22.18 landed. The promotion decision was wrong to make on
+the evidence available, for reasons that were all present in §22.18's own numbers but under-weighted
+in how they were framed:
+
+1. **The NLL delta is a ~10.2% perplexity multiplier, not a small number.** `exp(0.0969) ≈ 1.102`.
+   §22.18 reported "+0.0969 nats/token, PASS (<0.3)" — technically true against the predeclared
+   threshold, but reporting the raw nats figure obscured what it actually means: hard-swish makes
+   the model about **10% more perplexed**, on average, about the tokens fp32-exact-SwiGLU would
+   have generated. That is not a rounding-noise-scale effect.
+2. **192 total generated tokens is a thin sample for a decision this consequential.** The router
+   promotion's 25,392 router-comparisons (§22.15) is two orders of magnitude more evidence than
+   192 teacher-forced token positions — and the router change is architecturally narrower (affects
+   *which* experts are chosen) than SwiGLU (affects *every* expert's output at *every* layer).
+3. **Hard-swish is not a numerically-close approximation of SiLU — it is a different activation
+   function.** Every other "fast" technique in this file (RVV-vectorized dot products, activation
+   packing, the int4/int8 router kernels) is either exact or a bounded-error quantization of the
+   *same* underlying function. Hard-swish is qualitatively different: MobileNetV3 was **trained
+   from scratch with hard-swish**, so its weights co-adapted to hard-swish's piecewise-linear
+   shape. Qwen3-30B-A3B was trained with exact SiLU and has never seen hard-swish's shape during
+   training. Applying it post-hoc is a real distribution shift on an unadapted model, not a "fast
+   math trick" — a fundamentally different risk category than everything else promoted this
+   session, and it should have been evaluated (and gated) as such from the start.
+
+**Immediate action taken: `g_swiglu_fast` default reverted 1→0 (exact SiLU).** `g_swiglu_fast=1`
+(hard-swish) remains available as an explicit experimental flag, not removed — the RVV
+implementation is still validated-correct (§22.18's `bench/swiglu_hswish_probe.c` result stands,
+0/38.4M mismatches against the scalar hard-swish formula; that finding is about vectorization
+correctness and is unaffected by this retraction), only the *promotion* is retracted.
+
+**Documentation corrections** (§22.18's phrasing, not its numbers, which stand as measured):
+- "96.2% faster" is ambiguous — the swiglu bucket dropped 14.00ms→0.53ms, a **96.2% time
+  reduction**, equivalently **~26.4x faster** (14.00/0.53). Both phrasings are now used together
+  going forward to avoid the ambiguity.
+- "swiglu bucket ≥15% faster than exact" was correctly implemented in the harness's own printf
+  (`>=15%%`), but PROGRESS.md's prose write-up mistakenly said "(<15% required)" — corrected to
+  "(≥15% required)".
+- "within ~2% of 11.71-12.89 tok/s" compared only against the vendor binary's *low* endpoint
+  (11.49/11.71 ≈ 98.1%). Against the *high* endpoint it's 11.49/12.89 ≈ 89.1% — **about 11% below**.
+  Both endpoints should be stated, not the favorable one alone. (This entire comparison is now
+  moot pending re-promotion in any case, since the default no longer includes hard-swish.)
+
+**Remediation plan, in order, before any re-promotion is considered:**
+1. ~~Restore exact SiLU as default, keep hard-swish behind its flag~~ — **done, this section**.
+2. **Expand evaluation to several thousand tokens**, spanning perplexity-style evaluation on real
+   (not model-generated) text, code, multilingual, reasoning, *and* free-running generations (not
+   only teacher-forced against a reference) — teacher-forcing on the reference model's own
+   continuation cannot reveal whether hard-swish's errors compound differently over a longer,
+   uncorrected horizon. Not yet done.
+3. **Compare the full combined production stack** (int8 router + exact SwiGLU vs int8 router +
+   hard-swish) **against the original fp32-router + exact-SiLU baseline**, not only pairwise
+   against the immediately-prior config — §22.18 only measured hard-swish's *marginal* effect on
+   top of int8 routing, never the *cumulative* deviation from the fully-exact original engine that
+   a real deployment decision should be judged against. Not yet done.
+4. **Try a closer polynomial/rational sigmoid approximation** — something that approximates the
+   *actual* sigmoid function within its normal operating range (unlike hard-swish, which is a
+   different function by construction) — it may retain most of the ~13.5ms bucket gain with
+   materially lower NLL drift, precisely because Qwen3's weights were trained against real SiLU's
+   shape, not hard-swish's. Not yet done.
+5. **Promote only after the larger evaluation**, with reconsidered thresholds — the retraction
+   above suggests the original 0.3 nats/token bound (a 35% perplexity-inflation ceiling) was too
+   loose; any next threshold should likely be stated directly in perplexity-multiplier terms rather
+   than raw nats, so the number's real meaning doesn't require converting to notice a large effect.

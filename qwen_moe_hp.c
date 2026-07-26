@@ -1074,7 +1074,7 @@ int main(int c,char**v){
     const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.hp.imecache";
     g_router_validate=(c>5)?atoi(v[5]):0; /* router HP-Lin/int8-vs-fp32 expert-selection validation, off by default (extra compute) */
     g_router_mode=(c>6)?atoi(v[6]):2; /* 0=fp32(exact, revert flag) 1=int4-HP(rejected, see §22.7) 2=int8-M1(DEFAULT since 2026-07-26 -- passed the multi-prompt quality harness, codex_recs_1.md §22.15: 6.1% router mismatch, -0.0034 nats/tok NLL delta, 2.1% token divergence, 13.7% faster, all four pre-registered thresholds PASS) */
-    g_swiglu_fast=(c>7)?atoi(v[7]):1; /* 0=exact(revert flag) 1=hard-swish(DEFAULT since 2026-07-26 -- passed the multi-prompt harness, codex_recs_1.md §22.18: +0.0969 nats/tok NLL delta, 5.7% token divergence, 96.2% faster, all three pre-registered thresholds PASS) */
+    g_swiglu_fast=(c>7)?atoi(v[7]):0; /* 0=exact(DEFAULT, restored 2026-07-26 -- see codex_recs_1.md §22.19: promotion on the 192-token §22.18 result was premature) 1=hard-swish(EXPERIMENTAL -- +0.0969 nats/tok NLL delta ~= exp(0.0969)=10.2% perplexity inflation, 5.7% token divergence, ~26x swiglu-bucket speedup on a 192-token eval; MobileNetV3 was TRAINED with hard-swish, Qwen3 was not, so this is a replacement activation on an unadapted model, not a numerically-close approximation -- needs the larger evaluation in §22.19 before any promotion is reconsidered) */
     Model m; double tl=now(); int cached=0;
     if(cache_load(&m,cpath,nt)){ cached=1; fprintf(stderr,"loaded from cache in %.1fs  (%s)\n",now()-tl,cpath); }
     else { model_load(&m,&g,nt); fprintf(stderr,"requant loaded in %.1fs\n",now()-tl); }

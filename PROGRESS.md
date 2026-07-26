@@ -2,15 +2,17 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 11.49-11.5 tok/s
+## HEADLINE: qwen_moe_hp.c is the current best engine — 9.5-9.9 tok/s (default config)
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
-untouched) for comparison. `qwen_moe_hp.c` is now **~7.7x faster**, same correctness bar
-(`' Tokyo'` PASS, coherent generation) — within ~2% of the real vendor *binary*'s 11.71-12.89
-tok/s, the closest this session has gotten. **Build now REQUIRES `-fno-tree-vectorize`** (see the
-toolchain-hardening entry below and the file's own header comment) — this is not optional, it's a
-correctness/performance fix, not a tuning knob.
+untouched) for comparison. `qwen_moe_hp.c` is now **~6.4-6.6x faster** at its actual default
+config (int8-M1 router + exact SiLU), same correctness bar (`' Tokyo'` PASS, coherent generation).
+An experimental flag (`g_swiglu_fast=1`, hard-swish) reaches 11.49-11.5 tok/s (~7.7x) but was
+**promoted then retracted** the same day — see the dated entry below and
+`codex_recs_1.md` §22.19 before citing the higher number as current. **Build now REQUIRES
+`-fno-tree-vectorize`** (see the toolchain-hardening entry below and the file's own header
+comment) — this is not optional, it's a correctness/performance fix, not a tuning knob.
 
 **Quick start**: `ssh root@192.168.68.24` (static IP on wired Ethernet, confirmed persistent across
 reboots via NetworkManager — see Board State below); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
@@ -58,26 +60,40 @@ dropping proportionally further — consistent with, not contradicting, §22.16'
 gates predeclared before implementation, per explicit instruction not started until this
 confirmation landed.
 
-**Fast-SwiGLU promoted to default (2026-07-26): swiglu bucket 14.0ms→0.4-0.6ms, decode
-9.5-9.9→11.49-11.5 tok/s — the largest single per-token win this session.** Implemented
-hard-swish (Howard et al. 2019, MobileNetV3 — `x*clamp((x+3)/6,0,1)`, zero transcendentals, pure
-RVV vector ops) as `g_swiglu_fast`, gates predeclared before writing any code: avg NLL delta <0.3
-nats/tok (stricter than the router's 0.5 — SwiGLU runs on every expert at every layer, not once
-per layer like routing), token divergence <15%, swiglu bucket ≥15% faster. Validated the RVV
-implementation against a scalar reference of the *same* hard-swish formula first (0/38.4M element
-mismatches, `bench/swiglu_hswish_probe.c`) — this checks vectorization correctness, not
-approximation quality, since unlike every other RVV port in this file there's no bit-exact oracle
-for a deliberate approximation. Extended the harness with a new phase, reference held at *today's*
-production default (int8 router + exact SwiGLU) rather than the original fp32 ground truth, since
-the question is whether adding this on top of what already ships causes a problem. **Result: NLL
-delta +0.0969 (<0.3), divergence 5.7% (<15%), speed 96.2% faster (<15% required) — all three PASS**,
-though both quality numbers are meaningfully higher than the router's (expected — a real
-approximation of a nonlinearity, not a numerically-close weight quantization; the stricter
-thresholds were set anticipating this and it cleared them with real but smaller margin than the
-router did). **Promoted** (`g_swiglu_fast` default 0→1) per the standing instruction ("keep both
-[router and SwiGLU] behind flags until they pass the harness"); `g_swiglu_fast=0` remains an
-explicit exact-SiLU revert flag. See `codex_recs_1.md` §22.18 for the full writeup. **Session
-cumulative from the original 1.49 tok/s baseline: ~7.7x.**
+**Fast-SwiGLU implemented, briefly promoted, then RETRACTED same day (2026-07-26) — default is
+exact SiLU.** Implemented hard-swish (Howard et al. 2019, MobileNetV3 —
+`x*clamp((x+3)/6,0,1)`, zero transcendentals, pure RVV vector ops) as `g_swiglu_fast`, gates
+predeclared before writing any code: avg NLL delta <0.3 nats/tok, token divergence <15%, swiglu
+bucket ≥15% faster (all stricter than the router's bar). Validated the RVV implementation against
+a scalar reference of the *same* hard-swish formula first (0/38.4M element mismatches,
+`bench/swiglu_hswish_probe.c`) — checks vectorization correctness only, not approximation quality
+(no bit-exact oracle exists for a deliberate approximation). Extended the harness with a new
+phase, reference held at production default (int8 router + exact SwiGLU). **Result: NLL delta
++0.0969 nats/tok (<0.3 threshold), divergence 5.7% (<15%), swiglu bucket 96.2% time reduction /
+~26.4x faster (≥15% required) — all three PASS.** Promoted (`g_swiglu_fast` default 0→1) per the
+standing "keep behind flags until they pass the harness" instruction — decode reached
+**11.49-11.5 tok/s**.
+
+**RETRACTED, same day, per external review — see `codex_recs_1.md` §22.19 for the full
+reasoning.** The promotion was premature: (1) `exp(0.0969) ≈ 1.102` — the NLL delta means hard-swish
+makes the model **~10.2% more perplexed**, not a small effect once translated out of raw nats; (2)
+192 total generated tokens is a thin sample for a change this consequential — two orders of
+magnitude less evidence than the router's 25,392 comparisons; (3) **hard-swish is not a close
+numerical approximation of SiLU, it's a different activation function** — MobileNetV3 was
+*trained* with hard-swish (weights co-adapted to its shape); Qwen3 was trained with exact SiLU and
+has never seen hard-swish's shape, so this is a real distribution shift on an unadapted model, a
+different risk category than every other (exact-or-bounded-quantization) technique promoted this
+session. **`g_swiglu_fast` default reverted 1→0.** `g_swiglu_fast=1` remains available as an
+explicit experimental flag — the RVV implementation's correctness is unaffected by this
+retraction, only the promotion is. Remediation plan before any re-promotion (§22.19): expand
+evaluation to several thousand tokens including real-text perplexity and free-running (not only
+teacher-forced) generation; compare the full combined stack against the original fp32-router +
+exact-SiLU baseline, not only pairwise against the immediately-prior config; try a genuine
+polynomial/rational sigmoid approximation instead of a different function; re-threshold in
+perplexity-multiplier terms, not raw nats. None of this started yet.
+
+**Session cumulative from the original 1.49 tok/s baseline, at the actual current default: ~6.4-6.6x**
+(hard-swish's ~7.7x is not currently in effect).
 
 **Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
 Per the standing review item ("otherwise move to activation packing or attention"), reused the
