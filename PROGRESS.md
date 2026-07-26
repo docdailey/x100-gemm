@@ -33,6 +33,23 @@ not dispatch overhead. The persistent pool itself is a real, modest, keep-it win
 "beats the vendor binary" projection is retracted. Full detail in `research_feed_paths.md` §12,
 "A5 (real)" and "PR8 + bucket fix" rows.
 
+**Fine-grained buckets + two safe fixes (2026-07-26): 6.56→7.54 tok/s.** Split `rest` further
+into `rope+qknorm`/`router`/`swiglu`/`rest(other)` — `rest(other)` collapsed to 2.1ms, confirming
+the split is essentially complete now (measure before optimizing, not guess). Two fixes, both
+exact/zero-approximation-risk: RoPE cos/sin table was recomputed via `powf`+`sinf`+`cosf` per
+head per layer (up to 1728x/token) despite depending only on `(hd,pos,base)` — cached once per
+`forward()` call (13.2→2.0ms, 6.6x). Router matvec (128 experts x d=2048) vectorized with RVV
+`vfmacc`+`vfredusum` (29.4→18.7ms, only 1.6x — looks memory-bandwidth-bound, not compute-bound,
+so vectorizing the multiply alone doesn't fix the ~1MB/layer DRAM-streaming cost). Correctness
+held throughout (`' Tokyo'` PASS, identical continued generation). **Cumulative from the session's
+original 1.49 tok/s baseline: 5.06x.** Fresh ranking: linear(kernel) 58.5ms (44% of wall) >
+router≈attention 18.7ms each > act-pack 17.3ms > swiglu 14.2ms (untouched) > rope 2.0ms >
+rest(other) 2.2ms. SwiGLU is the next-biggest untouched item, but unlike the two fixes above,
+speeding it up means either vectorizing `expf` (no native RVV transcendental — would need a
+polynomial approximation) or approximating the sigmoid outright, both of which carry real
+numerical/quality risk that caching and exact-vectorization didn't — needs more validation than
+the single-prompt coherence check used so far before touching it.
+
 ## Headline status
 - **Qwen3-30B-A3B MoE runs COHERENT on the K3 IME-2**, pure C: prompt → ' Tokyo' PASS;
   "…Tokyo. The capital of Brazil is Brasília. The capital of Canada is Ottawa." **1.36 tok/s M=1 (nt=4)**.

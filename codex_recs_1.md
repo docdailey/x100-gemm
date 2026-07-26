@@ -1059,3 +1059,36 @@ the obvious first guess — 262144 unvectorized mults/layer is the single larges
 but per §19/working-rule, that's a measurement to take, not an assumption to build on), and
 speeding up the new format's slow requant (~18.4 min). Stopping here per the same working rule as
 §21.4 — this is the next branch decision, not an auto-advance.
+
+### 22.4 Splitting `rest` for real, then two safe fixes (2026-07-26)
+
+Followed §22.3's "not yet done" directly: split `rest` into `rope+qknorm`/`router`/`swiglu`/
+`rest(other)`. `rest(other)` came out to 2.1ms — confirms the split is essentially complete, not
+another undercount waiting to bite. Two fixes, both exact (no lossy approximation, unlike a
+SwiGLU/sigmoid approximation would be):
+
+1. **RoPE table caching.** `rope()` recomputed `powf`+`sinf`+`cosf` per head per layer — up to
+   1728x/token (nh+nkv heads x 48 layers) — despite the cos/sin values depending only on
+   `(hd,pos,rope_base)`, identical across every head and every layer for a given token. Split into
+   `rope_table()` (build once per `forward()` call) and `rope_apply()` (per-head rotation only).
+   **13.2→2.0ms (6.6x).**
+2. **Router matvec vectorization.** 128 experts x d=2048 (~1MB/layer), previously plain scalar
+   `for(i)s+=rw[i]*hn[i]`. RVV `vfmacc_vv_f32m1` accumulate + `vfredusum` reduction (`vdot_f32`),
+   vector-length-agnostic. **29.4→18.7ms — only 1.6x**, well short of the ~8-32x a VLEN=1024 A100
+   hart's lane count would suggest for compute-bound work. Reads as memory-bandwidth-bound: the
+   router matrix is ~1MB/layer streamed fresh from DRAM with poor cache locality, so vectorizing
+   the multiply-add doesn't touch the actual bottleneck (the load, not the FMA).
+
+Net: **wall 154.4→132.6ms, 6.56→7.54 tok/s.** Correctness held — `' Tokyo'` PASS, identical
+continued generation (Brasília, Ottawa) — confirming `vfredusum`'s unordered-reduction rounding
+differences didn't flip any expert-selection tie. **Cumulative from the original 1.49 tok/s P0
+baseline: 5.06x.**
+
+Fresh bucket ranking: `linear(kernel)` 58.5ms (44% of wall, still the single biggest item) >
+`router`≈`attention` 18.7ms each > `act-pack` 17.3ms > `swiglu` 14.2ms (untouched) > `rope` 2.0ms
+> `rest(other)` 2.2ms. SwiGLU is next-biggest untouched, but it's a qualitatively different kind
+of fix than the two above: there's no native RVV transcendental for `expf`, so a real speedup
+means either a polynomial sigmoid approximation or a lookup table — both carry numerical/quality
+risk that caching and exact vectorization didn't. The single-prompt `' Tokyo'`-coherence check
+used throughout this session is not enough validation for that; needs a broader
+quality/perplexity-style check before shipping, not just "still generates something plausible."

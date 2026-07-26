@@ -32,6 +32,7 @@
 #include <omp.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <riscv_vector.h>
 
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static int bind_ai(void){ int fd=open("/proc/set_ai_thread",O_WRONLY); if(fd<0)return -1; int r=write(fd,"0",1); close(fd); return r<0?-1:0; }
@@ -200,7 +201,7 @@ static Lin lin_new_hp(const float*wf32,int N,int K){
 static void pack_act_hp(const float*x,int K,uint8_t*Abuf){
     int Sb=K/256; for(int sb=0;sb<Sb;sb++) pack_A_hp(x+sb*256, Abuf+(size_t)sb*AREC);
 }
-static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0; static long gT_tok=0; static int gT_on=0;
+static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0, gT_rope=0, gT_router=0, gT_swiglu=0; static long gT_tok=0; static int gT_on=0;
 
 /* PR8 (codex_recs_1.md §17/§22.3): with the vendor kernel at ~446ns/call, the ~1392 fresh
  * #pragma omp parallel spawns/token that lin_mm_hp used to do dominated wall-clock (100.3ms,
@@ -326,8 +327,28 @@ typedef struct { float*attn_norm,*ffn_norm,*q_norm,*k_norm,*router; Lin q,k,v,o;
 typedef struct { int d,nl,nh,nkv,hd,vocab,nt,n_exp,n_act,moe; float rope_base,eps; float*tok_embd,*out_norm; Layer*L; Lin lm; } Model;
 
 static void rmsnorm(float*o,const float*x,const float*w,int n,float eps){ float s=0; for(int i=0;i<n;i++)s+=x[i]*x[i]; s=1.0f/sqrtf(s/n+eps); for(int i=0;i<n;i++)o[i]=x[i]*s*w[i]; }
-static void rope(float*v,int hd,int pos,float base){ for(int i=0;i<hd/2;i++){ float fr=powf(base,-2.0f*i/hd),a=pos*fr,c=cosf(a),s=sinf(a),x=v[i],y=v[i+hd/2]; v[i]=x*c-y*s; v[i+hd/2]=x*s+y*c; } }
+/* RoPE cos/sin depend only on (hd,pos,base) -- identical across every head AND every layer for a
+ * given token (48 layers x up to 36 heads = up to 1728 redundant powf/sinf/cosf table builds per
+ * token, all producing the same numbers). Build once per forward() call, apply per head. */
+static void rope_table(float*cosb,float*sinb,int hd,int pos,float base){
+    for(int i=0;i<hd/2;i++){ float fr=powf(base,-2.0f*i/hd),a=pos*fr; cosb[i]=cosf(a); sinb[i]=sinf(a); }
+}
+static void rope_apply(float*v,int hd,const float*cosb,const float*sinb){
+    for(int i=0;i<hd/2;i++){ float c=cosb[i],s=sinb[i],x=v[i],y=v[i+hd/2]; v[i]=x*c-y*s; v[i+hd/2]=x*s+y*c; }
+}
 static void softmax(float*x,int n){ float m=-1e30f; for(int i=0;i<n;i++)if(x[i]>m)m=x[i]; float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} float inv=1.0f/s; for(int i=0;i<n;i++)x[i]*=inv; }
+/* router matvec was the 2nd-biggest scalar bucket (29.4ms, measured): 128 experts x d=2048
+ * unvectorized mults/layer, ~1MB/layer, cache-miss-heavy. RVV fp32 dot, vector-length-agnostic. */
+static float vdot_f32(const float*a,const float*b,int n){
+    vfloat32m1_t vacc=__riscv_vfmv_v_f_f32m1(0.0f,__riscv_vsetvlmax_e32m1());
+    int i=0;
+    while(i<n){ size_t vl=__riscv_vsetvl_e32m1(n-i);
+        vfloat32m1_t va=__riscv_vle32_v_f32m1(a+i,vl), vb=__riscv_vle32_v_f32m1(b+i,vl);
+        vacc=__riscv_vfmacc_vv_f32m1(vacc,va,vb,vl); i+=vl; }
+    vfloat32m1_t vzero=__riscv_vfmv_v_f_f32m1(0.0f,__riscv_vsetvlmax_e32m1());
+    vfloat32m1_t vsum=__riscv_vfredusum_vs_f32m1_f32m1(vacc,vzero,__riscv_vsetvlmax_e32m1());
+    return __riscv_vfmv_f_s_f32m1_f32(vsum);
+}
 
 static void model_load(Model*m,Gguf*g,int nt){
     m->d=g->embd; m->nl=g->block_count; m->nh=g->nh; m->nkv=g->nkv; m->hd=g->hd; m->vocab=g->vocab;
@@ -413,15 +434,19 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
                     float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*g,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2){
     int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,qd=nh*hd,kvd=nkv*hd,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
     static float*h=NULL; if(!h)h=malloc(d*4); memcpy(h,m->tok_embd+(size_t)tok*d,d*4);
-    double _f0=gT_on?now():0, _a0=gT_actpack,_l0=gT_lin,_at0=gT_attn;
+    double _f0=gT_on?now():0, _a0=gT_actpack,_l0=gT_lin,_at0=gT_attn,_r0=gT_rope,_ro0=gT_router,_sw0=gT_swiglu;
+    { double _tr0=gT_on?now():0; float cosb[256],sinb[256]; rope_table(cosb,sinb,hd,pos,m->rope_base);
+    if(gT_on) gT_rope += now()-_tr0;
     for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
         rmsnorm(hn,h,ly->attn_norm,d,m->eps);
         { double _ta=gT_on?now():0; pack_act_hp(hn,d,Abuf2);
           double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
           lin_mm_hp(&ly->q,Abuf2,q,nt); lin_mm_hp(&ly->k,Abuf2,k,nt); lin_mm_hp(&ly->v,Abuf2,vv,nt);
           if(gT_on) gT_lin+=now()-_tb; }
-        for(int hh=0;hh<nh;hh++){ rmsnorm(q+hh*hd,q+hh*hd,ly->q_norm,hd,m->eps); rope(q+hh*hd,hd,pos,m->rope_base); }
-        for(int hh=0;hh<nkv;hh++){ rmsnorm(k+hh*hd,k+hh*hd,ly->k_norm,hd,m->eps); rope(k+hh*hd,hd,pos,m->rope_base); }
+        { double _tr=gT_on?now():0;
+          for(int hh=0;hh<nh;hh++){ rmsnorm(q+hh*hd,q+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q+hh*hd,hd,cosb,sinb); }
+          for(int hh=0;hh<nkv;hh++){ rmsnorm(k+hh*hd,k+hh*hd,ly->k_norm,hd,m->eps); rope_apply(k+hh*hd,hd,cosb,sinb); }
+          if(gT_on) gT_rope += now()-_tr; }
         float*Kc=kv->Kc+(size_t)l*kv->ctx*kvd,*Vc=kv->Vc+(size_t)l*kv->ctx*kvd;
         memcpy(Kc+(size_t)pos*kvd,k,kvd*4); memcpy(Vc+(size_t)pos*kvd,vv,kvd*4);
         float scale=1.0f/sqrtf(hd); double _at=gT_on?now():0;
@@ -432,11 +457,13 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         if(gT_on) gT_attn += now()-_at;
         lin_mm(&ly->o,att,tmp,nt,Abuf); for(int i=0;i<d;i++)h[i]+=tmp[i];
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
-        float rl[256]; for(int e=0;e<ne;e++){ float*rw=ly->router+(size_t)e*d,s=0; for(int i=0;i<d;i++)s+=rw[i]*hn[i]; rl[e]=s; }
+        double _tr2=gT_on?now():0;
+        float rl[256]; for(int e=0;e<ne;e++){ rl[e]=vdot_f32(ly->router+(size_t)e*d,hn,d); }
         softmax(rl,ne);
         int sel[32]; float sw[32];
         for(int a=0;a<na;a++){ int bi=-1; float bv=-1; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[a]=bi; sw[a]=bv; }
         float ssum=0; for(int a=0;a<na;a++)ssum+=sw[a]; for(int a=0;a<na;a++)sw[a]/=ssum;
+        if(gT_on) gT_router += now()-_tr2;
         for(int i=0;i<d;i++)eout[i]=0;
         { double _ta=gT_on?now():0; pack_act_hp(hn,d,Abuf2);
           if(gT_on) gT_actpack+=now()-_ta;
@@ -444,12 +471,14 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
               double _tb=gT_on?now():0;
               lin_mm_hp(&ly->eg[e],Abuf2,g,nt); lin_mm_hp(&ly->eu[e],Abuf2,u,nt);
               if(gT_on) gT_lin+=now()-_tb;
+              double _ts=gT_on?now():0;
               for(int i=0;i<moe;i++){ float x=g[i]; g[i]=(x/(1.0f+expf(-x)))*u[i]; }
+              if(gT_on) gT_swiglu+=now()-_ts;
               lin_mm(&ly->ed[e],g,tmp,nt,Abuf); for(int i=0;i<d;i++)eout[i]+=w*tmp[i]; } }
         for(int i=0;i<d;i++)h[i]+=eout[i];
-    }
+    } }
     rmsnorm(hn,h,m->out_norm,d,m->eps); lin_mm(&m->lm,hn,logits,nt,Abuf);
-    if(gT_on){ double ft=now()-_f0; gT_rest += ft-(gT_actpack-_a0)-(gT_lin-_l0)-(gT_attn-_at0); gT_tok++; }
+    if(gT_on){ double ft=now()-_f0; gT_rest += ft-(gT_actpack-_a0)-(gT_lin-_l0)-(gT_attn-_at0)-(gT_rope-_r0)-(gT_router-_ro0)-(gT_swiglu-_sw0); gT_tok++; }
 }
 static int argmax(const float*l,int n){ int b=0; float bv=l[0]; for(int i=1;i<n;i++)if(l[i]>bv){bv=l[i];b=i;} return b; }
 
@@ -493,9 +522,9 @@ int main(int c,char**v){
     for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
     double dt=now()-tg; gT_on=0;
     printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, vendor IME-2-HP int4 W4A8, nt=%d)\n", ngen/dt, nt);
-    if(gT_tok) printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rest %.1f | sum %.1f | wall %.1f\n",
-        gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rest/gT_tok*1e3,
-        (gT_actpack+gT_lin+gT_attn+gT_rest)/gT_tok*1e3, dt/ngen*1e3);
+    if(gT_tok) printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rope+qknorm %.1f | router %.1f | swiglu %.1f | rest(other) %.1f | sum %.1f | wall %.1f\n",
+        gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rope/gT_tok*1e3, gT_router/gT_tok*1e3, gT_swiglu/gT_tok*1e3, gT_rest/gT_tok*1e3,
+        (gT_actpack+gT_lin+gT_attn+gT_rope+gT_router+gT_swiglu+gT_rest)/gT_tok*1e3, dt/ngen*1e3);
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;
 }
