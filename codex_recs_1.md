@@ -1596,3 +1596,62 @@ would also be simpler code. **Not yet applied to production, and not yet A/B tes
 real engine** — this is a recommendation pending that test, not a landed result. If a real
 production run confirms the gain (expect `lm_head`'s 5.7ms bucket dropping toward ~5.1ms, and no
 regression elsewhere), blocked assignment should become the default.
+
+### 22.14 The production A/B: blocked scheduling REGRESSED — reverted, not adopted
+
+Ran the one remaining bounded experiment from §22.13: changed `lin_mm_hp_worker_run`'s panel
+assignment from cyclic (`np=tn; np<Np; np+=nt`) to blocked (`lo=Np*tn/nt, hi=Np*(tn+1)/nt`), for
+both the int4-HP and int8-M1 kernel paths (a pure scheduling change — panels are independent, each
+writing a disjoint `y[np*32..]` slice, so which thread computes which panel cannot change the
+numeric result; no oracle validation needed, only the token-identity check below).
+
+**Method**: built two binaries from the exact same source tree, one at the current committed
+(cyclic) state, one with only the panel-assignment change, both `LD_LIBRARY_PATH=/usr/lib
+./qwen_moe_hp{_cyclic,_blocked} /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4
+/root/models/qwen3-30b-a3b.hp.imecache 0 0` — same prompt, same cache, fp32 router (default), same
+generation length, nt=4, run back to back on the board, twice each.
+
+**Tokens identical in every run**: `' Tokyo'` PASS, generation matches exactly
+(`...Tokyo. ...Brasília. ...Ottawa.`) in all four runs — the scheduling change is exactly as
+correctness-neutral as expected.
+
+**Throughput: the OPPOSITE of §22.13's isolated-probe prediction, and reproducible across both
+runs:**
+
+| Bucket (ms/tok) | cyclic run 1 | blocked run 1 | cyclic run 2 | blocked run 2 |
+|---|---|---|---|---|
+| qkv | 9.4 | **10.2** | 9.4 | **10.2** |
+| o | 7.6 | **8.5** | 7.6 | **8.5** |
+| expert (gate/up/down) | 36.0 | 35.1 | 35.9 | 34.7 |
+| **lm_head** | **5.7** | **6.0** | **5.7** | **6.0** |
+| linear(kernel) sum | 58.8 | 59.8 | 58.5 | 59.4 |
+
+`qkv`, `o`, and — most notably — `lm_head` all get consistently *worse* with blocked scheduling
+(identical shift both runs, well outside this session's observed noise band for these buckets),
+not better. Only `expert` improved slightly. Net `linear(kernel)` is worse with blocked in both
+runs (+1.0 to +1.7%).
+
+**§22.13's pre-registered keep-criterion was explicit: "keep only if `lm_head` falls toward ~5.1ms
+with no regression elsewhere."** This result fails on both counts — `lm_head` rose, and `qkv`/`o`
+regressed. **Reverted immediately, per the pre-committed criterion, not kept.** `qwen_moe_hp.c` is
+back to the exact committed (cyclic) state; no production code changes from this experiment.
+
+**Why the isolated probe's prediction failed to generalize is not diagnosed, and — per the standing
+decision to stop this investigation (§22.13) — is not being chased further.** One observation worth
+recording without further testing: `shared_buffer_scheduling_probe.c` found NO cyclic-vs-blocked
+difference for `qkv`/`o`-sized Lins (Np≤128) in isolation, yet the real engine shows a real,
+reproducible regression for exactly those Lins under blocked scheduling — meaning the isolated
+probe's *conclusion for the small Lins* also didn't transfer cleanly to production, not just its
+`lm_head` prediction. This is itself informative: it says the remaining ~10% gap (§22.13) and this
+scheduling experiment's reversed result both point at something about the *real* engine (full
+model, real interleaving with pack/RoPE/router/SwiGLU, the actual all-1344-buffers-at-once
+allocation pattern) that none of the five isolated probes fully captured, rather than validating
+either probe's specific mechanism story. The lesson generalizes past this one experiment: an
+isolated synthetic probe that rules a factor in or out is real evidence, but a production A/B is
+still required before adopting anything derived from it — exactly the discipline that caught this
+one before it shipped.
+
+**Closed.** No further scheduling work on `linear(kernel)` planned. Per external review, the next
+high-value branch is a real multi-prompt quality harness — it unlocks safely evaluating SwiGLU
+approximation and promoting the int8 router (§22.8) past "experimental," neither of which the
+current single-prompt `' Tokyo'`-coherence check can responsibly settle.

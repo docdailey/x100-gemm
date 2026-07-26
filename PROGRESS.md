@@ -145,11 +145,27 @@ millisecond per token, not the whole 26→30 GB/s gap. Remaining untested candid
 all-1344-buffers-at-once allocation pattern, A-buffer/pack interaction) are being deliberately left
 untested — judged too small and too poorly localized to justify further speculative probes.
 
-**One actionable, NOT YET APPLIED candidate**: switch `lin_mm_hp_worker_run`'s panel assignment
-from cyclic to blocked — for `lm_head` specifically, or as the new general default (blocked did not
-regress any smaller Lin in the probe, and is simpler code). This needs a real production A/B before
-adopting — expect `lm_head`'s bucket (currently 5.7ms) dropping toward ~5.1ms with no regression
-elsewhere, if the probe result holds. See `codex_recs_1.md` §22.13 for the full five-probe chain.
+**Blocked-scheduling production A/B (2026-07-26): RAN, REGRESSED, REVERTED — not adopted.** Tested
+the one actionable candidate from the probe chain: switched `lin_mm_hp_worker_run` to blocked panel
+assignment, built two binaries from the same tree (cyclic vs blocked), ran both back to back on the
+board twice, same prompt/cache/fp32-router/nt=4/generation length. Tokens identical every run
+(`' Tokyo'` PASS, matching generation) — the change is exactly as correctness-neutral as expected.
+**Throughput was the opposite of the isolated probe's prediction, reproducibly**: `qkv` 9.4→10.2ms,
+`o` 7.6→8.5ms, **`lm_head` 5.7→6.0ms** (worse, not the predicted ~5.1ms) — identical shift both
+runs. Only `expert` improved slightly (36.0→~35ms). Net `linear(kernel)` worse in both runs
+(+1.0-1.7%). **Failed the pre-registered keep criterion ("keep only if `lm_head` falls toward
+~5.1ms with no regression elsewhere") on both counts — reverted immediately.** `qwen_moe_hp.c` is
+back to the exact prior committed (cyclic) state; still 8.84-9.25 tok/s, no change from this
+experiment. Why the isolated probe's prediction (and its "no difference for `qkv`/`o`" finding)
+both failed to transfer to the real engine is not diagnosed and, per the standing decision to stop
+this investigation, is not being chased further — see `codex_recs_1.md` §22.14 for the full
+writeup and what this implies about isolated probes vs required production A/Bs in general.
+
+**`linear(kernel)` work is now closed for this session.** No further scheduling or bandwidth
+investigation planned. Per external review, the next high-value branch is a real multi-prompt
+quality harness — needed to safely evaluate SwiGLU approximation and to decide whether the int8
+router (7.8% expert-set mismatch, §22.8) can be promoted past "experimental," neither of which the
+current single-prompt `' Tokyo'`-coherence check can responsibly settle.
 
 **Router-as-quantized-Lin fp16 experiment — real result, but the "stop here" conclusion was
 premature (self-correction, flagged by review).** Weight-only fp16 (activation stays fp32),
