@@ -95,6 +95,34 @@ perplexity-multiplier terms, not raw nats. None of this started yet.
 **Session cumulative from the original 1.49 tok/s baseline, at the actual current default: ~6.4-6.6x**
 (hard-swish's ~7.7x is not currently in effect).
 
+**Rational-SiLU evaluated on the board (2026-07-26) — PASSES every gate, hard-swish RE-CONFIRMED
+rejected, neither is promoted.** Added `g_swiglu_fast=2` (rational-Padé approximation of the actual
+sigmoid SiLU uses, one RVV `vfdiv`, no transcendentals) plus a corrected standalone RVV/numerical
+probe (`bench/swiglu_ratsig_probe.c`: 0/38.4M mismatches, 2.51-5.18x lower mean-abs-error than
+hard-swish vs true SiLU across three input ranges) and a larger harness: **376 teacher-forced
+generated positions + 687 independently authored real-text perplexity positions**, both candidates
+compared marginally against production (int8+exact) and cumulatively against the original
+fp32+exact baseline, plus free-running qualitative spot checks. All gates were fixed before the
+run: `<1.05x` teacher-forced and real-text-aggregate perplexity multiplier, `<1.10x` worst
+individual real-text corpus, `<15%` divergence, `>=15%` SwiGLU bucket reduction.
+
+**Results: hard-swish x1.1101 (11.0% inflation) vs production — FAILS the 5%-inflation gate**,
+consistent with §22.19's retraction (6.1% divergence, 24.4x speedup — the speed was never in
+question, the quality was). **Rational-Padé x1.0201 (2.0% inflation) vs production — PASSES**
+(3.2% divergence, 10.0x speedup / 90.0% bucket reduction). Real-text perplexity: both candidates
+clear the aggregate gate (hard-swish 0.9915x, rational-Padé 0.9841x, both <1.05x) *and* every
+individual corpus (<1.10x) — real-text alone would have wrongly cleared hard-swish, which is why
+the teacher-forced check remains the deciding methodology. Free-running spot check corroborates:
+rational-Padé's continuation tracks production's actual phrasing closely; hard-swish's diverges
+into a different narrative element. Full numbers in `codex_recs_1.md` §22.20.
+
+**No default changed.** `g_swiglu_fast` remains `0` (exact SiLU). `g_swiglu_fast=1` (hard-swish)
+stays rejected. `g_swiglu_fast=2` (rational-Padé) has now passed every harness gate administered
+but is deliberately **not promoted from this checkpoint** — the session's own standing discipline
+(a harness/probe pass still needs a production A/B before adoption, per the §22.14 scheduling
+precedent) hasn't been run for it yet, and promotion is being left to explicit confirmation rather
+than auto-applied.
+
 **Attention vectorization (2026-07-26): attention 18.7→9.1-9.2ms (-51%), 7.51-7.54→7.68-7.89 tok/s.**
 Per the standing review item ("otherwise move to activation packing or attention"), reused the
 router's proven `vdot_f32` (RVV `vfmacc`+`vfredusum`) for the QK dot product and added a new

@@ -1993,3 +1993,97 @@ correctness and is unaffected by this retraction), only the *promotion* is retra
    above suggests the original 0.3 nats/token bound (a 35% perplexity-inflation ceiling) was too
    loose; any next threshold should likely be stated directly in perplexity-multiplier terms rather
    than raw nats, so the number's real meaning doesn't require converting to notice a large effect.
+
+### 22.20 Rational-SiLU candidate and expanded evaluation harness — implementation checkpoint, results pending
+
+Implemented a second experimental SwiGLU mode, **not promoted and not yet evaluated on the board**:
+a rational-Padé approximation to the actual sigmoid used by SiLU. It approximates
+`tanh(x/2)` with `y*(27+y²)/(27+9y²)`, clamps to `[-1,1]`, then derives
+`sigmoid(x)=0.5*(1+tanh(x/2))`. The RVV path uses ordinary add/multiply/min/max plus one vector
+divide and remains behind `g_swiglu_fast=2`; exact SiLU remains the default (`0`) and hard-swish
+remains experimental (`1`). A standalone RVV-vs-scalar and true-SiLU numerical probe was added as
+`bench/swiglu_ratsig_probe.c`. Its initial RNG bug (`[0,2)` samples instead of `[0,1)`) was fixed
+before any result was accepted.
+
+The quality harness was expanded before running the candidate:
+
+- generated continuations increased from 192 to 352 token positions;
+- four independently authored real-text corpora add 688 next-token perplexity positions across
+  literature, technical prose, code, and reasoning;
+- candidates are compared both marginally against int8-router + exact-SiLU production and
+  cumulatively against the original fp32-router + exact-SiLU stack;
+- two free-running generations are printed to expose compounding behavior hidden by teacher forcing;
+- hard-swish and rational-Padé are evaluated side by side under the same build and harness.
+
+Final gates were fixed before the larger board run: teacher-forced perplexity multiplier `<1.05`,
+token divergence `<15%`, and SwiGLU bucket reduction `>=15%`; additionally, independently authored
+real-text perplexity must remain `<1.05x` aggregate versus int8 + exact SiLU, with no individual
+corpus exceeding `1.10x`. Passing the teacher-forced checks alone is now explicitly preliminary.
+No candidate becomes default from this checkpoint; the next step is to run the standalone probe
+and full board harness, record the results, then perform a production A/B only for a candidate that
+passes every gate.
+
+**Checkpoint completed — results below.** `bench/swiglu_ratsig_probe.c` (RNG fix applied):
+vectorization check 0/38.4M mismatches (max abs diff 5.7e-6) — the RVV path is a correct
+implementation of the rational-Padé formula. Numerical closeness to true SiLU, rational-Padé vs
+hard-swish, mean absolute error ratio: **2.51-5.18x lower error for rational-Padé** across
+typical/near-zero/wide input ranges (unaffected by the RNG fix — both candidates draw from the
+same corrected distribution, so the relative comparison was never invalid, only the absolute
+numbers shifted slightly).
+
+**Full board harness** (`HARNESS_GEN_SHORT=40`, `HARNESS_GEN_LONG=28` — up from 20/16 — plus the
+4-text real-text corpus): **376 teacher-forced token positions** (not the estimated 352 above —
+`8×40 + 2×28 = 376`), **687 real-text next-token positions** (`8×4` prompt-category positions was
+never the mechanism; it's `Σ(text_len−1)` across the 4 corpora = `175+167+170+175`), plus the
+router re-confirmation (376 tokens, 34,224 router comparisons — router thresholds still PASS
+cleanly: 5.7% mismatch, +0.0037 nats/tok, 1.3% divergence, 59.0% faster).
+
+| | vs int8+exact production | vs original fp32+exact | divergence | speed |
+|---|---|---|---|---|
+| **hard-swish** | **x1.1101 (11.0% inflation)** | x1.1411 (14.1%) | 6.1% (23/376) | 24.4x (95.9% reduction) |
+| **rational-Padé** | **x1.0201 (2.0% inflation)** | x1.0262 (2.6%) | 3.2% (12/376) | 10.0x (90.0% reduction) |
+
+Real-text perplexity (687 tokens, pure forward pass, independently authored — not teacher-forced
+against either model's own output): fp32+exact=2.975, int8+exact=3.015, int8+hard-swish=2.989,
+int8+rational-Padé=2.967 (perplexity, `exp(avg NLL)`). Aggregate multipliers vs int8+exact
+production: hard-swish **x0.9915**, rational-Padé **x0.9841** — both comfortably under the 1.05x
+gate. Per-corpus multipliers vs production (all four corpora, both candidates): hard-swish
+1.034/1.016/0.993/0.928, rational-Padé 0.993/0.967/1.014/0.964 — **every value for both candidates
+is under the 1.10x per-corpus gate.**
+
+**This is the decisive, informative result of the whole exercise: real-text perplexity alone would
+have passed hard-swish.** Its aggregate multiplier (0.9915) and every per-corpus multiplier clear
+the real-text gates comfortably — real-text perplexity, averaged over a full probability
+distribution, is not sensitive enough to catch what the teacher-forced greedy-argmax comparison
+catches (an 11.0% inflation in how confidently the model predicts the *specific* tokens a sibling
+config actually chose). Both methodologies were necessary; either alone would have given an
+incomplete picture — real-text alone would have wrongly cleared hard-swish, and the original
+§22.18 teacher-forced-only test (thin, 192 tokens, no real-text cross-check) is exactly what
+produced the premature promotion this checkpoint exists to correct.
+
+**Free-running (not teacher-forced) qualitative spot-check**, long-context/narrative prompt:
+- int8+exact (production): *"...and noticed something peculiar: the hands of the watch were
+  frozen at 12:00, but the gears inside were still turning."*
+- int8+hard-swish: *"...and noticed something peculiar: the gears inside were not made of brass,
+  but of a strange, dark metal that seemed to absorb light instead of"* — coherent, but a real
+  narrative departure introduced mid-continuation.
+- int8+rational-Padé: *"...and noticed something peculiar: the hands of the watch were frozen at
+  midnight, but the gears inside were still turning. He asked the stranger,"* — tracks
+  production's actual phrasing closely (same fact, "midnight" vs "12:00"), continues in the same
+  direction.
+
+**Verdict: hard-swish REJECTED** (fails the primary teacher-forced gate, 11.0% > 5%, despite
+passing every real-text gate — consistent with, not contradicting, §22.19's retraction).
+**Rational-Padé PASSES every gate administered**: teacher-forced marginal (2.0% < 5%), teacher-forced
+full-stack (2.6%, informational), real-text aggregate (0.9841 < 1.05x) and per-corpus (all <1.10x),
+divergence (3.2% < 15%), speed (90.0% reduction / 10.0x, ≥15% required). Qualitative free-running
+check corroborates the quantitative result.
+
+**Per the plan above: no candidate is promoted from this checkpoint.** `g_swiglu_fast` default
+remains `0` (exact SiLU). Both `1` (hard-swish, rejected) and `2` (rational-Padé, passed every
+harness gate) remain experimental flags only. The explicitly open next step, not yet done: a real
+production A/B for rational-Padé specifically (the same board-run, cyclic-vs-blocked-style
+methodology used for the scheduling experiment, §22.14) — harness gates are necessary but the
+session's own established discipline (§22.14) is that a harness/isolated-probe result, however
+clean, still needs a production A/B before adoption. Not run yet; explicit confirmation, not
+automatic promotion, is what determines whether it happens next.
