@@ -2,6 +2,32 @@
 
 Last update: 2026-07-26. Durable state so work survives a session kill.
 
+## HEADLINE: qwen_moe_hp.c is the current best engine — 7.51-7.54 tok/s
+Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
+session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
+kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
+untouched) for comparison. `qwen_moe_hp.c` is **5.06x faster**, same correctness bar (`' Tokyo'`
+PASS, coherent generation), still below the real vendor *binary*'s 11.71-12.89 tok/s.
+
+**Quick start**: `ssh root@192.168.68.88`; cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`
+→ `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache`
+reloads in ~22s and prints buckets. **nt=4 is the right default** (nt=8 measured slightly worse —
+memory-bandwidth-bound workload, more threads just adds bus contention, see below).
+
+**Current bucket ranking** (wall ~132.6ms/tok): `linear(kernel)` 58.5ms (44%, still dominant) >
+`router`≈`attention` 18.7ms each > `act-pack` 17.3ms > `swiglu` 14.2ms (untouched) > `rope` 2.0ms
+> `rest(other)` 2.2ms (confirms the bucket split is essentially complete).
+
+**In flight**: router-as-quantized-Lin experiment (fp16-packed RVV first, W4 only if fp16 proves
+safe) — the router (128x2048 fp32, ~1MB/layer, currently full-precision) is itself shaped exactly
+like every other `Lin` in this engine; running it through the same fast path could both shrink
+its memory footprint and reuse existing infrastructure. Real risk unlike the RoPE/router-vectorize
+fixes already shipped: routing is a **discrete** top-8 selection, so quantization noise could flip
+which experts get chosen, not just perturb a smooth activation — needs an explicit expert-choice
+comparison against the fp32 reference before shipping, not just "still says Tokyo."
+
+Full narrative below (kept for the reasoning trail — what was tried, what turned out wrong, why).
+
 ## Path A — vendor kernel port (2026-07-26, IN FLIGHT)
 Chased the ~8x gap found against the real vendor binary (research_feed_paths.md A5-equiv:
 11.71-12.89 tok/s vs our 1.49). Traced `ime.cpp`'s dispatch to the real M=1 kernel
@@ -59,24 +85,30 @@ Matches the router finding and `docs/HARDWARE.md`'s own peak-TOPS table (4-acros
 only +11% even for register-fed compute): our workload is memory-bandwidth-bound, so more threads
 just adds LPDDR5-bus contention. **nt=4 stays the default.**
 
-## Headline status
-- **Qwen3-30B-A3B MoE runs COHERENT on the K3 IME-2**, pure C: prompt → ' Tokyo' PASS;
-  "…Tokyo. The capital of Brazil is Brasília. The capital of Canada is Ottawa." **1.36 tok/s M=1 (nt=4)**.
+## Headline status (superseded engines, kept for reference)
+- **Qwen3-30B-A3B MoE, `qwen_moe.c`** (prior baseline, P0.1-P0.3 tuned): ' Tokyo' PASS, coherent,
+  **1.49 tok/s M=1 (nt=4)**. Superseded by `qwen_moe_hp.c` (7.51-7.54 tok/s) — see HEADLINE above.
 - Dense **Qwen3-4B W8A8** (`qwen_ime.c`): ' Tokyo' + Berlin/Rome/Spain, **3.85 tok/s**.
 - Dense **Qwen3-4B W4A8 per-group** (`qwen_ime4.c`): ' Tokyo' PASS (validates per-group int4).
 - Rust runtime (`~/x100-llm`) DEPRECATED — rustc/-fPIC miscompiles the vmadot asm. Pure C is the path.
 
 ## Files (repo: github.com/docdailey/x100-gemm, local /Users/Dailey/x100-gemm)
-- `qwen_moe.c` — Qwen3-30B-A3B MoE decode, W4A8, mmap GGUF, requant cache. **PRIMARY.**
+- `qwen_moe_hp.c` — Qwen3-30B-A3B MoE decode, real vendor IME-2-HP int4 kernel. **PRIMARY, current best (7.51-7.54 tok/s).**
+- `qwen_moe.c` — same model, our own custom q4-in-q8-interleave kernel. Prior baseline (1.49 tok/s), untouched/working, kept for comparison.
 - `qwen_ime.c` — dense Qwen3 W8A8 (int8 per-channel). `qwen_ime4.c` — dense W4A8 per-group.
+- `bench/vendor_ime_probe.c`, `bench/vendor_ime_a2_probe.c`, `bench/vendor_ime_a2_full.c` — Path A kernel port + validation probes (research_feed_paths.md A1-A3).
 - `bench/{decode_layer,moe_decode,q4_gemv,gguf_dump}.c` — throughput harnesses (synthetic ceilings, NOT real tok/s).
-- `codex_recs_1.md` §20 = appended findings. `research_feed_paths.md` = feeding research (review before next branch).
+- `codex_recs_1.md` §20-22 = appended findings (§22 = the vendor-kernel integration, this session). `research_feed_paths.md` = feeding research + §12 results log (review before next branch).
 
-## Board state (root@192.168.68.88, static; A100 hart8 VLEN=1024)
+## Board state (root@192.168.68.88, static; A100 harts 8-15 VLEN=1024, X100 harts 0-7 VLEN=256)
 - Model: `/root/models/Qwen3-30B-A3B-Q4_0.gguf` (17GB, unsloth base — NOT the Coder variant on NAS).
-- Binary: `/root/qwen_moe_cache` (current). Build: `gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_cache qwen_moe.c -lm`.
-- Run: `LD_LIBRARY_PATH=/usr/lib ./qwen_moe_cache /root/models/Qwen3-30B-A3B-Q4_0.gguf <ngen> <nt> [cachepath]`.
-- **Local cache**: `/root/models/qwen3-30b-a3b.imecache` (~18-20GB, footer "ENDIMEC" validated). Load ~40s vs 16-min requant.
+- **Current (qwen_moe_hp.c)**: binary `/root/qwen_moe_hp`. Build: `gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread`.
+  Run: `LD_LIBRARY_PATH=/usr/lib ./qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf <ngen> <nt> [cachepath]`.
+  Cache: `/root/models/qwen3-30b-a3b.hp.imecache` (`IMEC` ver=2, vendor N32-panel/K256-superblock format, footer `ENDIMEC`).
+  Load ~22s vs ~18.4 min full requant (slower than the old format's requant — real, unoptimized cost).
+- **Prior (qwen_moe.c)**: binary `/root/qwen_moe_cache`. Build: `gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_cache qwen_moe.c -lm`.
+  Cache: `/root/models/qwen3-30b-a3b.imecache` (`IMEC` ver=1, our own q4-in-q8-interleave format — NOT
+  compatible with the ver=2 cache above; the two engines' caches don't interchange).
 - Requant now **parallel over 8 X100 cores** (`#pragma omp parallel for`, affinity reset to harts 0-7) → ~2 min not 16.
 - NAS sshfs mount `/mnt/jupiter2` → `willy@192.168.69.133:/storage/milkv_jupiter2` (persistent, fstab x-systemd.automount,
   board key authorized). **WARNING: sshfs ~25 MB/s and silently truncates large writes — do NOT cache to NAS. Local only.**
@@ -114,5 +146,9 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
 - ~1.9GB/token / ~13 GB/s packed ≈ 150ms matmul; token is ~735ms → ~585ms glue = the P0 target (unconfirmed until buckets).
 
 ## Next-session quick start
-1. `ssh root@192.168.68.88`; local cache exists → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_cache /root/models/Qwen3-30B-A3B-Q4_0.gguf 12 4` reloads in ~40s and prints buckets.
-2. Continue P0.2/P0.3, then research_feed_paths.md branch choice.
+See HEADLINE at the top of this doc — `qwen_moe_hp.c` is current, `qwen_moe.c` is superseded.
+1. `ssh root@192.168.68.88`; HP cache exists → `LD_LIBRARY_PATH=/usr/lib /root/qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf 16 4 /root/models/qwen3-30b-a3b.hp.imecache` reloads in ~22s and prints buckets.
+2. In flight: router-as-quantized-Lin experiment (fp16-packed RVV first; compare expert selection
+   against the fp32 router before trusting it, then consider W4 only if that holds up). SwiGLU
+   (14.2ms, largest untouched bucket) deliberately deferred — needs quality validation beyond the
+   single-prompt coherence check before approximating `expf`/sigmoid.
