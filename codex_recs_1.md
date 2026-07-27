@@ -2509,3 +2509,60 @@ costlier).
 **Per the execution directive, no further phase has started.** Phase 2 (head-major KV-layout A/B)
 is the next planned step, not yet implemented — this baseline scoreboard is the review point the
 directive requires before it begins.
+
+### 22.28 Attention Phase 2: head-major KV layout — KEPT, dramatic gain, isolated from threading/fusion
+
+Explicit authorization: Phase 2 only, isolated head-major KV-layout A/B, not combined with
+threading or GQA fusion. The §22.27 baseline showing QK/AV as co-dominant was read as confirming
+"exact GQA reuse remains the likely larger later opportunity, while softmax should wait" — i.e.
+this entry is Phase 2 alone, Phase 3 (threading) and Phase 4 (fusion) are separate future decisions.
+
+**Change**: per-layer KV-cache layout in `forward()` changed from `[position][kv_head][head_dim]`
+(2KB stride between consecutive positions for one head — `kvd=nkv*hd=4*128=512` floats) to
+`[kv_head][position][head_dim]` (one head's whole history contiguous). The write became `nkv`
+separate per-head `memcpy`s (positions for different heads are no longer adjacent, so the old
+single all-heads-at-once `memcpy` no longer applies) instead of one; the read indexes each head's
+contiguous run directly instead of striding by `kvd` per position. Same total per-layer allocation
+size either way (`ctx*kvd` floats), same arithmetic, same quantization — pure addressing change,
+matching the plan's "do not change quantization or attention math" constraint exactly.
+
+**Validation** (plan's required order): (1) ASan on a bounded long-context test — `QWEN_CTXLEN=256,
+ngen=24`, completed clean, no report, no abort. (2) No KV bounds errors — the `forward()` guard
+added in §22.25/§22.26 stayed silent throughout every run. (3) Token identity vs the time-major
+baseline — confirmed byte-identical at the canonical 12-token prompt, at the ASan ctx=256 run, and
+at every A/B context below. (4) A/B at contexts 128, 512, 1024 — full results follow. Baseline
+preserved at `/tmp/qwen_moe_hp_kv_timemajor.c` (`git show HEAD:qwen_moe_hp.c` from immediately
+before this change — hash-verified identical to the exact binary §22.27's baseline scoreboard was
+measured against, so that data was reused rather than re-measured, saving substantial board time
+on a workload where ctx=1024 alone costs ~20 minutes/trial).
+
+| | 128 | 512 | 1024 |
+|---|---|---|---|
+| attention bucket | 136.75→56.40ms (**-58.8%**) | 585.55→201.14ms (**-65.6%**) | 1217.45→384.06ms (**-68.5%**) |
+| wall/token | 216.3→135.3ms (-37.4%) | 665.8→280.4ms (-57.9%) | 1298.8→463.8ms (-64.3%) |
+| tok/s | 4.63→7.39 (**+59.6%**) | 1.50→3.56 (**+136.9%**) | 0.77→2.16 (**+179.9%**) |
+
+Short-context (canonical prompt, 2 paired trials each): baseline wall 88.45ms avg → candidate
+87.7ms avg, a **0.85% improvement, not a regression** — the plan's "no more than 2% short-context
+regression" gate is not merely met but inverted (the change helps everywhere tested, not just at
+long context). Every pairing above is two independent trials in tight agreement (e.g. ctx=1024:
+383.32ms vs 384.79ms) — the improvement is reproducible, not a one-off. Bonus, not a required
+metric: prefill time also dropped substantially (ctx=512 ~172-185s→91s, ctx=1024 ~678-680s→279s),
+the same locality argument applying to prefill's own repeated K/V writes/reads.
+
+**This result is far larger than the plan's own framing anticipated** ("may improve prefetching and
+cache-line use" was stated as a secondary, exploratory rationale for testing layout first, not a
+prediction of a 58-68% bucket reduction). The magnitude makes sense in hindsight: the old layout's
+2KB stride between consecutive positions for a fixed head guaranteed zero cache-line reuse and a
+strided access pattern hostile to hardware prefetching; the new layout's contiguous per-head
+history is close to the best case for both. This also reframes the co-dominant QK/AV baseline from
+§22.27 — a meaningful fraction of what looked like "real compute cost" was actually avoidable
+memory-layout overhead, not fundamental FLOP or bandwidth cost.
+
+**Both predeclared keep criteria met — KEPT.** Head-major is now the production KV-cache layout in
+`qwen_moe_hp.c` (committed). Per the explicit authorization, **threading (Phase 3) and GQA fusion
+(Phase 4) are not started** — this entry is the isolated layout change only, as scoped. The
+co-dominant QK/AV baseline (§22.27) is read as the user directed: it confirms exact GQA reuse
+(Phase 4 — eliminating the 8x redundant K/V re-reads across query heads sharing a KV head) remains
+the likely larger later opportunity, while softmax vectorization (Phase 5) can wait, being a
+smaller and now-even-smaller-relatively fraction of a bucket that just dropped by more than half.

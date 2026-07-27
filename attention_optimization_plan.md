@@ -219,9 +219,15 @@ per the execution directive, no layout/threading/fusion candidate is implemented
 | Baseline (T1) | 1024 | 566.90 | 69.27 | 580.86 | 1217.22 | 1298.5 | 0.77 | (ref) |
 | Baseline (T2) | 1024 | 567.25 | 69.34 | 580.88 | 1217.67 | 1299.0 | 0.77 | identical to T1 |
 | Baseline (avg) | 1024 | 567.08 | 69.31 | 580.87 | 1217.45 | 1298.8 | 0.77 | — |
-| Head-major KV | 128 | | | | | | | |
-| Head-major KV | 512 | | | | | | | |
-| Head-major KV | 1024 | | | | | | | |
+| Head-major KV (T1) | 128 | 22.03 | 10.75 | 23.74 | 56.69 | 135.5 | 7.38 | identical to baseline |
+| Head-major KV (T2) | 128 | 21.66 | 10.78 | 23.51 | 56.11 | 135.1 | 7.40 | identical to baseline |
+| Head-major KV (avg) | 128 | 21.85 | 10.77 | 23.63 | 56.40 | 135.3 | 7.39 | — |
+| Head-major KV (T1) | 512 | 73.96 | 40.34 | 86.30 | 200.79 | 279.8 | 3.57 | identical to baseline |
+| Head-major KV (T2) | 512 | 75.23 | 40.33 | 85.75 | 201.49 | 280.9 | 3.56 | identical to baseline |
+| Head-major KV (avg) | 512 | 74.60 | 40.34 | 86.03 | 201.14 | 280.4 | 3.56 | — |
+| Head-major KV (T1) | 1024 | 140.84 | 79.79 | 162.50 | 383.32 | 463.2 | 2.16 | identical to baseline |
+| Head-major KV (T2) | 1024 | 140.30 | 79.91 | 164.36 | 384.79 | 464.4 | 2.15 | identical to baseline |
+| Head-major KV (avg) | 1024 | 140.57 | 79.85 | 163.43 | 384.06 | 463.8 | 2.16 | — |
 | Four KV-group workers | 128 | | | | | | | |
 | Four KV-group workers | 512 | | | | | | | |
 | Four KV-group workers | 1024 | | | | | | | |
@@ -245,6 +251,38 @@ counts — plausibly the read-modify-write accumulation into the output vector (
 *and* writes `oh`) versus QK's read-only reduction to a scalar (`vdot_f32` only writes one `sc[j]`
 per position) — relevant to Phase 4's fused-kernel motivation, since both directions redundantly
 re-read the same K/V once per query head sharing a KV head (8x redundant reads either way).
+
+**Phase 2 result (2026-07-26): KEPT — result far exceeds the plan's own modest framing.** The
+head-major layout was expected to "improve prefetching and cache-line use" as a secondary,
+possibly-marginal effect; the actual measured effect is dramatic, not marginal — the old layout's
+2KB stride between consecutive positions for one head guaranteed zero cache-line reuse and a
+strided (not sequential) access pattern; the new layout makes one head's whole K/V history
+contiguous, ideal for the hardware prefetcher.
+
+| | 128 | 512 | 1024 |
+|---|---|---|---|
+| attention bucket | 136.75→56.40ms (**-58.8%**) | 585.55→201.14ms (**-65.6%**) | 1217.45→384.06ms (**-68.5%**) |
+| wall/token | 216.3→135.3ms (-37.4%) | 665.8→280.4ms (-57.9%) | 1298.8→463.8ms (-64.3%) |
+| tok/s | 4.63→7.39 (**+59.6%**) | 1.50→3.56 (**+136.9%**) | 0.77→2.16 (**+179.9%**) |
+
+Short-context (canonical 12-token prompt, 2 paired trials): wall time 88.45ms→87.7ms, a **0.85%
+improvement, not a regression** — comfortably clears the "no more than 2% regression" gate with
+room to spare. Both predeclared keep criteria met: attention improves reproducibly (tight
+trial-to-trial agreement at every context, see table above) and short-context does not regress.
+ASan clean on a bounded ctx=256/ngen=24 run (no report, no abort); tokens byte-identical to the
+time-major baseline at every context tested (128, 512, 1024, plus the ASan ctx=256 run) and at the
+canonical short prompt. Bonus, not a required metric: prefill time also improved substantially
+(ctx=512: ~172-185s→91s; ctx=1024: ~678-680s→279s), consistent with the same locality argument
+applying to the prefill loop's own repeated K/V writes and reads.
+
+**Head-major is now the production KV-cache layout** (`qwen_moe_hp.c`, committed). The time-major
+baseline is preserved at `/tmp/qwen_moe_hp_kv_timemajor.c` on the board (built from the exact
+pre-Phase-2 commit) as the revert reference, matching this session's established pattern (e.g. the
+§22.14 scheduling A/B) of keeping a scratch comparison copy rather than committing it to the repo.
+Full writeup in `codex_recs_1.md` §22.28.
+
+**Per the execution directive, still no threading or GQA fusion** — Phase 3 (four KV-group
+workers) is the next candidate, not started, and is a separate decision from this one.
 
 ## Stop conditions
 

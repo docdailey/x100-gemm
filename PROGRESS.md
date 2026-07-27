@@ -80,6 +80,22 @@ context, decomposing §22.23's aggregate ~1.2ms/token-of-context finding. Per th
 directive, **no layout/threading/fusion work has started** — this baseline is the required review
 point before Phase 2 (head-major KV layout) begins.
 
+**Attention Phase 2 KEPT — head-major KV layout, dramatic gain (2026-07-26, `codex_recs_1.md`
+§22.28).** Explicit authorization: Phase 2 only, isolated from threading/GQA fusion. Per-layer KV
+cache changed from `[position][kv_head][head_dim]` (2KB stride between positions for one head) to
+`[kv_head][position][head_dim]` (one head's history contiguous) — pure addressing change, same
+math/quantization. **Attention bucket: -58.8% (ctx=128), -65.6% (ctx=512), -68.5% (ctx=1024).
+tok/s: +59.6%, +136.9%, +179.9% respectively** — far beyond the plan's own modest "may improve
+prefetching" framing; the old layout's 2KB stride was hostile to hardware prefetching, and a
+meaningful fraction of what looked like real attention compute cost was actually avoidable
+memory-layout overhead. Short-context (canonical prompt): wall time *improved* 0.85%, not
+regressed — both predeclared keep criteria (attention improves reproducibly, short-context doesn't
+regress >2%) cleared with large margins. ASan clean on a bounded long-context run, tokens
+byte-identical to the time-major baseline at every context tested. **Head-major is now the
+production KV-cache layout.** Threading (Phase 3) and GQA fusion (Phase 4) not started — separate
+future decisions; the co-dominant QK/AV baseline (§22.27) is read as confirming exact GQA reuse
+(Phase 4) is the likely larger next opportunity, softmax (Phase 5) can wait.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config), AT PARITY with the vendor binary at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

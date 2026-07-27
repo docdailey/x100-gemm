@@ -760,17 +760,31 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
             fprintf(stderr,"KV position overflow: pos=%d ctx=%d\n",pos,kv->ctx);
             abort();
         }
+        /* attention_optimization_plan.md Phase 2 (codex_recs_1.md §22.28): head-major KV layout,
+         * exact candidate vs the time-major baseline preserved at /tmp/qwen_moe_hp_kv_timemajor.c
+         * (matches git HEAD before this change). Per-layer region is now [kv_head][position]
+         * [head_dim] (stride ctx*hd per kv_head) instead of [position][kv_head][head_dim] (stride
+         * kvd=nkv*hd per position, a 2KB stride for one head's history in the old layout) -- each
+         * head's own K/V history is now contiguous. Same total per-layer size (ctx*kvd floats
+         * either way), same values, only the addressing changes: the write becomes nkv separate
+         * per-head memcpys (positions for different heads are no longer adjacent) instead of one
+         * memcpy of all heads at a position; the read indexes each head's contiguous run directly
+         * instead of striding by kvd per position. No math, no quantization, no threading change. */
         float*Kc=kv->Kc+(size_t)l*kv->ctx*kvd,*Vc=kv->Vc+(size_t)l*kv->ctx*kvd;
-        memcpy(Kc+(size_t)pos*kvd,k,kvd*4); memcpy(Vc+(size_t)pos*kvd,vv,kvd*4);
+        for(int kvh=0;kvh<nkv;kvh++){
+            memcpy(Kc+(size_t)kvh*kv->ctx*hd+(size_t)pos*hd, k+(size_t)kvh*hd, hd*4);
+            memcpy(Vc+(size_t)kvh*kv->ctx*hd+(size_t)pos*hd, vv+(size_t)kvh*hd, hd*4);
+        }
         float scale=1.0f/sqrtf(hd); double _at=gT_on?now():0;
         for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q+hh*hd,*sc=tmp;
+            float*Kh=Kc+(size_t)kvh*kv->ctx*hd,*Vh=Vc+(size_t)kvh*kv->ctx*hd;
             double _tqk=gT_on?now():0;
-            for(int j=0;j<=pos;j++){ float*kj=Kc+(size_t)j*kvd+kvh*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
+            for(int j=0;j<=pos;j++){ float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
             double _tsm=gT_on?now():0; if(gT_on) gT_attn_qk += _tsm-_tqk;
             softmax(sc,pos+1);
             double _tav=gT_on?now():0; if(gT_on) gT_attn_sm += _tav-_tsm;
             float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-            for(int j=0;j<=pos;j++){ float*vj=Vc+(size_t)j*kvd+kvh*hd; vaxpy_f32(oh,vj,sc[j],hd); }
+            for(int j=0;j<=pos;j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
             if(gT_on) gT_attn_av += now()-_tav; }
         if(gT_on) gT_attn += now()-_at;
         g_lin_class=LIN_O; lin_mm(&ly->o,att,tmp,nt,Abuf); g_lin_class=LIN_NONE;
