@@ -96,25 +96,47 @@ production KV-cache layout.** Threading (Phase 3) and GQA fusion (Phase 4) not s
 future decisions; the co-dominant QK/AV baseline (§22.27) is read as confirming exact GQA reuse
 (Phase 4) is the likely larger next opportunity, softmax (Phase 5) can wait.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config), AT PARITY with the vendor binary at nt=4
+**Attention Phase 3 KEPT — four-KV-group worker parallelism, isolated from GQA fusion
+(2026-07-26, `codex_recs_1.md` §22.29).** Explicit authorization: Phase 3 only; softmax stays
+deferred despite a small regression. Reused the existing persistent pool (no new threads) — worker
+`tn` handles KV heads `tn, tn+attn_nt, ...`, matching the plan's ideal division at `attn_nt=nkv=4`.
+**Attention bucket vs Phase 2: -75.0% (ctx=128), -75.0% (ctx=512), -74.4% (ctx=1024). tok/s: 7.39→
+10.77 (+45.7%), 3.56→7.73 (+117.1%), 2.16→5.625 (+160.4%).** Short-context wall time *improved*
+8.25%, not regressed. All five predeclared keep criteria met with large margins (tokens identical
+at every worker count/context, ASan+UBSan clean, both bucket/speed floors cleared many times over,
+no short-context regression). **Four-KV-group parallelism is now the production attention path** —
+`g_attn_nt` defaults to `min(nt,nkv)` (=4 at `nt=4`), `QWEN_ATTN_NT=1` is the serial revert flag.
+**The canonical-prompt HEADLINE number itself moved: 11.35-11.4→12.3-12.35 tok/s** — this branch's
+long-context work also improved the short-context default. Softmax's relative share of the
+(now much smaller) attention bucket grew, but per explicit direction stays untouched — Phase 4
+(GQA-fused kernels, eliminating 8x redundant K/V re-reads across query heads sharing a KV head) is
+the next identified opportunity, not started.
+
+## HEADLINE: qwen_moe_hp.c is the current best engine — 12.3-12.35 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
-untouched) for comparison. `qwen_moe_hp.c` is now **~7.6-7.8x faster** at its actual default config
-(int8-M1 router + rational-Padé SwiGLU), same correctness bar (`' Tokyo'` PASS, coherent
-generation, tokens identical to exact SiLU on the canonical prompt). A clean, sequential (no
-contention) A/B against the real vendor `llama-bench` binary confirms **11.35-11.39 tok/s (ours) vs
-11.38±0.21 tok/s (vendor) at nt=4 — statistically at parity**, closing what was previously reported
-as an ~11% gap (that earlier vendor number turned out to be measured against a stale, since-fixed
-vendor library — see the dated entry below and `codex_recs_1.md` §22.24). An earlier experimental flag
-(`g_swiglu_fast=1`, hard-swish) reaches a similar 11.49-11.5 tok/s but was **promoted then
-retracted** the same day for a real quality regression (11.0% perplexity inflation at scale) — see
-`codex_recs_1.md` §22.19-20 — and stays rejected; do not re-promote it. The default SwiGLU mode is
-now `g_swiglu_fast=2` (rational-Padé), promoted 2026-07-26 after passing an expanded quality
-harness (§22.20) *and* a bounded production A/B (§22.21) — see the dated entries below. `0`
-(exact SiLU) remains available as an explicit revert flag. **Build now REQUIRES
-`-fno-tree-vectorize`** (see the toolchain-hardening entry below and the file's own header
-comment) — this is not optional, it's a correctness/performance fix, not a tuning knob.
+untouched) for comparison. `qwen_moe_hp.c` is now **~8.3x faster** at its actual default config
+(int8-M1 router + rational-Padé SwiGLU + head-major KV layout + 4-way parallel attention), same
+correctness bar (`' Tokyo'` PASS, coherent generation, tokens identical across every promoted
+flag's revert-flag comparison). A clean, sequential (no contention) A/B against the real vendor
+`llama-bench` binary found **11.35-11.39 tok/s (ours) vs 11.38±0.21 tok/s (vendor) at nt=4 —
+statistically at parity** *before* the attention-optimization branch (§22.27-§22.29) below; that
+branch has since pushed the canonical-prompt default past the vendor figure (12.3-12.35 vs
+11.38±0.21) — a fresh apples-to-apples vendor re-run hasn't been done post-attention-branch, so
+treat the "past vendor" framing as directional pending that recheck, not yet as its own verified
+A/B. (That earlier vendor gap was itself found to be measured against a stale, since-fixed vendor
+library — see `codex_recs_1.md` §22.24.) An earlier experimental flag (`g_swiglu_fast=1`,
+hard-swish) reaches a similar throughput on short prompts but was **promoted then retracted** the
+same day for a real quality regression (11.0% perplexity inflation at scale) — see `codex_recs_1.md`
+§22.19-20 — and stays rejected; do not re-promote it. The default SwiGLU mode is `g_swiglu_fast=2`
+(rational-Padé), promoted after passing an expanded quality harness (§22.20) *and* a bounded
+production A/B (§22.21, reconfirmed §22.26); `0` (exact SiLU) remains an explicit revert flag. The
+default attention KV layout is head-major (§22.28, `qwen_moe_hp_kv_timemajor.c` preserved as the
+time-major revert reference), with attention parallelized across `min(nt,nkv)` pool workers
+(§22.29, `QWEN_ATTN_NT=1` as the serial revert flag). **Build now REQUIRES `-fno-tree-vectorize`**
+(see the toolchain-hardening entry below and the file's own header comment) — this is not optional,
+it's a correctness/performance fix, not a tuning knob.
 
 **Quick start**: `ssh root@192.168.68.24` (static IP on wired Ethernet, confirmed persistent across
 reboots via NetworkManager — see Board State below); cache exists at `/root/models/qwen3-30b-a3b.hp.imecache`

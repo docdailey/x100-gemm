@@ -2566,3 +2566,77 @@ co-dominant QK/AV baseline (§22.27) is read as the user directed: it confirms e
 (Phase 4 — eliminating the 8x redundant K/V re-reads across query heads sharing a KV head) remains
 the likely larger later opportunity, while softmax vectorization (Phase 5) can wait, being a
 smaller and now-even-smaller-relatively fraction of a bucket that just dropped by more than half.
+
+### 22.29 Attention Phase 3: four-KV-group worker parallelism — KEPT, isolated from GQA fusion
+
+Explicit authorization: Phase 3 only, isolated four-KV-group worker parallelism, not combined with
+GQA fusion. Softmax to remain deferred despite a small regression (see below).
+
+**Implementation, cleanup of a stale plan reference**: the plan's own "Immediate next action"
+section still said "Implement Phase 1 instrumentation only" after Phase 1/2 had both completed and
+been kept — fixed to correctly identify Phase 3, then Phase 4, as the actual next steps.
+
+**Change**: `HpWork` (the existing persistent-pool dispatch struct, `qwen_moe_hp.c`) gained a third
+`kind==2` variant for attention, reusing the pool unchanged — no new threads created. Worker `tn`
+handles KV heads `tn, tn+attn_nt, tn+2*attn_nt, ...` and each such KV head's `gpr` (8) query heads,
+in ascending head order; with `attn_nt==nkv` (the promoted default) each worker gets exactly one KV
+head, matching the plan's stated ideal division. Every pool thread is woken and increments the
+shared done-counter exactly once per round regardless of whether it had real work that round
+(threads with `tn>=attn_nt` no-op), so testing `attn_nt`=1/2/4 needed no change to the existing
+`lin_mm_hp`/`lin_mm_i8` wait discipline. A private per-worker score scratch buffer (`>=ctx` floats)
+is allocated once, lazily, not per-call. `g_attn_nt<=1` (the serial fallback, matching Phase 2's
+code byte-for-byte) took an entirely separate, unmodified branch in `forward()` — zero risk to the
+already-verified path when parallelism is off, and the fallback used throughout Phase 1/2's own
+testing.
+
+Dispatch/sync overhead is measured directly (`gT_attn_dispatch`): wall time of the whole attention
+step minus the busiest single worker's own QK+softmax+AV time that round — cost not explained by
+any one worker's real compute. QK/softmax/AV sub-buckets are kept thread-safe via per-worker
+indexed accumulator slots (no locking needed, each thread only ever writes its own index) summed
+into the globals by the single dispatching thread after every round completes, so there's no data
+race despite up to 4 threads recording sub-timings concurrently.
+
+**Validation** (plan's required order): tokens confirmed byte-identical at every worker count
+(1/2/4) and every context tested (canonical prompt, ctx=256/ngen=24, ctx=512, ctx=1024). ASan clean
+on a bounded ctx=256/ngen=24 run at both `attn_nt=2` and `attn_nt=4` (no report, no abort). UBSan
+clean at `attn_nt=4` on the same bounded test — the plan's "no ASan or UBSan failure" gate is fully
+covered, not just the ASan half.
+
+**A/B, 2 trials per context, board otherwise idle, against Phase 2's head-major baseline**
+(`*` marks summed-across-workers CPU-time, not wall-clock-comparable once threaded — "attention
+bucket" is the wall-clock figure that matters):
+
+| | 128 | 512 | 1024 |
+|---|---|---|---|
+| attention bucket | 56.40→14.09ms (**-75.0%**) | 201.14→50.33ms (**-75.0%**) | 384.06→98.42ms (**-74.4%**) |
+| wall/token | 135.3→92.85ms (-31.4%) | 280.4→129.35ms (-53.9%) | 463.8→177.8ms (-61.7%) |
+| tok/s | 7.39→10.77 (**+45.7%**) | 3.56→7.73 (**+117.1%**) | 2.16→5.625 (**+160.4%**) |
+
+Short-context (canonical prompt, 2 paired trials): wall time 88.45ms (Phase 2 baseline) → 81.15ms,
+**an 8.25% improvement**, comfortably clearing "no more than 2% regression." **All five predeclared
+keep criteria met** — tokens identical, ASan+UBSan clean, attention-bucket reduction (75.0%/74.4%,
+both far past the 20% floor at ctx 512/1024), end-to-end improvement (117.1%/160.4%, both far past
+the 10% floor), no short-context regression (an improvement instead). Dispatch/sync overhead stayed
+tiny throughout (0.09-1.14ms across every configuration) — the coordination cost of parallelizing
+is not eating the gain.
+
+**Four-KV-group worker parallelism is now the production attention path.** `g_attn_nt` default
+changed from a hardcoded `1` to `min(nt,nkv)` (computed in `main()` once `m.nkv` is known, so it
+naturally tracks whatever `nt` is actually configured with, `=4` at the standard default).
+`QWEN_ATTN_NT=1` remains an explicit serial revert flag, byte-identical to Phase 2's code path. The
+true production default invocation (no CLI overrides, no env vars) now reports `attn_nt=4` and
+**12.3-12.35 tok/s at the canonical prompt**, up from 11.3-11.5 before this entry — the short-
+context HEADLINE number itself moved, not just the long-context numbers this branch was chasing.
+
+**As explicitly directed: softmax (Phase 5) stays deferred despite a small regression.** Its own
+summed-work total held roughly flat in absolute terms through Phases 2-3 (e.g. ctx=1024: 69.31ms
+Phase 1 baseline vs 69.17ms Phase 3 total-work — essentially unchanged), but QK/AV's wall-clock
+contribution collapsed by ~74-75%, so softmax is now a much larger *relative* share of a bucket that
+shrank dramatically — the "small regression" is relative, not absolute, and exactly what Phase 5
+exists to eventually address, but per direction it is not touched now: no exponential
+approximation, no vectorization work, until specifically authorized.
+
+**Per the execution directive, still no GQA fusion.** Phase 4 (exact GQA-fused kernels — eliminating
+the 8x redundant K/V re-reads across query heads sharing a KV head, identified in the §22.27
+baseline and still true after Phase 2/3, since neither touched the redundant-re-read pattern
+itself) is the next identified opportunity, not started, and is a separate future decision.

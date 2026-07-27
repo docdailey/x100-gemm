@@ -394,9 +394,20 @@ static double gT_lin_qkv=0, gT_lin_o=0, gT_lin_exp=0, gT_lin_lm=0;
 /* attention_optimization_plan.md Phase 1: split gT_attn (already the sum of these three) into
  * QK dot-product, softmax, and weighted-V accumulate, per head, to establish which operation
  * dominates before changing the KV layout or adding threading -- instrumentation only, no math
- * changed. A fourth "dispatch/sync" sub-bucket is left for Phase 3 (worker pool), not needed yet
- * since attention has no dispatch/wait of its own until threading is added. */
+ * changed. */
 static double gT_attn_qk=0, gT_attn_sm=0, gT_attn_av=0;
+/* Phase 3 (codex_recs_1.md §22.29): dispatch/sync overhead when attention is parallelized across
+ * the persistent pool -- wall time of the whole attention step minus the slowest single worker's
+ * own QK+softmax+AV time this round, i.e. cost not explained by any one worker's real compute.
+ * Zero when g_attn_nt<=1 (serial path, exact same code as Phase 2, no dispatch involved). */
+static double gT_attn_dispatch=0;
+/* g_attn_nt: how many pool threads participate in attention this run (independent of g_pool_nt,
+ * which still fully participates in the GEMM kernels regardless). DEFAULT (set in main() once
+ * m.nkv is known) is min(nt,nkv) -- PROMOTED 2026-07-26 after passing every Phase 3 keep criterion,
+ * codex_recs_1.md §22.29. 1=serial, byte-identical to Phase 2, kept as an explicit revert flag via
+ * QWEN_ATTN_NT, same "avoid another positional production arg" convention as QWEN_CTXLEN/
+ * QWEN_HARNESS. The initializer below (1) only matters before main() sets the real default. */
+static int g_attn_nt=1;
 enum { LIN_NONE=0, LIN_QKV, LIN_O, LIN_EXP, LIN_LM };
 static int g_lin_class=LIN_NONE;
 static void lin_add(double d){
@@ -429,13 +440,24 @@ static int g_router_mode=0;
  * np<Np; np+=nt), so the actual math is unchanged -- only the dispatch mechanism differs.
  * Generalized (kind field) to also dispatch the int8 M1 kernel through the same pool. */
 #define MAXNT 16
-typedef struct { int kind; const Lin*l; const uint8_t*Abuf; float*y; int kb; } HpWork; /* kind: 0=int4 HP, 1=int8 M1 */
+/* kind: 0=int4 HP GEMM, 1=int8 M1 GEMM, 2=attention (Phase 3, codex_recs_1.md §22.29). The
+ * attention-only fields are unused by kind 0/1 and vice versa; kept as plain extra fields (not a
+ * union) since HpWork is small and this file already treats struct simplicity as more valuable
+ * than the few bytes a union would save. attn_worker_run/attn_dispatch (defined later, after the
+ * vdot_f32/softmax/vaxpy_f32 primitives they call) fill and read these. */
+typedef struct {
+    int kind; const Lin*l; const uint8_t*Abuf; float*y; int kb;
+    const float*aq; const float*aKc; const float*aVc; float*aatt;
+    int apos; float ascale; int ahd; int ankv; int agpr; int actx; int aattn_nt;
+} HpWork;
 static _Atomic int g_pool_gen=0, g_pool_done=0;
 static HpWork g_pool_work;
 static int g_pool_nt=0;
 static pthread_t g_pool_threads[MAXNT];
+static void attn_worker_run(int tn); /* defined after vdot_f32/softmax/vaxpy_f32, called below */
 
 static void lin_mm_hp_worker_run(int tn){
+    if(g_pool_work.kind==2){ attn_worker_run(tn); return; }
     int Np=g_pool_work.l->N/32;
     if(g_pool_work.kind==0){
         for(int np=tn; np<Np; np+=g_pool_nt)
@@ -591,6 +613,72 @@ static void vaxpy_f32(float*y,const float*x,float scale,int n){
         vfloat32m1_t vx=__riscv_vle32_v_f32m1(x+i,vl), vy=__riscv_vle32_v_f32m1(y+i,vl);
         vy=__riscv_vfmacc_vf_f32m1(vy,scale,vx,vl);
         __riscv_vse32_v_f32m1(y+i,vy,vl); i+=vl; }
+}
+/* attention_optimization_plan.md Phase 3 (codex_recs_1.md §22.29): four-KV-group worker
+ * parallelism, reusing the persistent pool -- no new threads. Isolated from Phase 4 (GQA fusion):
+ * each worker still does the exact same per-head QK/softmax/AV as the Phase 2 serial code, just on
+ * a different thread; K/V is still re-read once per query head sharing a KV head (unchanged, that
+ * redundancy is Phase 4's target, not this one's). Worker tn handles KV heads tn, tn+attn_nt,
+ * tn+2*attn_nt, ... and each such KV head's gpr query heads, in ascending head order -- with
+ * attn_nt==nkv (the production target once/if promoted) this gives exactly the plan's "ideal
+ * division" (worker k = KV head k) since each worker's stride equals nkv. Every pool thread always
+ * gets woken and always increments g_pool_done exactly once per round (matching the existing
+ * lin_mm_hp/lin_mm_i8 wait discipline unchanged); threads with tn>=attn_nt do no attention work
+ * that round, a fast no-op, so testing attn_nt=1/2/4 needs no change to the wait logic. */
+static float* g_attn_scratch[MAXNT]; /* private per-worker score buffer, >=ctx floats, allocated
+    once (lazily, on first use) not per-layer/token -- matches Phase 3's explicit requirement. */
+static int g_attn_scratch_ctx=0;
+static double g_w_qk[MAXNT], g_w_sm[MAXNT], g_w_av[MAXNT]; /* per-worker accumulators: each thread
+    only ever writes its own index, so these are race-free without locking; summed into the global
+    gT_attn_qk/sm/av by the single dispatching thread after every worker has finished its round. */
+static void attn_scratch_ensure(int ctx){
+    if(g_attn_scratch_ctx>=ctx) return;
+    for(int i=0;i<MAXNT;i++){ free(g_attn_scratch[i]); g_attn_scratch[i]=malloc((size_t)ctx*4); }
+    g_attn_scratch_ctx=ctx;
+}
+static void attn_worker_run(int tn){
+    if(tn>=g_pool_work.aattn_nt){ g_w_qk[tn]=g_w_sm[tn]=g_w_av[tn]=0; return; }
+    int nkv=g_pool_work.ankv, gpr=g_pool_work.agpr, hd=g_pool_work.ahd, pos=g_pool_work.apos, actx=g_pool_work.actx;
+    float scale=g_pool_work.ascale;
+    const float*q=g_pool_work.aq, *Kc=g_pool_work.aKc, *Vc=g_pool_work.aVc; float*att=g_pool_work.aatt;
+    float*sc=g_attn_scratch[tn];
+    double qk=0, sm=0, av=0;
+    for(int kvh=tn; kvh<nkv; kvh+=g_pool_work.aattn_nt){
+        const float*Kh=Kc+(size_t)kvh*actx*hd, *Vh=Vc+(size_t)kvh*actx*hd;
+        for(int qi=0; qi<gpr; qi++){
+            int hh=kvh*gpr+qi; const float*qh=q+(size_t)hh*hd;
+            double t0=gT_on?now():0;
+            for(int j=0;j<=pos;j++){ const float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
+            double t1=gT_on?now():0; if(gT_on) qk+=t1-t0;
+            softmax(sc,pos+1);
+            double t2=gT_on?now():0; if(gT_on) sm+=t2-t1;
+            float*oh=att+(size_t)hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+            for(int j=0;j<=pos;j++){ const float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
+            if(gT_on) av += now()-t2;
+        }
+    }
+    g_w_qk[tn]=qk; g_w_sm[tn]=sm; g_w_av[tn]=av;
+}
+static void attn_dispatch(const float*q,const float*Kc,const float*Vc,float*att,int pos,float scale,
+        int hd,int nkv,int gpr,int actx,int attn_nt){
+    attn_scratch_ensure(actx);
+    g_pool_work.kind=2; g_pool_work.aq=q; g_pool_work.aKc=Kc; g_pool_work.aVc=Vc; g_pool_work.aatt=att;
+    g_pool_work.apos=pos; g_pool_work.ascale=scale; g_pool_work.ahd=hd; g_pool_work.ankv=nkv;
+    g_pool_work.agpr=gpr; g_pool_work.actx=actx; g_pool_work.aattn_nt=attn_nt;
+    double _tdisp=gT_on?now():0;
+    atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release); /* wake workers 1..g_pool_nt-1 */
+    attn_worker_run(0); /* main thread does its own share (tn=0) */
+    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < g_pool_nt-1) { /* spin */ }
+    if(gT_on){
+        double maxw=0, sumqk=0,sumsm=0,sumav=0;
+        for(int i=0;i<attn_nt;i++){
+            double w=g_w_qk[i]+g_w_sm[i]+g_w_av[i]; if(w>maxw) maxw=w;
+            sumqk+=g_w_qk[i]; sumsm+=g_w_sm[i]; sumav+=g_w_av[i];
+        }
+        gT_attn_qk+=sumqk; gT_attn_sm+=sumsm; gT_attn_av+=sumav;
+        gT_attn_dispatch += (now()-_tdisp) - maxw;
+    }
 }
 /* SwiGLU (codex_recs_1.md §22.18): g_swiglu_fast selects exact SiLU(x)*u (default, `expf`-based,
  * matches the original engine exactly) or a candidate fast approximation, gated behind the flag
@@ -776,16 +864,27 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
             memcpy(Vc+(size_t)kvh*kv->ctx*hd+(size_t)pos*hd, vv+(size_t)kvh*hd, hd*4);
         }
         float scale=1.0f/sqrtf(hd); double _at=gT_on?now():0;
-        for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q+hh*hd,*sc=tmp;
-            float*Kh=Kc+(size_t)kvh*kv->ctx*hd,*Vh=Vc+(size_t)kvh*kv->ctx*hd;
-            double _tqk=gT_on?now():0;
-            for(int j=0;j<=pos;j++){ float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
-            double _tsm=gT_on?now():0; if(gT_on) gT_attn_qk += _tsm-_tqk;
-            softmax(sc,pos+1);
-            double _tav=gT_on?now():0; if(gT_on) gT_attn_sm += _tav-_tsm;
-            float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-            for(int j=0;j<=pos;j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
-            if(gT_on) gT_attn_av += now()-_tav; }
+        /* attention_optimization_plan.md Phase 3 (codex_recs_1.md §22.29): g_attn_nt<=1 (default)
+         * keeps this exact serial loop byte-for-byte, unchanged since Phase 2 -- zero risk to the
+         * already-verified path when parallelism is off. g_attn_nt>1 dispatches the same per-head
+         * work across the persistent pool via attn_dispatch, isolated from Phase 2 (layout already
+         * applied either way) and from Phase 4 (no GQA fusion -- each worker still does the exact
+         * same per-head QK/softmax/AV, just on a different thread, one KV head's worth per stride
+         * step, matching attn_worker_run's division). */
+        if(g_attn_nt<=1){
+            for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q+hh*hd,*sc=tmp;
+                float*Kh=Kc+(size_t)kvh*kv->ctx*hd,*Vh=Vc+(size_t)kvh*kv->ctx*hd;
+                double _tqk=gT_on?now():0;
+                for(int j=0;j<=pos;j++){ float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
+                double _tsm=gT_on?now():0; if(gT_on) gT_attn_qk += _tsm-_tqk;
+                softmax(sc,pos+1);
+                double _tav=gT_on?now():0; if(gT_on) gT_attn_sm += _tav-_tsm;
+                float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+                for(int j=0;j<=pos;j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
+                if(gT_on) gT_attn_av += now()-_tav; }
+        } else {
+            attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
+        }
         if(gT_on) gT_attn += now()-_at;
         g_lin_class=LIN_O; lin_mm(&ly->o,att,tmp,nt,Abuf); g_lin_class=LIN_NONE;
         for(int i=0;i<d;i++)h[i]+=tmp[i];
@@ -1337,6 +1436,16 @@ int main(int c,char**v){
      * KV cache to fit. Lets the same binary/build measure how the attention bucket scales with
      * context length without a second benchmark harness. */
     int ctxlen_req=0; { const char*cv=getenv("QWEN_CTXLEN"); if(cv) ctxlen_req=atoi(cv); }
+    /* QWEN_ATTN_NT (env var, same convention): number of pool threads that participate in
+     * attention (attention_optimization_plan.md Phase 3, codex_recs_1.md §22.29). DEFAULT since
+     * 2026-07-26 is min(nt,nkv) -- promoted after passing every predeclared keep criterion: tokens
+     * identical at every worker count and context tested, ASan+UBSan clean, attention bucket
+     * -74.4%/-74.9% at ctx=1024/512 (>=20% required), tok/s +160.4%/+117.1% (>=10% required),
+     * short-context wall time *improved* 8.25% (>=2% regression tolerated). `QWEN_ATTN_NT=1`
+     * remains an explicit serial revert flag, byte-identical to Phase 2's code path. Values above
+     * g_pool_nt are clamped (no more workers than exist). */
+    g_attn_nt = nt<m.nkv ? nt : m.nkv;
+    { const char*av=getenv("QWEN_ATTN_NT"); if(av){ g_attn_nt=atoi(av); if(g_attn_nt>nt) g_attn_nt=nt; if(g_attn_nt<1) g_attn_nt=1; } }
     /* ctx must cover prefill+ngen regardless of which prompt path is taken -- the default path's
      * prefill is a fixed 12 tokens (see `np` below), NOT just the QWEN_CTXLEN path. Previously only
      * the QWEN_CTXLEN branch grew ctx, so any ngen (2nd CLI arg, directly user-controlled, no
@@ -1384,9 +1493,15 @@ int main(int c,char**v){
         printf("  linear breakdown (avg/%ld tok, ms): qkv %.1f | o %.1f | expert(gate/up/down) %.1f | lm_head %.1f | sum %.1f\n",
             gT_tok, gT_lin_qkv/gT_tok*1e3, gT_lin_o/gT_tok*1e3, gT_lin_exp/gT_tok*1e3, gT_lin_lm/gT_tok*1e3,
             (gT_lin_qkv+gT_lin_o+gT_lin_exp+gT_lin_lm)/gT_tok*1e3);
-        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f | sum %.2f (attention bucket %.2f)\n",
+        /* At attn_nt=1 (serial), QK+softmax+AV+dispatch sums to ~the attention bucket, same
+         * reconciliation check as Phase 1. At attn_nt>1, QK/softmax/AV are summed CPU-time across
+         * all participating workers (so they naturally exceed wall-clock time by ~attn_nt) --
+         * "attention bucket" (gT_attn) is the true wall-clock figure and the one that matters for
+         * the A/B decision; "total work" is diagnostic (e.g. confirms parallel workers aren't
+         * doing duplicate work: it should stay close to the attn_nt=1 total, not grow with nt). */
+        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f (total work, %s) | dispatch %.2f | attention bucket (wall) %.2f, attn_nt=%d\n",
             gT_tok, gT_attn_qk/gT_tok*1e3, gT_attn_sm/gT_tok*1e3, gT_attn_av/gT_tok*1e3,
-            (gT_attn_qk+gT_attn_sm+gT_attn_av)/gT_tok*1e3, gT_attn/gT_tok*1e3);
+            g_attn_nt<=1?"= wall time":"summed across workers", gT_attn_dispatch/gT_tok*1e3, gT_attn/gT_tok*1e3, g_attn_nt);
     }
     if(g_router_validate){
         printf("  router int4-HP-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",

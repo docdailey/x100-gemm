@@ -228,9 +228,15 @@ per the execution directive, no layout/threading/fusion candidate is implemented
 | Head-major KV (T1) | 1024 | 140.84 | 79.79 | 162.50 | 383.32 | 463.2 | 2.16 | identical to baseline |
 | Head-major KV (T2) | 1024 | 140.30 | 79.91 | 164.36 | 384.79 | 464.4 | 2.15 | identical to baseline |
 | Head-major KV (avg) | 1024 | 140.57 | 79.85 | 163.43 | 384.06 | 463.8 | 2.16 | — |
-| Four KV-group workers | 128 | | | | | | | |
-| Four KV-group workers | 512 | | | | | | | |
-| Four KV-group workers | 1024 | | | | | | | |
+| Four KV-group workers (T1) | 128 | 20.54* | 9.41* | 21.59* | 13.95 | 92.7 | 10.79 | identical to baseline |
+| Four KV-group workers (T2) | 128 | 21.36* | 9.40* | 21.41* | 14.23 | 93.0 | 10.75 | identical to baseline |
+| Four KV-group workers (avg) | 128 | 20.95* | 9.41* | 21.50* | 14.09 | 92.85 | 10.77 | — |
+| Four KV-group workers (T1) | 512 | 78.16* | 35.06* | 79.39* | 50.83 | 129.7 | 7.71 | identical to baseline |
+| Four KV-group workers (T2) | 512 | 75.52* | 34.96* | 78.41* | 49.83 | 129.0 | 7.75 | identical to baseline |
+| Four KV-group workers (avg) | 512 | 76.84* | 35.01* | 78.90* | 50.33 | 129.35 | 7.73 | — |
+| Four KV-group workers (T1) | 1024 | 149.86* | 69.17* | 154.29* | 98.34 | 177.6 | 5.63 | identical to baseline |
+| Four KV-group workers (T2) | 1024 | 150.94* | 69.16* | 153.41* | 98.50 | 178.0 | 5.62 | identical to baseline |
+| Four KV-group workers (avg) | 1024 | 150.40* | 69.17* | 153.85* | 98.42 | 177.8 | 5.625 | — |
 | Fused multi-Q QK | 512 | | | | | | | |
 | Fused multi-Q QK | 1024 | | | | | | | |
 | Fused multi-Q AV | 512 | | | | | | | |
@@ -281,8 +287,45 @@ pre-Phase-2 commit) as the revert reference, matching this session's established
 §22.14 scheduling A/B) of keeping a scratch comparison copy rather than committing it to the repo.
 Full writeup in `codex_recs_1.md` §22.28.
 
-**Per the execution directive, still no threading or GQA fusion** — Phase 3 (four KV-group
-workers) is the next candidate, not started, and is a separate decision from this one.
+**Phase 3 result (2026-07-26): KEPT — explicit authorization, Phase 3 only, isolated from GQA
+fusion.** `*` in the scoreboard above marks QK/softmax/AV values that are **summed CPU-time across
+all participating workers**, not directly wall-time-comparable once threaded (they naturally scale
+up with worker count since more workers means more total concurrent compute-seconds, even though
+wall-clock drops) — the **Attention ms** column remains the true wall-clock figure and the one
+comparable across every phase.
+
+| | 128 | 512 | 1024 |
+|---|---|---|---|
+| attention bucket | 56.40→14.09ms (**-75.0%**) | 201.14→50.33ms (**-75.0%**) | 384.06→98.42ms (**-74.4%**) |
+| wall/token | 135.3→92.85ms (-31.4%) | 280.4→129.35ms (-53.9%) | 463.8→177.8ms (-61.7%) |
+| tok/s | 7.39→10.77 (**+45.7%**) | 3.56→7.73 (**+117.1%**) | 2.16→5.625 (**+160.4%**) |
+
+Short-context (canonical 12-token prompt, 2 paired trials): wall time 88.45ms (Phase 2 baseline,
+attn_nt=1) → 81.15ms, an **8.25% improvement** — comfortably clears "no more than 2% regression."
+All five predeclared keep criteria met: tokens identical at every worker count (1/2/4) and context
+tested; ASan clean on a bounded ctx=256/ngen=24 run at attn_nt=2 and attn_nt=4; UBSan clean at
+attn_nt=4; attention-bucket reduction 75.0%/74.4% at ctx=512/1024, both far past the 20% floor;
+end-to-end tok/s improvement 117.1%/160.4%, both far past the 10% floor; short-context improved
+rather than regressed. Dispatch/sync overhead is tiny (0.09-1.14ms across every configuration
+tested) — parallelization is not paying a meaningful coordination tax.
+
+**Four-KV-group worker parallelism is now the production attention path**: `g_attn_nt` defaults to
+`min(nt,nkv)` (=4 at the standard `nt=4` config), set once `m.nkv` is known in `main()`.
+`QWEN_ATTN_NT=1` remains an explicit serial revert flag, byte-identical to the Phase 2 code path.
+Full writeup in `codex_recs_1.md` §22.29.
+
+**As explicitly directed: softmax (Phase 5) remains deferred despite a small regression.** Softmax's
+own summed-work total grew slightly in absolute terms through Phases 2-3 while QK/AV's wall-clock
+contribution collapsed (e.g. ctx=1024: 69.31ms at the Phase 1 baseline → 69.17ms total-work at
+Phase 3 — essentially flat in absolute terms, but now a much larger *relative* share of a bucket
+that shrank by 74%, since QK/AV no longer dwarf it the way they did in Phase 1). This is exactly
+the kind of change Phase 5 exists to eventually address, but per direction it stays deferred: no
+exponential approximation, no work here, until specifically authorized.
+
+**Per the execution directive, still no GQA fusion.** Phase 4 (exact GQA-fused kernels — eliminating
+the 8x redundant K/V re-reads across query heads sharing a KV head, per the Phase 1 baseline's
+co-dominant-QK/AV reading) is the next identified opportunity, not started, and is a separate
+decision from this one.
 
 ## Stop conditions
 
@@ -297,4 +340,12 @@ Do not combine layout, threading, and fused kernels into one patch.
 
 ## Immediate next action
 
-Implement Phase 1 instrumentation only. Establish QK, softmax, and AV costs at contexts 128, 512, and 1024 before changing the KV layout or attention implementation. Then perform the isolated head-major KV-layout A/B described in Phase 2.
+Phase 1 (instrumentation + baseline) and Phase 2 (head-major KV layout) are both complete and kept
+— see the scoreboard above and `codex_recs_1.md` §22.27-§22.29. Phase 3 (four-KV-group worker
+parallelism) is also complete and kept, per explicit authorization to proceed with Phase 3 only,
+isolated from GQA fusion, with softmax deferred despite its small regression (see the Phase 3
+result note below the scoreboard). **Next: Phase 4 (exact GQA-fused kernels) is the identified
+larger opportunity** — QK and AV were co-dominant in the Phase 1 baseline (§22.27), and both
+directions still redundantly re-read the same K/V once per query head sharing a KV head (8x
+redundant reads) even after Phase 2/3; fusing across the 8 query heads per KV group is the next
+candidate to isolate and A/B, not yet started. Softmax (Phase 5) remains explicitly deferred.
