@@ -339,10 +339,11 @@ scratch (`gpr×ctx`) because all query heads' scores for a KV head finish togeth
 Standalone probe (`bench/qk_multiq_probe.c`) and production integration validation
 (`QWEN_QK_VALIDATE=1`, 60,426,240 real-dispatch comparisons) both report max_abs=0 / max_rel=0.
 
-ASan and UBSan clean at `-O2` (production uses `-O3`); UBSan at `-O1` hit a compiler
-register-pressure crash on 8 live RVV accumulators that does not reproduce at `-O2`/`-O3` — same
-class of GCC/RVV interaction already documented for this file. Tokens byte-identical fuse0↔fuse1 at
-every context and the canonical short prompt.
+ASan and UBSan clean at `-O2` (production uses `-O3`); UBSan at `-O1` hit a page-fault crash on 8
+live RVV accumulators that did not reproduce at `-O2`/`-O3` — suspected but not confirmed to be a
+compiler code-generation issue (same class of GCC/RVV interaction already documented for this
+file), not established causation. Tokens byte-identical fuse0↔fuse1 at every context and the
+canonical short prompt.
 
 | | short | 128 | 512 | 1024 |
 |---|---|---|---|---|

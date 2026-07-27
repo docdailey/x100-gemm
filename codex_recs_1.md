@@ -2663,10 +2663,12 @@ var (same convention as `QWEN_ATTN_NT`/`QWEN_CTXLEN`).
    every real attention call, diffs post-scale pre-softmax scores): **60,426,240 comparisons, 0
    mismatches, max_abs=0, max_rel=0**.
 3. ASan clean on bounded `ctx=256/ngen=24` with `QWEN_QK_FUSE=1` (multiple trials; production-opt
-   levels). ASan/`-O1` had earlier intermittent faults traced to a racy temporary debug print
-   (removed) plus an `-O1`-specific UBSan page-fault on 8 live RVV accumulators that does **not**
-   reproduce at `-O2`/`-O3` — same GCC/RVV interaction class already documented for this file
-   (§22.16). Production builds with `-O3 -fno-tree-vectorize`.
+   levels). ASan/`-O1` had earlier intermittent faults traced to a racy temporary debug print,
+   which was removed (3/3 clean ASan-`-O1` runs afterward). A separate, later UBSan-`-O1` page-fault
+   on 8 live RVV accumulators was not explained by that fix — it did not reproduce at `-O2`/`-O3`
+   under either sanitizer, which is suspected but not confirmed to be a compiler code-generation
+   issue (the same GCC/RVV interaction class already documented for this file, §22.16), not
+   established causation. Production builds with `-O3 -fno-tree-vectorize`.
 4. UBSan clean at `-O2` with `QWEN_QK_FUSE=1` on the same bounded test.
 5. Token identity: first-argmax and full generation strings byte-identical fuse0↔fuse1 at the
    canonical short prompt (`' Tokyo'` PASS) and at every long-context A/B trial.
