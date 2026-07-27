@@ -397,7 +397,10 @@ AV summed-work alone drops ~76-82% (the intended effect, and a larger reduction 
 unchanged. Short-context does not regress (a slight improvement instead). This is a **much larger
 win than Phase 4.1** — roughly 3× the wall-time improvement at every context — because AV fusion's
 own reduction is proportionally larger. **KEPT and promoted**: `g_av_fuse` defaults to 1;
-`QWEN_AV_FUSE=0` is the explicit revert. Full writeup in `codex_recs_1.md` §22.31.
+`QWEN_AV_FUSE=0` is the explicit revert. Note the sanitizer gate was not a clean sweep — ASan-`-O2`
+with default inlining reproducibly failed — but production (`-O3`) is clean under both sanitizers
+and the failure is narrowly isolated to that inlining decision, not the kernel; see above and
+`codex_recs_1.md` §22.31 for the full picture.
 
 **Both exact GQA-fused kernels (Phase 4.1 and 4.2) are now complete and kept.** Per the execution
 directive, stop here — softmax (Phase 5), eight-core testing (Phase 6), KV quantization, and

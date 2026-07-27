@@ -1714,8 +1714,9 @@ int main(int c,char**v){
      * change. */
     { const char*qv=getenv("QWEN_QK_VALIDATE"); if(qv) g_qk_validate=atoi(qv); }
     /* QWEN_AV_FUSE (env var, same convention): Phase 4.2 multi-Q AV (attention_optimization_plan.md,
-     * codex_recs_1.md §22.31), under A/B -- default 0 (unfused, Phase 4.1 code path). Only takes
-     * effect when QWEN_QK_FUSE is also 1 (see g_av_fuse's own comment for why). */
+     * codex_recs_1.md §22.31), KEPT after A/B -- default is now 1 (fused). QWEN_AV_FUSE=0 is the
+     * explicit unfused revert to the Phase 4.1 code path. Only takes effect when QWEN_QK_FUSE is
+     * also 1 (see g_av_fuse's own comment for why). */
     { const char*vf=getenv("QWEN_AV_FUSE"); if(vf) g_av_fuse=atoi(vf); }
     /* QWEN_AV_VALIDATE=1 (env var, same convention): integration validation for Phase 4.2, mirrors
      * QWEN_QK_VALIDATE -- runs both AV modes on every real attention dispatch, diffing the real

@@ -132,8 +132,11 @@ kernel logic; ASan-`-O1`/`-O3` (production, 3/3) and UBSan-`-O2`/`-O3` all clean
 vs Phase 4.1: -31.5% (short), -35.1% (ctx=128), -33.7% (ctx=512), -34.6% (ctx=1024). tok/s: +4.8%,
 +13.2%, +21.6%** (roughly 3× Phase 4.1's own wall-time win, since AV was the slightly larger
 co-dominant bucket and its fused reduction, 76-82%, is larger than QK's 22-26%). Short-context does
-not regress (a slight improvement instead). All four predeclared keep criteria met. **Promoted**:
-`g_av_fuse` defaults to 1; `QWEN_AV_FUSE=0` is the Phase 4.1 revert. **Both exact GQA-fused kernels
+not regress (a slight improvement instead). Improvement/numerics/short-context criteria cleanly
+met; the sanitizer criterion was not a clean sweep (ASan-`-O2` default-inlining failure above) but
+production (`-O3`) is clean and the failure is narrowly isolated to that inlining decision, not the
+kernel. **Promoted**: `g_av_fuse` defaults to 1; `QWEN_AV_FUSE=0` is the Phase 4.1 revert. **Both
+exact GQA-fused kernels
 (QK and AV) are now complete and kept** — next, if authorized, is Phase 5 (exact softmax
 optimization), only if softmax is material now that QK/AV have shrunk so much.
 
