@@ -663,6 +663,52 @@ static void vaxpy_f32(float*y,const float*x,float scale,int n){
         vy=__riscv_vfmacc_vf_f32m1(vy,scale,vx,vl);
         __riscv_vse32_v_f32m1(y+i,vy,vl); i+=vl; }
 }
+/* attention_optimization_plan.md Phase 4.2 (codex_recs_1.md §22.31): multi-Q AV, exact GQA reuse
+ * on V. For a fixed KV head, the unfused AV loop calls vaxpy_f32(oh,vj,sc[j],hd) once per (query
+ * head, position) pair, re-reading the SAME vj (V vector at position j) from memory up to 8 times
+ * per position -- the AV-side analog of qk8_dot's redundant K re-reads. This kernel instead
+ * processes ONE hd-chunk (32 lanes) at a time across the WHOLE position loop, holding 8 named
+ * accumulators (one per query head) live in registers for that chunk, loading each V chunk once
+ * per position and using it to update all 8 accumulators before advancing to the next position;
+ * only after the full position sweep for that chunk does it write the 8 accumulators back to
+ * memory. Chunk-outer/position-inner (rather than qk8_dot's single-position/chunk-inner) because
+ * AV's reduction axis is position, not head_dim -- the accumulator must live across the position
+ * loop, not be reduced away within one. Holding only 8 accumulators live at a time (never 8 heads
+ * x 4 chunks = 32 at once) keeps the same register-pressure profile as qk8_dot, already known-good
+ * at -O3 (the production optimization level) after Phase 4.1's sanitizer work.
+ *
+ * Per-query-head numerics are intentionally IDENTICAL to vaxpy_f32: for any fixed query head and
+ * hd-chunk, the accumulation order across positions (j=0,1,2,...,pos) is unchanged from the
+ * unfused loop -- IEEE-754 addition order determines the result exactly, and holding a running sum
+ * in a register instead of round-tripping it through memory each iteration does not change that
+ * order. Expected bit-exact to the unfused path -- verified, not just assumed, in
+ * bench/av_multiq_probe.c before this is trusted. Writes oh[qi][coff..coff+vl) directly (not an
+ * accumulate-into-existing-memory), so callers do not need to pre-zero oh before calling this for
+ * every hd-chunk. */
+static void av8_chunk(const float*const scw[QK8_MAXGPR],const float*Vh,int hd,int pos,int gpr,
+        float*const oh[QK8_MAXGPR],int coff,size_t vl){
+    vfloat32m1_t z=__riscv_vfmv_v_f_f32m1(0.0f,vl);
+    vfloat32m1_t a0=z,a1=z,a2=z,a3=z,a4=z,a5=z,a6=z,a7=z;
+    for(int j=0;j<=pos;j++){
+        vfloat32m1_t vv=__riscv_vle32_v_f32m1(Vh+(size_t)j*hd+coff,vl); /* V chunk loaded ONCE */
+        if(gpr>0) a0=__riscv_vfmacc_vf_f32m1(a0,scw[0][j],vv,vl);
+        if(gpr>1) a1=__riscv_vfmacc_vf_f32m1(a1,scw[1][j],vv,vl);
+        if(gpr>2) a2=__riscv_vfmacc_vf_f32m1(a2,scw[2][j],vv,vl);
+        if(gpr>3) a3=__riscv_vfmacc_vf_f32m1(a3,scw[3][j],vv,vl);
+        if(gpr>4) a4=__riscv_vfmacc_vf_f32m1(a4,scw[4][j],vv,vl);
+        if(gpr>5) a5=__riscv_vfmacc_vf_f32m1(a5,scw[5][j],vv,vl);
+        if(gpr>6) a6=__riscv_vfmacc_vf_f32m1(a6,scw[6][j],vv,vl);
+        if(gpr>7) a7=__riscv_vfmacc_vf_f32m1(a7,scw[7][j],vv,vl);
+    }
+    if(gpr>0) __riscv_vse32_v_f32m1(oh[0]+coff,a0,vl);
+    if(gpr>1) __riscv_vse32_v_f32m1(oh[1]+coff,a1,vl);
+    if(gpr>2) __riscv_vse32_v_f32m1(oh[2]+coff,a2,vl);
+    if(gpr>3) __riscv_vse32_v_f32m1(oh[3]+coff,a3,vl);
+    if(gpr>4) __riscv_vse32_v_f32m1(oh[4]+coff,a4,vl);
+    if(gpr>5) __riscv_vse32_v_f32m1(oh[5]+coff,a5,vl);
+    if(gpr>6) __riscv_vse32_v_f32m1(oh[6]+coff,a6,vl);
+    if(gpr>7) __riscv_vse32_v_f32m1(oh[7]+coff,a7,vl);
+}
 /* attention_optimization_plan.md Phase 3 (codex_recs_1.md §22.29): four-KV-group worker
  * parallelism, reusing the persistent pool -- no new threads. Isolated from Phase 4 (GQA fusion):
  * each worker still does the exact same per-head QK/softmax/AV as the Phase 2 serial code, just on
@@ -700,6 +746,16 @@ static int g_qk_fuse=1;
  * mode, on the SAME real activations, and diff the two captures. NULL (default) costs one branch
  * per QK write, negligible, and is what every production/benchmark run uses. */
 static float* g_qk_capture=NULL;
+/* g_av_fuse: Phase 4.2 fused multi-Q AV (codex_recs_1.md §22.31), KEPT after A/B -- default is now
+ * 1 (fused, av8_chunk). 0 = byte-for-byte the Phase 4.1 code path below, kept as the explicit
+ * revert path. Only meaningful inside the g_qk_fuse==1 branch: AV fusion needs all gpr query
+ * heads' softmax weights ready before it starts, which is only true once QK has already been
+ * computed for the whole KV head (the fused-QK branch's structure), not in the unfused-QK branch
+ * where each head's own softmax+AV happens immediately after that head's own QK. Set via
+ * QWEN_AV_FUSE env var, same convention as QWEN_QK_FUSE. A/B (2 trials, short/128/512/1024): wall
+ * time -0.2%/-4.5%/-11.6%/-17.8%, attn bucket -31.5%/-35.1%/-33.7%/-34.6%, token-identical,
+ * 0/55,050,240 integration-validation mismatches. */
+static int g_av_fuse=1;
 static void attn_scratch_ensure(int ctx){
     if(g_attn_scratch_ctx>=ctx) return;
     for(int i=0;i<MAXNT;i++){ free(g_attn_scratch[i]); g_attn_scratch[i]=malloc((size_t)ctx*4); }
@@ -735,15 +791,28 @@ static void attn_worker_run(int tn){
                 }
             }
             double t1=gT_on?now():0; if(gT_on) qk+=t1-t0;
-            for(int qi=0;qi<gpr;qi++){
-                int hh=kvh*gpr+qi; float*sc=scm+(size_t)qi*actx;
-                double ts0=gT_on?now():0;
-                softmax(sc,pos+1);
-                double ts1=gT_on?now():0; if(gT_on) sm+=ts1-ts0;
-                float*oh=att+(size_t)hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-                for(int j=0;j<=pos;j++){ const float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
-                if(gT_on) av += now()-ts1;
+            for(int qi=0;qi<gpr;qi++) softmax(scm+(size_t)qi*actx,pos+1);
+            double t2=gT_on?now():0; if(gT_on) sm+=t2-t1;
+            if(g_av_fuse){
+                /* Phase 4.2 (codex_recs_1.md §22.31): all gpr heads' softmax weights for this KV
+                 * head are ready together (unlike the unfused branch below), so AV can process all
+                 * 8 output heads per hd-chunk, loading each V chunk once instead of gpr times. */
+                const float*scw[QK8_MAXGPR]; float*ohp[QK8_MAXGPR];
+                for(int qi=0;qi<gpr;qi++){ ohp[qi]=att+(size_t)(kvh*gpr+qi)*hd; scw[qi]=scm+(size_t)qi*actx; }
+                int coff=0;
+                while(coff<hd){
+                    size_t vl=__riscv_vsetvl_e32m1(hd-coff);
+                    av8_chunk(scw,Vh,hd,pos,gpr,ohp,coff,vl);
+                    coff+=(int)vl;
+                }
+            } else {
+                for(int qi=0;qi<gpr;qi++){
+                    int hh=kvh*gpr+qi; float*sc=scm+(size_t)qi*actx;
+                    float*oh=att+(size_t)hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+                    for(int j=0;j<=pos;j++){ const float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
+                }
             }
+            if(gT_on) av += now()-t2;
         }
     } else {
         /* Phase 3 code, unchanged -- explicit revert path when g_qk_fuse==0. */
@@ -828,6 +897,38 @@ static void attn_qk_validate_and_dispatch(const float*q,const float*Kc,const flo
     }
     g_qk_capture=NULL; g_qk_fuse=real_fuse;
     if(real_fuse!=1) attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,actx,attn_nt); /* leave att correct for the configured mode -- the fused call above is only reused as-is when real_fuse==1 */
+}
+/* Phase 4.2 integration validation (codex_recs_1.md §22.31): simpler than the QK version above --
+ * AV's fused output goes directly into the real `att` buffer already (no intermediate quantity
+ * needs a separate capture hook), so this just runs the real attn_dispatch path twice into two
+ * SEPARATE output buffers, once per mode, on the same real q/Kc/Vc from actual decode, and diffs
+ * the two buffers directly. */
+static int g_av_validate=0; /* set via QWEN_AV_VALIDATE=1 */
+static float *g_avval_unfused=NULL, *g_avval_fused=NULL; static int g_avval_cap=0;
+static long g_avval_cmp=0, g_avval_mismatch=0; static double g_avval_max_abs=0, g_avval_max_rel=0;
+static void attn_av_validate_and_dispatch(const float*q,const float*Kc,const float*Vc,float*att,int pos,float scale,
+        int hd,int nkv,int gpr,int actx,int attn_nt){
+    int nh=nkv*gpr;
+    if(g_avval_cap < nh*hd){
+        free(g_avval_unfused); free(g_avval_fused);
+        g_avval_unfused=malloc((size_t)nh*hd*4); g_avval_fused=malloc((size_t)nh*hd*4);
+        g_avval_cap=nh*hd;
+    }
+    int real_av=g_av_fuse; /* whatever the run is actually configured to use */
+
+    g_av_fuse=0; attn_dispatch(q,Kc,Vc,g_avval_unfused,pos,scale,hd,nkv,gpr,actx,attn_nt);
+    g_av_fuse=1; attn_dispatch(q,Kc,Vc,g_avval_fused,pos,scale,hd,nkv,gpr,actx,attn_nt);
+
+    for(int i=0;i<nh*hd;i++){
+        double u=g_avval_unfused[i], f=g_avval_fused[i];
+        double ad=fabs(u-f); double rd=fabs(u)>1e-12?ad/fabs(u):ad;
+        if(ad>g_avval_max_abs) g_avval_max_abs=ad;
+        if(rd>g_avval_max_rel) g_avval_max_rel=rd;
+        if(ad>1e-4) g_avval_mismatch++;
+        g_avval_cmp++;
+    }
+    g_av_fuse=real_av;
+    memcpy(att, real_av?g_avval_fused:g_avval_unfused, (size_t)nh*hd*4); /* leave att correct for the configured mode -- reuse rather than a third dispatch */
 }
 /* SwiGLU (codex_recs_1.md §22.18): g_swiglu_fast selects exact SiLU(x)*u (default, `expf`-based,
  * matches the original engine exactly) or a candidate fast approximation, gated behind the flag
@@ -1033,6 +1134,8 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
                 if(gT_on) gT_attn_av += now()-_tav; }
         } else if(g_qk_validate){
             attn_qk_validate_and_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
+        } else if(g_av_validate){
+            attn_av_validate_and_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         } else {
             attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         }
@@ -1610,6 +1713,14 @@ int main(int c,char**v){
      * the actually-configured mode still wins, validation is a side comparison, not a behavior
      * change. */
     { const char*qv=getenv("QWEN_QK_VALIDATE"); if(qv) g_qk_validate=atoi(qv); }
+    /* QWEN_AV_FUSE (env var, same convention): Phase 4.2 multi-Q AV (attention_optimization_plan.md,
+     * codex_recs_1.md §22.31), under A/B -- default 0 (unfused, Phase 4.1 code path). Only takes
+     * effect when QWEN_QK_FUSE is also 1 (see g_av_fuse's own comment for why). */
+    { const char*vf=getenv("QWEN_AV_FUSE"); if(vf) g_av_fuse=atoi(vf); }
+    /* QWEN_AV_VALIDATE=1 (env var, same convention): integration validation for Phase 4.2, mirrors
+     * QWEN_QK_VALIDATE -- runs both AV modes on every real attention dispatch, diffing the real
+     * output buffers. Not meant to be left on during the real A/B. */
+    { const char*vv=getenv("QWEN_AV_VALIDATE"); if(vv) g_av_validate=atoi(vv); }
     /* ctx must cover prefill+ngen regardless of which prompt path is taken -- the default path's
      * prefill is a fixed 12 tokens (see `np` below), NOT just the QWEN_CTXLEN path. Previously only
      * the QWEN_CTXLEN branch grew ctx, so any ngen (2nd CLI arg, directly user-controlled, no
@@ -1663,9 +1774,9 @@ int main(int c,char**v){
          * "attention bucket" (gT_attn) is the true wall-clock figure and the one that matters for
          * the A/B decision; "total work" is diagnostic (e.g. confirms parallel workers aren't
          * doing duplicate work: it should stay close to the attn_nt=1 total, not grow with nt). */
-        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f (total work, %s) | dispatch %.2f | attention bucket (wall) %.2f, attn_nt=%d, qk_fuse=%d\n",
+        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f (total work, %s) | dispatch %.2f | attention bucket (wall) %.2f, attn_nt=%d, qk_fuse=%d, av_fuse=%d\n",
             gT_tok, gT_attn_qk/gT_tok*1e3, gT_attn_sm/gT_tok*1e3, gT_attn_av/gT_tok*1e3,
-            g_attn_nt<=1?"= wall time":"summed across workers", gT_attn_dispatch/gT_tok*1e3, gT_attn/gT_tok*1e3, g_attn_nt, g_qk_fuse);
+            g_attn_nt<=1?"= wall time":"summed across workers", gT_attn_dispatch/gT_tok*1e3, gT_attn/gT_tok*1e3, g_attn_nt, g_qk_fuse, g_av_fuse);
     }
     if(g_router_validate){
         printf("  router int4-HP-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
@@ -1676,6 +1787,10 @@ int main(int c,char**v){
     if(g_qk_validate){
         printf("  qk_fuse integration validate: %ld comparisons, %ld mismatches(>1e-4 abs), max_abs=%e, max_rel=%e -- %s\n",
             g_qkval_cmp, g_qkval_mismatch, g_qkval_max_abs, g_qkval_max_rel, g_qkval_mismatch==0?"PASS":"FAIL");
+    }
+    if(g_av_validate){
+        printf("  av_fuse integration validate: %ld comparisons, %ld mismatches(>1e-4 abs), max_abs=%e, max_rel=%e -- %s\n",
+            g_avval_cmp, g_avval_mismatch, g_avval_max_abs, g_avval_max_rel, g_avval_mismatch==0?"PASS":"FAIL");
     }
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;

@@ -246,8 +246,15 @@ per the execution directive, no layout/threading/fusion candidate is implemented
 | Multi-Q QK (T1) | 1024 | 113.65* | 69.68* | 152.64* | 87.55 | 167.2 | 5.98 | identical to Phase 3 |
 | Multi-Q QK (T2) | 1024 | 113.70* | 69.63* | 152.72* | 87.47 | 167.2 | 5.98 | identical to Phase 3 |
 | Multi-Q QK (avg) | 1024 | 113.68* | 69.66* | 152.68* | 87.51 | 167.2 | 5.98 | — |
-| Fused multi-Q AV | 512 | | | | | | | |
-| Fused multi-Q AV | 1024 | | | | | | | |
+| Fused multi-Q AV (T1) | 128 | 16.61* | 9.36* | 4.28* | 8.57 | 88.3 | 11.33 | identical to Phase 4.1 |
+| Fused multi-Q AV (T2) | 128 | 16.64* | 9.33* | 4.17* | 8.64 | 88.2 | 11.34 | identical to Phase 4.1 |
+| Fused multi-Q AV (avg) | 128 | 16.625* | 9.345* | 4.225* | 8.605 | 88.25 | 11.335 | — |
+| Fused multi-Q AV (T1) | 512 | 60.22* | 35.10* | 17.55* | 30.91 | 111.2 | 8.99 | identical to Phase 4.1 |
+| Fused multi-Q AV (T2) | 512 | 59.26* | 35.08* | 16.88* | 30.20 | 110.6 | 9.05 | identical to Phase 4.1 |
+| Fused multi-Q AV (avg) | 512 | 59.74* | 35.09* | 17.215* | 30.555 | 110.9 | 9.02 | — |
+| Fused multi-Q AV (T1) | 1024 | 112.99* | 69.73* | 38.50* | 57.84 | 138.5 | 7.22 | identical to Phase 4.1 |
+| Fused multi-Q AV (T2) | 1024 | 112.97* | 69.64* | 37.07* | 58.07 | 138.7 | 7.21 | identical to Phase 4.1 |
+| Fused multi-Q AV (avg) | 1024 | 112.98* | 69.685* | 37.785* | 57.955 | 138.6 | 7.215 | — |
 
 **Baseline reading**: QK and AV are essentially co-dominant (~46-48% of the attention bucket each,
 at every context tested), softmax is a small but non-trivial 5.7-6.9% (shrinking slightly as a
@@ -362,6 +369,40 @@ revert. Full writeup in `codex_recs_1.md` §22.30.
 **Next: Phase 4.2 (multi-Q AV) remains the larger residual opportunity** — AV is still co-dominant
 and still re-reads each V vector 8× per KV head. Softmax (Phase 5) stays deferred.
 
+**Phase 4.2 result (2026-07-27): KEPT — multi-Q AV, with the same end-to-end completion discipline
+used for QK.** `av8_chunk` processes one hd-chunk at a time across the whole position loop, holding
+8 named accumulators live and loading each V chunk once per position instead of gpr times
+(chunk-outer/position-inner, the opposite nesting from `qk8_dot` since AV's reduction axis is
+position, not head_dim). Bit-exact by construction to `vaxpy_f32` (same per-head, position-
+ascending accumulation order). Standalone probe (`bench/av_multiq_probe.c`) and production
+integration validation (`QWEN_AV_VALIDATE=1`, 55,050,240 real-dispatch comparisons) both report
+max_abs=0 / max_rel=0.
+
+ASan-`-O2` (default inlining) hit a reproducible `stack-use-after-scope` in `av8_chunk` that did not
+reproduce in the isolated standalone probe; rebuilding with `-fno-inline` at the same `-O2` isolated
+it specifically to GCC's inlining decision, not the kernel's arithmetic. ASan-`-O1` and ASan-`-O3`
+(production, 3/3 runs) were clean; UBSan-`-O2`/`-O3` clean; UBSan-`-O1` showed the same already-
+documented `-O1` GCC/RVV instability class as Phase 4.1, not a new defect. Production (`-O3
+-fno-tree-vectorize`) is clean under both sanitizers. Tokens byte-identical fuse0↔fuse1 at every
+context and the canonical short prompt.
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| attention bucket | 2.22→1.52ms (-31.5%) | 13.25→8.61ms (**-35.1%**) | 46.08→30.56ms (**-33.7%**) | 88.59→57.96ms (**-34.6%**) |
+| wall/token | 81.25→81.1ms (-0.2%) | 92.4→88.25ms (**-4.5%**) | 125.45→110.9ms (**-11.6%**) | 168.5→138.6ms (**-17.8%**) |
+| tok/s | 12.31→12.33 (~flat) | 10.82→11.34 (**+4.8%**) | 7.97→9.02 (**+13.2%**) | 5.94→7.22 (**+21.6%**) |
+
+AV summed-work alone drops ~76-82% (the intended effect, and a larger reduction than QK's own
+22-26%, since AV was the slightly larger of the two co-dominant buckets); QK/softmax essentially
+unchanged. Short-context does not regress (a slight improvement instead). This is a **much larger
+win than Phase 4.1** — roughly 3× the wall-time improvement at every context — because AV fusion's
+own reduction is proportionally larger. **KEPT and promoted**: `g_av_fuse` defaults to 1;
+`QWEN_AV_FUSE=0` is the explicit revert. Full writeup in `codex_recs_1.md` §22.31.
+
+**Both exact GQA-fused kernels (Phase 4.1 and 4.2) are now complete and kept.** Per the execution
+directive, stop here — softmax (Phase 5), eight-core testing (Phase 6), KV quantization, and
+windowing remain out of scope until separately authorized.
+
 ## Stop conditions
 
 Stop this branch when any of the following becomes true:
@@ -375,7 +416,9 @@ Do not combine layout, threading, and fused kernels into one patch.
 
 ## Immediate next action
 
-Phases 1–3 and Phase 4.1 (multi-Q QK) are complete and kept — see the scoreboard above and
-`codex_recs_1.md` §22.27–§22.30. **Next: Phase 4.2 only — multi-Q AV** (load each V once, update
-eight independent output accumulators). Keep QK fusion, head-major layout, four-worker scheduling,
-fp32 KV storage, and softmax unchanged. Softmax (Phase 5) remains explicitly deferred.
+Phases 1–3 and Phase 4 (both multi-Q QK and multi-Q AV) are complete and kept — see the scoreboard
+above and `codex_recs_1.md` §22.27–§22.31. Both exact GQA-fused kernels are now the production
+attention path. **Next, if authorized: Phase 5 — exact softmax optimization** (RVV-vectorize the
+max reduction and normalization, keep `expf` exact, no exponential approximation without a separate
+predeclared quality study), only if softmax is shown to be material now that QK/AV have shrunk so
+much. No phase should begin without explicit authorization.

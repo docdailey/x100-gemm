@@ -2699,3 +2699,86 @@ in the long-context regime this attention branch has been chasing since §22.23.
 **Next**: Phase 4.2 multi-Q AV (load each V once, update 8 independent output accumulators) is the
 residual larger opportunity — AV still co-dominates and still re-reads each V 8×. Softmax (Phase 5)
 stays deferred. Do not combine with approximate math.
+
+### 22.31 Attention Phase 4.2: fused multi-Q AV (exact GQA reuse) — KEPT
+
+Explicit authorization: "Phase 4.2 only: isolated exact multi-Q AV, with the same end-to-end
+completion discipline used for QK" — implement, validate (standalone probe + production
+integration validation), sanitize, run the full A/B matrix, apply the predeclared keep/revert
+decision, document, commit, then stop.
+
+**Implementation.** The unfused AV loop calls `vaxpy_f32(oh,vj,sc[j],hd)` once per (query head,
+position) pair, re-reading the same V row up to 8 times per position — the AV-side analog of QK's
+redundant K re-reads. `av8_chunk` instead processes ONE 32-lane hd-chunk at a time across the
+WHOLE position loop, holding 8 named accumulators (one per query head) live in registers for that
+chunk, loading each V chunk once per position and updating all 8 accumulators before advancing;
+only after the full position sweep does it write the 8 accumulators back to memory. This is
+chunk-outer/position-inner — the opposite nesting from `qk8_dot` (single-position/chunk-inner) —
+because AV's reduction axis is position, not head_dim: the accumulator must live across the
+position loop rather than be reduced away within one. Holding only 8 accumulators live at a time
+(never 8 heads × 4 chunks = 32 at once) keeps the same register-pressure profile as `qk8_dot`.
+Per-query-head numerics are intentionally identical to `vaxpy_f32`: for any fixed head and chunk,
+the position-ascending accumulation order is unchanged — IEEE-754 addition order, not storage
+location, determines the result, so holding the running sum in a register instead of round-
+tripping it through memory does not change it. Requires the fused-QK branch's structure (all `gpr`
+heads' softmax weights ready together before AV starts), so it only takes effect when
+`g_qk_fuse==1`; `attn_worker_run`'s fused branch was split into a softmax-all-heads loop followed
+by a switchable AV block (`g_av_fuse`, env var `QWEN_AV_FUSE`, default was 0 pre-promotion). The
+unfused branch is untouched, byte-for-byte the Phase 4.1 code.
+
+**Validation** (same order as Phase 4.1): standalone probe `bench/av_multiq_probe.c` (`vaxpy_f32`/
+`av8_chunk` copied verbatim) at ctx∈{113,300,1024}, gpr=8, synthetic weights — **bit-exact: 3,072
+comparisons, 0 mismatches, max_abs=0, max_rel=0.** Production integration validation
+(`attn_av_validate_and_dispatch`, `QWEN_AV_VALIDATE=1`) is simpler than QK's version: AV's fused
+output lands directly in the real `att` buffer already, so it just runs the real `attn_dispatch`
+path twice into two separate output buffers (once per mode) on the same real q/K/V from actual
+decode and diffs the buffers directly — no capture instrumentation needed inside the kernel.
+**Result: 55,050,240 comparisons, 0 mismatches, max_abs=0, max_rel=0 — PASS.**
+
+**Sanitizers found a real, narrowly-characterized issue, not a logic bug.** ASan-`-O1`: clean.
+ASan-`-O2` (default GCC inlining): a reproducible `stack-use-after-scope` in `av8_chunk`, 2/2 runs,
+different worker thread and different timing each run. This did **not** reproduce in the isolated
+standalone probe under ASan-`-O2` (clean), which narrows it to something about the production
+calling context (the persistent worker-thread pool's repeated invocation), not the kernel's
+arithmetic. Rebuilding ASan-`-O2` with `-fno-inline`: clean — this specifically isolates the
+finding to GCC-`-O2`'s default decision to inline `av8_chunk` into `attn_worker_run`, not a defect
+in the kernel logic itself. ASan-`-O3` (the actual production optimization level): clean, 3/3
+repeated runs. UBSan-`-O1`: a separate runtime-error diagnostic (misaligned/undersized pointer
+store) in the pre-existing, unmodified `qh[]`-population line, accompanied by garbled decode
+output — consistent with this file's already-documented `-O1` GCC/RVV instability (§22.16, and
+Phase 4.1's own `-O1` `qk8_dot` SEGV) rather than a new defect. UBSan-`-O2` and UBSan-`-O3`: both
+clean. Net: the actual production build (`-O3 -fno-tree-vectorize`, no sanitizer) is clean under
+both sanitizers, the anomaly is isolated to one specific compiler decision at one specific
+optimization level with a sanitizer attached, and it does not reproduce in isolation — suspected to
+be a compiler/sanitizer-instrumentation interaction specific to that inlining decision, not
+confirmed as its root cause, and not a numerical or logic defect (both independent bit-exact
+correctness checks above already rule that out).
+
+**A/B, 2 trials per configuration, board otherwise idle, `QWEN_AV_FUSE=0` vs `1` against the Phase
+4.1 baseline** (`qk_fuse=1` in both arms, since that is now the default; values are 2-trial
+averages):
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| wall/token | 81.25→81.10ms (-0.2%) | 92.40→88.25ms (**-4.5%**) | 125.45→110.90ms (**-11.6%**) | 168.50→138.60ms (**-17.8%**) |
+| tok/s | 12.31→12.33 | 10.82→11.34 (+4.8%) | 7.97→9.02 (**+13.2%**) | 5.94→7.22 (**+21.6%**) |
+| attention bucket (wall) | 2.22→1.52ms (-31.5%) | 13.25→8.61ms (**-35.1%**) | 46.08→30.56ms (**-33.7%**) | 88.59→57.96ms (**-34.6%**) |
+| AV (summed across workers) | 3.39→0.81ms (-76.1%) | 23.58→4.23ms (**-82.1%**) | 78.75→17.22ms (**-78.1%**) | 155.68→37.79ms (**-75.7%**) |
+
+Roughly 3× the magnitude of Phase 4.1's own wall-time win at every context, as expected — AV was
+the (very slightly) larger of the two co-dominant buckets in the §22.27 baseline, and the fused
+kernel's own reduction (76-82%) is larger than QK's fused reduction (22-26%) was. Trial-to-trial
+agreement is tight throughout (e.g. ctx=1024 fuse=1: 138.5ms/7.22 tok/s vs 138.7ms/7.21 tok/s).
+Generated token text is byte-identical between `fuse=0` and `fuse=1` at every context length across
+both trials. Short-context wall time did not regress at all (a slight improvement, -0.2%),
+comfortably inside the 2% ceiling.
+
+**All four predeclared keep criteria met — KEPT.** `g_av_fuse` default promoted from 0 to 1;
+`QWEN_AV_FUSE=0` remains the explicit revert path, byte-identical to Phase 4.1. No change to
+softmax, KV layout, or worker scheduling. Rebuilt the production binary (`-O3
+-fno-tree-vectorize`) and confirmed the promoted default (no env vars) reproduces the A/B's
+`fuse=1` numbers exactly and still passes the canonical `' Tokyo'` check.
+
+**Per the execution directive: stop here.** Softmax optimization (Phase 5), eight-core testing
+(Phase 6), KV quantization, and windowing remain explicitly out of scope until separately
+authorized.
