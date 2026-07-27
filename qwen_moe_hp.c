@@ -603,6 +603,55 @@ static float vdot_f32(const float*a,const float*b,int n){
     vfloat32m1_t vsum=__riscv_vfredusum_vs_f32m1_f32m1(vacc,vzero,__riscv_vsetvlmax_e32m1());
     return __riscv_vfmv_f_s_f32m1_f32(vsum);
 }
+#define QK8_MAXGPR 8
+/* attention_optimization_plan.md Phase 4.1 (codex_recs_1.md §22.30): multi-Q QK, exact GQA reuse.
+ * For a fixed KV head, the current per-head loop calls vdot_f32(qh,kj,hd) once per query head,
+ * re-reading the SAME kj (K vector at position j) from memory up to 8 times per position (once per
+ * query head sharing this KV head) -- each re-read is likely a real DRAM/L2 fetch, not an L1 hit,
+ * since a full ctx-length sweep for one query head runs between touches of the same kj by the next
+ * query head. This kernel instead loads each 32-lane chunk of kj exactly once per position and
+ * immediately uses it to update ALL `n` query-head accumulators before moving to the next chunk --
+ * "load once, update eight independent accumulators" per the plan's literal wording, not just a
+ * cache-friendly loop reorder.
+ *
+ * Per-query-head numerics are intentionally IDENTICAL to vdot_f32: same chunk boundaries (vl
+ * schedule driven by the same n=hd, same __riscv_vsetvl_e32m1 sequence), same vfmacc_vv order into
+ * a per-qi running accumulator, same final vfredusum reduction -- the only thing that changes is
+ * that kj's chunk is loaded once and shared across the `n` vfmacc calls instead of being loaded
+ * fresh inside `n` separate vdot_f32 calls. Because each acc[qi]'s own update sequence is untouched
+ * by what happens to the OTHER accumulators in between, this is expected to be bit-exact to calling
+ * vdot_f32(qh[qi],kj,hd) for qi=0..n-1 -- verified, not just assumed, in bench/qk_multiq_probe.c
+ * before this is trusted. */
+static void qk8_dot(const float*const qh[QK8_MAXGPR],const float*kj,int hd,int n,float*out){
+    /* RVV vector types are sizeless ("scalable"), so they cannot be array elements (`type v[N]` is
+     * a compile error) -- 8 named accumulators instead, matching QK8_MAXGPR exactly (this model's
+     * gpr is always 8; n<8 simply leaves the extra accumulators unused). */
+    vfloat32m1_t z=__riscv_vfmv_v_f_f32m1(0.0f,__riscv_vsetvlmax_e32m1());
+    vfloat32m1_t a0=z,a1=z,a2=z,a3=z,a4=z,a5=z,a6=z,a7=z;
+    int i=0;
+    while(i<hd){
+        size_t vl=__riscv_vsetvl_e32m1(hd-i);
+        vfloat32m1_t vk=__riscv_vle32_v_f32m1(kj+i,vl); /* kj chunk loaded ONCE */
+        if(n>0) a0=__riscv_vfmacc_vv_f32m1(a0,__riscv_vle32_v_f32m1(qh[0]+i,vl),vk,vl);
+        if(n>1) a1=__riscv_vfmacc_vv_f32m1(a1,__riscv_vle32_v_f32m1(qh[1]+i,vl),vk,vl);
+        if(n>2) a2=__riscv_vfmacc_vv_f32m1(a2,__riscv_vle32_v_f32m1(qh[2]+i,vl),vk,vl);
+        if(n>3) a3=__riscv_vfmacc_vv_f32m1(a3,__riscv_vle32_v_f32m1(qh[3]+i,vl),vk,vl);
+        if(n>4) a4=__riscv_vfmacc_vv_f32m1(a4,__riscv_vle32_v_f32m1(qh[4]+i,vl),vk,vl);
+        if(n>5) a5=__riscv_vfmacc_vv_f32m1(a5,__riscv_vle32_v_f32m1(qh[5]+i,vl),vk,vl);
+        if(n>6) a6=__riscv_vfmacc_vv_f32m1(a6,__riscv_vle32_v_f32m1(qh[6]+i,vl),vk,vl);
+        if(n>7) a7=__riscv_vfmacc_vv_f32m1(a7,__riscv_vle32_v_f32m1(qh[7]+i,vl),vk,vl);
+        i+=vl;
+    }
+    vfloat32m1_t vzero=__riscv_vfmv_v_f_f32m1(0.0f,__riscv_vsetvlmax_e32m1());
+    if(n>0) out[0]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a0,vzero,__riscv_vsetvlmax_e32m1()));
+    if(n>1) out[1]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a1,vzero,__riscv_vsetvlmax_e32m1()));
+    if(n>2) out[2]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a2,vzero,__riscv_vsetvlmax_e32m1()));
+    if(n>3) out[3]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a3,vzero,__riscv_vsetvlmax_e32m1()));
+    if(n>4) out[4]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a4,vzero,__riscv_vsetvlmax_e32m1()));
+    if(n>5) out[5]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a5,vzero,__riscv_vsetvlmax_e32m1()));
+    if(n>6) out[6]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a6,vzero,__riscv_vsetvlmax_e32m1()));
+    if(n>7) out[7]=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(a7,vzero,__riscv_vsetvlmax_e32m1()));
+}
 /* y[i] += scale*x[i], vector-length-agnostic. Attention's QK-dot (vdot_f32, reused) and AV
  * weighted-accumulate (this) are the same unvectorized-dot/axpy patterns already vectorized for
  * the router matvec -- same technique, applied to the other scalar-C hot loop (item 5 of the
@@ -628,40 +677,100 @@ static void vaxpy_f32(float*y,const float*x,float scale,int n){
 static float* g_attn_scratch[MAXNT]; /* private per-worker score buffer, >=ctx floats, allocated
     once (lazily, on first use) not per-layer/token -- matches Phase 3's explicit requirement. */
 static int g_attn_scratch_ctx=0;
+static float* g_attn_scratch_multi[MAXNT]; /* Phase 4.1: gpr*ctx floats per worker (row-major
+    [qi][j]), holds all gpr query heads' scores for one KV head at once -- needed because the fused
+    QK kernel computes every query head's score for a position together, so softmax/AV for query
+    head 0 can't start until the whole fused QK sweep (all positions, all heads) has finished,
+    unlike the unfused path where one query head's full score row is ready before its softmax. */
+static int g_attn_scratch_multi_ctx=0, g_attn_scratch_multi_gpr=0;
 static double g_w_qk[MAXNT], g_w_sm[MAXNT], g_w_av[MAXNT]; /* per-worker accumulators: each thread
     only ever writes its own index, so these are race-free without locking; summed into the global
     gT_attn_qk/sm/av by the single dispatching thread after every worker has finished its round. */
+/* g_qk_fuse: Phase 4.1 fused multi-Q QK (codex_recs_1.md §22.30), KEPT after A/B -- default is now
+ * 1 (fused, qk8_dot). 0 = byte-for-byte the Phase 3 code path below, kept as the explicit revert
+ * path. softmax/AV/layout/scheduling unchanged either way. Set via QWEN_QK_FUSE env var, same
+ * convention as QWEN_ATTN_NT/QWEN_CTXLEN. A/B (2 trials, short/128/512/1024): wall time -0.1%/
+ * -1.13%/-3.12%/-5.80%, attn bucket -6.6%/-9.8%/-9.0%/-10.3%, token-identical, 0/60,426,240
+ * integration-validation mismatches. */
+static int g_qk_fuse=1;
+/* g_qk_capture: when non-NULL, points to an nh*actx-float buffer that BOTH the fused and unfused
+ * branches below additionally write their post-scale, pre-softmax QK score for (hh,j) into (index
+ * hh*actx+j), on top of their normal scratch writes -- lets a validation driver run the exact same
+ * real dispatch path (real pool, real scratch, real KV-head mapping, real scaling) twice, once per
+ * mode, on the SAME real activations, and diff the two captures. NULL (default) costs one branch
+ * per QK write, negligible, and is what every production/benchmark run uses. */
+static float* g_qk_capture=NULL;
 static void attn_scratch_ensure(int ctx){
     if(g_attn_scratch_ctx>=ctx) return;
     for(int i=0;i<MAXNT;i++){ free(g_attn_scratch[i]); g_attn_scratch[i]=malloc((size_t)ctx*4); }
     g_attn_scratch_ctx=ctx;
+}
+static void attn_scratch_multi_ensure(int ctx,int gpr){
+    if(g_attn_scratch_multi_ctx>=ctx && g_attn_scratch_multi_gpr>=gpr) return;
+    int gg=gpr>g_attn_scratch_multi_gpr?gpr:g_attn_scratch_multi_gpr;
+    int cc=ctx>g_attn_scratch_multi_ctx?ctx:g_attn_scratch_multi_ctx;
+    for(int i=0;i<MAXNT;i++){ free(g_attn_scratch_multi[i]); g_attn_scratch_multi[i]=malloc((size_t)gg*cc*4); }
+    g_attn_scratch_multi_ctx=cc; g_attn_scratch_multi_gpr=gg;
 }
 static void attn_worker_run(int tn){
     if(tn>=g_pool_work.aattn_nt){ g_w_qk[tn]=g_w_sm[tn]=g_w_av[tn]=0; return; }
     int nkv=g_pool_work.ankv, gpr=g_pool_work.agpr, hd=g_pool_work.ahd, pos=g_pool_work.apos, actx=g_pool_work.actx;
     float scale=g_pool_work.ascale;
     const float*q=g_pool_work.aq, *Kc=g_pool_work.aKc, *Vc=g_pool_work.aVc; float*att=g_pool_work.aatt;
-    float*sc=g_attn_scratch[tn];
     double qk=0, sm=0, av=0;
-    for(int kvh=tn; kvh<nkv; kvh+=g_pool_work.aattn_nt){
-        const float*Kh=Kc+(size_t)kvh*actx*hd, *Vh=Vc+(size_t)kvh*actx*hd;
-        for(int qi=0; qi<gpr; qi++){
-            int hh=kvh*gpr+qi; const float*qh=q+(size_t)hh*hd;
+    if(g_qk_fuse && gpr<=QK8_MAXGPR){
+        float*scm=g_attn_scratch_multi[tn]; /* [qi*actx+j] */
+        const float*qh[QK8_MAXGPR];
+        for(int kvh=tn; kvh<nkv; kvh+=g_pool_work.aattn_nt){
+            const float*Kh=Kc+(size_t)kvh*actx*hd, *Vh=Vc+(size_t)kvh*actx*hd;
+            for(int qi=0;qi<gpr;qi++) qh[qi]=q+(size_t)(kvh*gpr+qi)*hd;
             double t0=gT_on?now():0;
-            for(int j=0;j<=pos;j++){ const float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
+            for(int j=0;j<=pos;j++){
+                const float*kj=Kh+(size_t)j*hd;
+                float out8[QK8_MAXGPR];
+                qk8_dot(qh,kj,hd,gpr,out8);
+                for(int qi=0;qi<gpr;qi++){
+                    float s=out8[qi]*scale; scm[(size_t)qi*actx+j]=s;
+                    if(g_qk_capture) g_qk_capture[(size_t)(kvh*gpr+qi)*actx+j]=s;
+                }
+            }
             double t1=gT_on?now():0; if(gT_on) qk+=t1-t0;
-            softmax(sc,pos+1);
-            double t2=gT_on?now():0; if(gT_on) sm+=t2-t1;
-            float*oh=att+(size_t)hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-            for(int j=0;j<=pos;j++){ const float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
-            if(gT_on) av += now()-t2;
+            for(int qi=0;qi<gpr;qi++){
+                int hh=kvh*gpr+qi; float*sc=scm+(size_t)qi*actx;
+                double ts0=gT_on?now():0;
+                softmax(sc,pos+1);
+                double ts1=gT_on?now():0; if(gT_on) sm+=ts1-ts0;
+                float*oh=att+(size_t)hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+                for(int j=0;j<=pos;j++){ const float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
+                if(gT_on) av += now()-ts1;
+            }
+        }
+    } else {
+        /* Phase 3 code, unchanged -- explicit revert path when g_qk_fuse==0. */
+        float*sc=g_attn_scratch[tn];
+        for(int kvh=tn; kvh<nkv; kvh+=g_pool_work.aattn_nt){
+            const float*Kh=Kc+(size_t)kvh*actx*hd, *Vh=Vc+(size_t)kvh*actx*hd;
+            for(int qi=0; qi<gpr; qi++){
+                int hh=kvh*gpr+qi; const float*qh=q+(size_t)hh*hd;
+                double t0=gT_on?now():0;
+                for(int j=0;j<=pos;j++){
+                    const float*kj=Kh+(size_t)j*hd; float s=vdot_f32(qh,kj,hd)*scale; sc[j]=s;
+                    if(g_qk_capture) g_qk_capture[(size_t)hh*actx+j]=s;
+                }
+                double t1=gT_on?now():0; if(gT_on) qk+=t1-t0;
+                softmax(sc,pos+1);
+                double t2=gT_on?now():0; if(gT_on) sm+=t2-t1;
+                float*oh=att+(size_t)hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+                for(int j=0;j<=pos;j++){ const float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
+                if(gT_on) av += now()-t2;
+            }
         }
     }
     g_w_qk[tn]=qk; g_w_sm[tn]=sm; g_w_av[tn]=av;
 }
 static void attn_dispatch(const float*q,const float*Kc,const float*Vc,float*att,int pos,float scale,
         int hd,int nkv,int gpr,int actx,int attn_nt){
-    attn_scratch_ensure(actx);
+    if(g_qk_fuse && gpr<=QK8_MAXGPR) attn_scratch_multi_ensure(actx,gpr); else attn_scratch_ensure(actx);
     g_pool_work.kind=2; g_pool_work.aq=q; g_pool_work.aKc=Kc; g_pool_work.aVc=Vc; g_pool_work.aatt=att;
     g_pool_work.apos=pos; g_pool_work.ascale=scale; g_pool_work.ahd=hd; g_pool_work.ankv=nkv;
     g_pool_work.agpr=gpr; g_pool_work.actx=actx; g_pool_work.aattn_nt=attn_nt;
@@ -679,6 +788,46 @@ static void attn_dispatch(const float*q,const float*Kc,const float*Vc,float*att,
         gT_attn_qk+=sumqk; gT_attn_sm+=sumsm; gT_attn_av+=sumav;
         gT_attn_dispatch += (now()-_tdisp) - maxw;
     }
+}
+/* Phase 4.1 integration validation (codex_recs_1.md §22.30, per explicit review): the standalone
+ * probe (bench/qk_multiq_probe.c) validates qk8_dot's math on synthetic data, copied out of the
+ * production file -- it cannot catch bugs in how the REAL engine wires the kernel in: scratch
+ * indexing (g_attn_scratch_multi's row layout), KV-head mapping (kvh*gpr+qi), scaling, or the pool
+ * dispatch itself. This runs the exact real attn_dispatch path TWICE per call site, once per mode,
+ * on the SAME real q/Kc/Vc from the actual decode (not synthetic data), capturing every (head,
+ * position) QK score via g_qk_capture and diffing the two captures -- exercises every one of those
+ * integration points for real, using the real multi-threaded pool both times. */
+static int g_qk_validate=0; /* set via QWEN_QK_VALIDATE=1 */
+static float *g_qkval_unfused=NULL, *g_qkval_fused=NULL; static int g_qkval_cap=0;
+static long g_qkval_cmp=0, g_qkval_mismatch=0; static double g_qkval_max_abs=0, g_qkval_max_rel=0;
+static void attn_qk_validate_and_dispatch(const float*q,const float*Kc,const float*Vc,float*att,int pos,float scale,
+        int hd,int nkv,int gpr,int actx,int attn_nt){
+    int nh=nkv*gpr;
+    if(g_qkval_cap < nh*actx){
+        free(g_qkval_unfused); free(g_qkval_fused);
+        g_qkval_unfused=malloc((size_t)nh*actx*4); g_qkval_fused=malloc((size_t)nh*actx*4);
+        g_qkval_cap=nh*actx;
+    }
+    int real_fuse=g_qk_fuse; /* whatever the run is actually configured to use */
+
+    g_qk_fuse=0; g_qk_capture=g_qkval_unfused;
+    attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,actx,attn_nt);
+
+    g_qk_fuse=1; g_qk_capture=g_qkval_fused;
+    attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,actx,attn_nt);
+
+    for(int hh=0;hh<nh;hh++){
+        for(int j=0;j<=pos;j++){
+            double u=g_qkval_unfused[(size_t)hh*actx+j], f=g_qkval_fused[(size_t)hh*actx+j];
+            double ad=fabs(u-f); double rd=fabs(u)>1e-12?ad/fabs(u):ad;
+            if(ad>g_qkval_max_abs) g_qkval_max_abs=ad;
+            if(rd>g_qkval_max_rel) g_qkval_max_rel=rd;
+            if(ad>1e-4) g_qkval_mismatch++;
+            g_qkval_cmp++;
+        }
+    }
+    g_qk_capture=NULL; g_qk_fuse=real_fuse;
+    if(real_fuse!=1) attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,actx,attn_nt); /* leave att correct for the configured mode -- the fused call above is only reused as-is when real_fuse==1 */
 }
 /* SwiGLU (codex_recs_1.md §22.18): g_swiglu_fast selects exact SiLU(x)*u (default, `expf`-based,
  * matches the original engine exactly) or a candidate fast approximation, gated behind the flag
@@ -882,6 +1031,8 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
                 float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
                 for(int j=0;j<=pos;j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
                 if(gT_on) gT_attn_av += now()-_tav; }
+        } else if(g_qk_validate){
+            attn_qk_validate_and_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         } else {
             attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         }
@@ -1446,6 +1597,19 @@ int main(int c,char**v){
      * g_pool_nt are clamped (no more workers than exist). */
     g_attn_nt = nt<m.nkv ? nt : m.nkv;
     { const char*av=getenv("QWEN_ATTN_NT"); if(av){ g_attn_nt=atoi(av); if(g_attn_nt>nt) g_attn_nt=nt; if(g_attn_nt<1) g_attn_nt=1; } }
+    /* QWEN_QK_FUSE (env var, same convention): Phase 4.1 multi-Q QK (attention_optimization_plan.md,
+     * codex_recs_1.md §22.30). Default is now 1 (fused, KEPT after A/B); QWEN_QK_FUSE=0 is the
+     * explicit unfused revert to the Phase 3 code path. Softmax/AV/layout/scheduling are unaffected
+     * either way. */
+    { const char*qf=getenv("QWEN_QK_FUSE"); if(qf) g_qk_fuse=atoi(qf); }
+    /* QWEN_QK_VALIDATE=1 (env var, same convention): integration validation for Phase 4.1, per
+     * explicit review -- runs BOTH the unfused and fused paths on every real attention dispatch
+     * (via attn_qk_validate_and_dispatch), diffing real captured QK scores. Costs ~2-3x the
+     * attention bucket while active; meant for a short bounded run before benchmarking, not left on
+     * during the real A/B. Overrides whatever QWEN_QK_FUSE requested for att's final content --
+     * the actually-configured mode still wins, validation is a side comparison, not a behavior
+     * change. */
+    { const char*qv=getenv("QWEN_QK_VALIDATE"); if(qv) g_qk_validate=atoi(qv); }
     /* ctx must cover prefill+ngen regardless of which prompt path is taken -- the default path's
      * prefill is a fixed 12 tokens (see `np` below), NOT just the QWEN_CTXLEN path. Previously only
      * the QWEN_CTXLEN branch grew ctx, so any ngen (2nd CLI arg, directly user-controlled, no
@@ -1499,15 +1663,19 @@ int main(int c,char**v){
          * "attention bucket" (gT_attn) is the true wall-clock figure and the one that matters for
          * the A/B decision; "total work" is diagnostic (e.g. confirms parallel workers aren't
          * doing duplicate work: it should stay close to the attn_nt=1 total, not grow with nt). */
-        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f (total work, %s) | dispatch %.2f | attention bucket (wall) %.2f, attn_nt=%d\n",
+        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f (total work, %s) | dispatch %.2f | attention bucket (wall) %.2f, attn_nt=%d, qk_fuse=%d\n",
             gT_tok, gT_attn_qk/gT_tok*1e3, gT_attn_sm/gT_tok*1e3, gT_attn_av/gT_tok*1e3,
-            g_attn_nt<=1?"= wall time":"summed across workers", gT_attn_dispatch/gT_tok*1e3, gT_attn/gT_tok*1e3, g_attn_nt);
+            g_attn_nt<=1?"= wall time":"summed across workers", gT_attn_dispatch/gT_tok*1e3, gT_attn/gT_tok*1e3, g_attn_nt, g_qk_fuse);
     }
     if(g_router_validate){
         printf("  router int4-HP-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
             g_rtr_cmp, g_rtr_hp_mismatch, g_rtr_hp_mismatch?(double)g_rtr_hp_diffcount/g_rtr_hp_mismatch:0.0, m.n_act, g_rtr_hp_maxabs, g_rtr_hp_maxrel);
         printf("  router int8-M1-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
             g_rtr_cmp, g_rtr_i8_mismatch, g_rtr_i8_mismatch?(double)g_rtr_i8_diffcount/g_rtr_i8_mismatch:0.0, m.n_act, g_rtr_i8_maxabs, g_rtr_i8_maxrel);
+    }
+    if(g_qk_validate){
+        printf("  qk_fuse integration validate: %ld comparisons, %ld mismatches(>1e-4 abs), max_abs=%e, max_rel=%e -- %s\n",
+            g_qkval_cmp, g_qkval_mismatch, g_qkval_max_abs, g_qkval_max_rel, g_qkval_mismatch==0?"PASS":"FAIL");
     }
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;

@@ -2636,7 +2636,64 @@ shrank dramatically — the "small regression" is relative, not absolute, and ex
 exists to eventually address, but per direction it is not touched now: no exponential
 approximation, no vectorization work, until specifically authorized.
 
-**Per the execution directive, still no GQA fusion.** Phase 4 (exact GQA-fused kernels — eliminating
-the 8x redundant K/V re-reads across query heads sharing a KV head, identified in the §22.27
-baseline and still true after Phase 2/3, since neither touched the redundant-re-read pattern
-itself) is the next identified opportunity, not started, and is a separate future decision.
+**Per the execution directive, still no GQA fusion at the time of this entry.** Phase 4 (exact
+GQA-fused kernels) was the next identified opportunity — see §22.30 for the multi-Q QK result.
+
+### 22.30 Attention Phase 4.1: multi-Q QK (exact GQA reuse on K) — KEPT, isolated from multi-Q AV
+
+Explicit authorization: Phase 4 only; implement multi-Q QK first in isolation; do not begin AV
+fusion in the same patch; preserve an explicit Phase 3 revert path; validate integrated scores
+before production A/B; keep only if attention/e2e improve reproducibly and sanitizers are clean.
+Softmax remains deferred.
+
+**Change**: `qk8_dot` — for each K position of a KV head, load each 32-lane K chunk once and
+immediately FMA it into all 8 query-head accumulators (named `a0..a7`; RVV types are sizeless so
+they cannot be array elements). Per-query-head chunking, FMA order, and `vfredusum` reduction are
+intentionally identical to `vdot_f32`, so each head's scalar score is bit-exact to the unfused path
+(verified, not assumed). Fused path needs a larger per-worker scratch (`gpr×ctx` floats) because
+all query heads' score rows for a KV head complete together before softmax/AV start. Unfused path
+(`g_qk_fuse==0`) remains the exact Phase 3 code, byte-for-byte. Controlled by `QWEN_QK_FUSE` env
+var (same convention as `QWEN_ATTN_NT`/`QWEN_CTXLEN`).
+
+**Validation** (required order, all on board `root@192.168.68.24`):
+
+1. Standalone probe `bench/qk_multiq_probe.c` at three contexts: 11,496 comparisons, max_abs=0,
+   max_rel=0.
+2. Integrated capture via `QWEN_QK_VALIDATE=1` (runs both paths through the real pool/dispatch on
+   every real attention call, diffs post-scale pre-softmax scores): **60,426,240 comparisons, 0
+   mismatches, max_abs=0, max_rel=0**.
+3. ASan clean on bounded `ctx=256/ngen=24` with `QWEN_QK_FUSE=1` (multiple trials; production-opt
+   levels). ASan/`-O1` had earlier intermittent faults traced to a racy temporary debug print
+   (removed) plus an `-O1`-specific UBSan page-fault on 8 live RVV accumulators that does **not**
+   reproduce at `-O2`/`-O3` — same GCC/RVV interaction class already documented for this file
+   (§22.16). Production builds with `-O3 -fno-tree-vectorize`.
+4. UBSan clean at `-O2` with `QWEN_QK_FUSE=1` on the same bounded test.
+5. Token identity: first-argmax and full generation strings byte-identical fuse0↔fuse1 at the
+   canonical short prompt (`' Tokyo'` PASS) and at every long-context A/B trial.
+
+**A/B, 2 trials per config, board otherwise idle, against Phase 3 baseline (`qk_fuse=0`,
+`attn_nt=4`, head-major KV)** — `*` = summed worker CPU-time:
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| attention bucket | 2.41→2.25ms (-6.6%) | 14.17→12.78ms (**-9.8%**) | 50.60→46.04ms (**-9.0%**) | 97.57→87.51ms (**-10.3%**) |
+| wall/token | 81.05→80.95ms (-0.1%) | 92.85→91.8ms (-1.1%) | 129.85→125.8ms (-3.1%) | 177.5→167.2ms (**-5.8%**) |
+| tok/s | 12.345→12.35 (~flat) | 10.775→10.895 (+1.1%) | 7.70→7.95 (**+3.2%**) | 5.635→5.98 (**+6.1%**) |
+
+QK summed-work alone: ~22–26% reduction at long context (the intended mechanism). Softmax and AV
+essentially flat (AV fusion not in this patch). Short-context does not regress.
+
+**Honest relative to Phase 2/3 gates**: the Phase 3 predeclared floors (20% attention bucket / 10%
+e2e at ctx 512 or 1024) were written for the threading candidate and are **not** met by multi-Q QK
+alone. The Phase 4 authorization gate was the weaker "reproducible attention/end-to-end improvement
++ sanitize," which is met with tight trial-to-trial agreement. This is a free, exact, modest win —
+kept and promoted because the quality risk is zero (bit-exact) and every long-context regime
+improves, not because it moves the HEADLINE short-context number.
+
+**Promoted**: `g_qk_fuse` defaults to `1`. `QWEN_QK_FUSE=0` remains the explicit unfused revert
+(Phase 3 path). Canonical short-context HEADLINE stays ~12.3–12.4 tok/s (noise-flat); the win is
+in the long-context regime this attention branch has been chasing since §22.23.
+
+**Next**: Phase 4.2 multi-Q AV (load each V once, update 8 independent output accumulators) is the
+residual larger opportunity — AV still co-dominates and still re-reads each V 8×. Softmax (Phase 5)
+stays deferred. Do not combine with approximate math.

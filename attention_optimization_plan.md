@@ -237,8 +237,15 @@ per the execution directive, no layout/threading/fusion candidate is implemented
 | Four KV-group workers (T1) | 1024 | 149.86* | 69.17* | 154.29* | 98.34 | 177.6 | 5.63 | identical to baseline |
 | Four KV-group workers (T2) | 1024 | 150.94* | 69.16* | 153.41* | 98.50 | 178.0 | 5.62 | identical to baseline |
 | Four KV-group workers (avg) | 1024 | 150.40* | 69.17* | 153.85* | 98.42 | 177.8 | 5.625 | — |
-| Fused multi-Q QK | 512 | | | | | | | |
-| Fused multi-Q QK | 1024 | | | | | | | |
+| Multi-Q QK (T1) | 128 | 16.65* | 9.37* | 20.36* | 12.70 | 91.5 | 10.93 | identical to Phase 3 |
+| Multi-Q QK (T2) | 128 | 16.58* | 9.40* | 20.78* | 12.86 | 92.1 | 10.86 | identical to Phase 3 |
+| Multi-Q QK (avg) | 128 | 16.62* | 9.39* | 20.57* | 12.78 | 91.8 | 10.895 | — |
+| Multi-Q QK (T1) | 512 | 59.88* | 35.17* | 77.08* | 45.74 | 125.0 | 8.00 | identical to Phase 3 |
+| Multi-Q QK (T2) | 512 | 60.51* | 35.19* | 79.22* | 46.34 | 126.6 | 7.90 | identical to Phase 3 |
+| Multi-Q QK (avg) | 512 | 60.20* | 35.18* | 78.15* | 46.04 | 125.8 | 7.95 | — |
+| Multi-Q QK (T1) | 1024 | 113.65* | 69.68* | 152.64* | 87.55 | 167.2 | 5.98 | identical to Phase 3 |
+| Multi-Q QK (T2) | 1024 | 113.70* | 69.63* | 152.72* | 87.47 | 167.2 | 5.98 | identical to Phase 3 |
+| Multi-Q QK (avg) | 1024 | 113.68* | 69.66* | 152.68* | 87.51 | 167.2 | 5.98 | — |
 | Fused multi-Q AV | 512 | | | | | | | |
 | Fused multi-Q AV | 1024 | | | | | | | |
 
@@ -322,10 +329,37 @@ that shrank by 74%, since QK/AV no longer dwarf it the way they did in Phase 1).
 the kind of change Phase 5 exists to eventually address, but per direction it stays deferred: no
 exponential approximation, no work here, until specifically authorized.
 
-**Per the execution directive, still no GQA fusion.** Phase 4 (exact GQA-fused kernels — eliminating
-the 8x redundant K/V re-reads across query heads sharing a KV head, per the Phase 1 baseline's
-co-dominant-QK/AV reading) is the next identified opportunity, not started, and is a separate
-decision from this one.
+**Phase 4.1 result (2026-07-27): KEPT — multi-Q QK only, isolated from multi-Q AV.** Explicit
+authorization: Phase 4 only; first implement multi-Q QK in isolation; do not fuse AV in the same
+patch; preserve `QWEN_QK_FUSE=0` as the Phase 3 revert path. Softmax remains deferred.
+
+`qk8_dot` loads each K chunk once and updates all 8 query-head accumulators with identical per-head
+FMA/reduction order to `vdot_f32` (bit-exact by construction). Fused path uses a larger per-worker
+scratch (`gpr×ctx`) because all query heads' scores for a KV head finish together before softmax.
+Standalone probe (`bench/qk_multiq_probe.c`) and production integration validation
+(`QWEN_QK_VALIDATE=1`, 60,426,240 real-dispatch comparisons) both report max_abs=0 / max_rel=0.
+
+ASan and UBSan clean at `-O2` (production uses `-O3`); UBSan at `-O1` hit a compiler
+register-pressure crash on 8 live RVV accumulators that does not reproduce at `-O2`/`-O3` — same
+class of GCC/RVV interaction already documented for this file. Tokens byte-identical fuse0↔fuse1 at
+every context and the canonical short prompt.
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| attention bucket | 2.41→2.25ms (-6.6%) | 14.17→12.78ms (**-9.8%**) | 50.60→46.04ms (**-9.0%**) | 97.57→87.51ms (**-10.3%**) |
+| wall/token | 81.05→80.95ms (-0.1%) | 92.85→91.8ms (-1.1%) | 129.85→125.8ms (-3.1%) | 177.5→167.2ms (**-5.8%**) |
+| tok/s | 12.345→12.35 (~flat) | 10.775→10.895 (+1.1%) | 7.70→7.95 (**+3.2%**) | 5.635→5.98 (**+6.1%**) |
+
+QK summed-work alone drops ~22–26% at long context (the intended effect); AV is essentially
+unchanged (as expected — not fused yet); softmax flat. Short-context does not regress. Honest
+relative to Phase 2/3: this is a **modest exact win**, not a dramatic one — the Phase 3
+predeclared 20% attention / 10% e2e floors (written for the threading candidate) are **not** met
+here. The Phase 4 authorization gate was "reproducible attention/end-to-end improvement + sanitize,"
+which is met. **KEPT and promoted**: `g_qk_fuse` defaults to 1; `QWEN_QK_FUSE=0` is the explicit
+revert. Full writeup in `codex_recs_1.md` §22.30.
+
+**Next: Phase 4.2 (multi-Q AV) remains the larger residual opportunity** — AV is still co-dominant
+and still re-reads each V vector 8× per KV head. Softmax (Phase 5) stays deferred.
 
 ## Stop conditions
 
@@ -340,12 +374,7 @@ Do not combine layout, threading, and fused kernels into one patch.
 
 ## Immediate next action
 
-Phase 1 (instrumentation + baseline) and Phase 2 (head-major KV layout) are both complete and kept
-— see the scoreboard above and `codex_recs_1.md` §22.27-§22.29. Phase 3 (four-KV-group worker
-parallelism) is also complete and kept, per explicit authorization to proceed with Phase 3 only,
-isolated from GQA fusion, with softmax deferred despite its small regression (see the Phase 3
-result note below the scoreboard). **Next: Phase 4 (exact GQA-fused kernels) is the identified
-larger opportunity** — QK and AV were co-dominant in the Phase 1 baseline (§22.27), and both
-directions still redundantly re-read the same K/V once per query head sharing a KV head (8x
-redundant reads) even after Phase 2/3; fusing across the 8 query heads per KV group is the next
-candidate to isolate and A/B, not yet started. Softmax (Phase 5) remains explicitly deferred.
+Phases 1–3 and Phase 4.1 (multi-Q QK) are complete and kept — see the scoreboard above and
+`codex_recs_1.md` §22.27–§22.30. **Next: Phase 4.2 only — multi-Q AV** (load each V once, update
+eight independent output accumulators). Keep QK fusion, head-major layout, four-worker scheduling,
+fp32 KV storage, and softmax unchanged. Softmax (Phase 5) remains explicitly deferred.
