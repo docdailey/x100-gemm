@@ -70,6 +70,16 @@ cache. **This was live in the shipped production binary all session**, not harne
 SwiGLU's savings barely move tok/s (8.82 vs 8.88) because attention now dominates — a live
 confirmation of §22.23's crossover finding.
 
+**Attention optimization branch opened — Phase 1 (instrumentation + baseline) complete
+(2026-07-26, `attention_optimization_plan.md`, `codex_recs_1.md` §22.27).** New QK/softmax/AV
+sub-buckets added inside the existing attention timer, verified byte-identical output and
+negligible overhead. Baseline (2 trials/context): **QK and AV are co-dominant, ~46-48% of the
+attention bucket each at every context tested (128/512/1024) — neither is "the" bottleneck.**
+Softmax is secondary but non-trivial (5.7-6.9%). Both QK and AV scale close to linearly with
+context, decomposing §22.23's aggregate ~1.2ms/token-of-context finding. Per the plan's execution
+directive, **no layout/threading/fusion work has started** — this baseline is the required review
+point before Phase 2 (head-major KV layout) begins.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config), AT PARITY with the vendor binary at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

@@ -2460,3 +2460,52 @@ not just a synthetic `QWEN_CTXLEN` sweep.
 **Conclusion: the production A/B reconfirms rational-Padé's promotion with fresh numbers, and the
 exercise of actually testing output quality at a non-canonical generation length caught a real bug
 that had been sitting in the shipped production binary the whole session.**
+
+### 22.27 Attention optimization, Phase 1: QK/softmax/AV bucket split, baseline scoreboard
+
+`attention_optimization_plan.md` (Codex-authored, treated as controlling) opens the next branch:
+attention overtook `linear(kernel)` as the dominant per-token bucket past ~59 tokens of context
+(§22.23), and nothing has touched it beyond the original vectorization pass (§22.9). Per the plan's
+explicit execution directive, **Phase 1 only** — instrumentation, no layout/threading/GQA-fusion/
+semantic changes — was implemented and run this entry; later phases are not started.
+
+**Instrumentation**: three new global accumulators (`gT_attn_qk`, `gT_attn_sm`, `gT_attn_av`)
+timed inside the existing per-head loop in `forward()`, splitting the already-existing `gT_attn`
+bucket by operation — QK dot-product, softmax, weighted-V accumulate — without changing any
+arithmetic. Verified before trusting any measurement: canonical-prompt run reports byte-identical
+`' Tokyo'` output and unchanged tok/s (11.2-11.4 range, within normal noise) versus the
+pre-instrumentation binary, and the three sub-buckets sum to within ~0.1ms of the pre-existing
+`attention` bucket at every context tested — the timing calls (`clock_gettime` via `now()`, ~1500
+extra calls/token at `nh=32, nl=48`) add negligible measurable overhead.
+
+**Baseline scoreboard** (2 trials/context, board otherwise idle throughout, `nt=4`, canonical-style
+`ngen=16` decode via `QWEN_CTXLEN`-synthesized prefill; full per-trial table now in the plan
+document's own scoreboard section, not duplicated here):
+
+| context | QK (avg ms) | softmax (avg ms) | AV (avg ms) | attention (avg ms) | tok/s (avg) |
+|---|---|---|---|---|---|
+| 128 | 61.80 | 9.45 | 65.34 | 136.75 | 4.63 |
+| 512 | 270.79 | 35.08 | 279.50 | 585.55 | 1.50 |
+| 1024 | 567.08 | 69.31 | 580.87 | 1217.45 | 0.77 |
+
+Tokens byte-identical between the two trials at every context (as expected — deterministic
+greedy decode, same config both times).
+
+**What this establishes, per the plan's own stated purpose ("establish whether QK, softmax, or AV
+dominates before optimizing anything")**: **QK and AV are essentially co-dominant, ~46-48% of the
+attention bucket each at every context tested — neither one alone is "the" bottleneck.** Softmax is
+a real but secondary cost, 5.7% (ctx=1024) to 6.9% (ctx=128) of the bucket — material enough that
+Phase 5 (exact RVV softmax) is worth eventually doing, per the plan's own "only pursue if material"
+framing, but clearly not the dominant term the way QK/AV are. Both QK and AV scale close to
+linearly with context (128→512 is a 4x context increase, both grow ~4.3-4.4x; 512→1024 is 2x
+context, both grow ~2.07-2.10x) — consistent with, and now decomposing, §22.23's aggregate
+~1.2ms/token-of-context finding into its two real components. AV runs consistently ~2.3-2.5%
+more expensive than QK at the larger contexts, plausibly because `vaxpy_f32`'s accumulation is a
+read-modify-write on the output vector while `vdot_f32`'s reduction only writes a single scalar per
+position — noted for Phase 4, where both directions independently re-read the same K/V once per
+query head sharing a KV head (8x redundant reads either way, regardless of which of QK/AV is
+costlier).
+
+**Per the execution directive, no further phase has started.** Phase 2 (head-major KV-layout A/B)
+is the next planned step, not yet implemented — this baseline scoreboard is the review point the
+directive requires before it begins.

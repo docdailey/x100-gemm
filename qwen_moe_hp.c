@@ -391,6 +391,12 @@ static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0, gT_rope=0, gT_router
  * the rest-accounting sink; these four partition it by consumer so we can see whether residual
  * vendor gap lives in QKV, O, expert FFN (gate/up/down), or lm_head. */
 static double gT_lin_qkv=0, gT_lin_o=0, gT_lin_exp=0, gT_lin_lm=0;
+/* attention_optimization_plan.md Phase 1: split gT_attn (already the sum of these three) into
+ * QK dot-product, softmax, and weighted-V accumulate, per head, to establish which operation
+ * dominates before changing the KV layout or adding threading -- instrumentation only, no math
+ * changed. A fourth "dispatch/sync" sub-bucket is left for Phase 3 (worker pool), not needed yet
+ * since attention has no dispatch/wait of its own until threading is added. */
+static double gT_attn_qk=0, gT_attn_sm=0, gT_attn_av=0;
 enum { LIN_NONE=0, LIN_QKV, LIN_O, LIN_EXP, LIN_LM };
 static int g_lin_class=LIN_NONE;
 static void lin_add(double d){
@@ -758,9 +764,14 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
         memcpy(Kc+(size_t)pos*kvd,k,kvd*4); memcpy(Vc+(size_t)pos*kvd,vv,kvd*4);
         float scale=1.0f/sqrtf(hd); double _at=gT_on?now():0;
         for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q+hh*hd,*sc=tmp;
+            double _tqk=gT_on?now():0;
             for(int j=0;j<=pos;j++){ float*kj=Kc+(size_t)j*kvd+kvh*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
-            softmax(sc,pos+1); float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-            for(int j=0;j<=pos;j++){ float*vj=Vc+(size_t)j*kvd+kvh*hd; vaxpy_f32(oh,vj,sc[j],hd); } }
+            double _tsm=gT_on?now():0; if(gT_on) gT_attn_qk += _tsm-_tqk;
+            softmax(sc,pos+1);
+            double _tav=gT_on?now():0; if(gT_on) gT_attn_sm += _tav-_tsm;
+            float*oh=att+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+            for(int j=0;j<=pos;j++){ float*vj=Vc+(size_t)j*kvd+kvh*hd; vaxpy_f32(oh,vj,sc[j],hd); }
+            if(gT_on) gT_attn_av += now()-_tav; }
         if(gT_on) gT_attn += now()-_at;
         g_lin_class=LIN_O; lin_mm(&ly->o,att,tmp,nt,Abuf); g_lin_class=LIN_NONE;
         for(int i=0;i<d;i++)h[i]+=tmp[i];
@@ -1359,6 +1370,9 @@ int main(int c,char**v){
         printf("  linear breakdown (avg/%ld tok, ms): qkv %.1f | o %.1f | expert(gate/up/down) %.1f | lm_head %.1f | sum %.1f\n",
             gT_tok, gT_lin_qkv/gT_tok*1e3, gT_lin_o/gT_tok*1e3, gT_lin_exp/gT_tok*1e3, gT_lin_lm/gT_tok*1e3,
             (gT_lin_qkv+gT_lin_o+gT_lin_exp+gT_lin_lm)/gT_tok*1e3);
+        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f | sum %.2f (attention bucket %.2f)\n",
+            gT_tok, gT_attn_qk/gT_tok*1e3, gT_attn_sm/gT_tok*1e3, gT_attn_av/gT_tok*1e3,
+            (gT_attn_qk+gT_attn_sm+gT_attn_av)/gT_tok*1e3, gT_attn/gT_tok*1e3);
     }
     if(g_router_validate){
         printf("  router int4-HP-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",

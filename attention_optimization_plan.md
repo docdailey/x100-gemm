@@ -203,11 +203,22 @@ Do not change the four-thread linear/IME configuration.
 
 ## Required scoreboard
 
+Phase 1 baseline filled in 2026-07-26 (2 trials/context, board otherwise idle, one job at a time;
+raw trials kept, not just averages — see `codex_recs_1.md` §22.27 for full methodology/discussion).
+`nt=4`, `ngen=16`, `QWEN_CTXLEN` synthesizing the prefill. All later rows pending, not started —
+per the execution directive, no layout/threading/fusion candidate is implemented yet.
+
 | Candidate | Context | QK ms | Softmax ms | AV ms | Attention ms | Wall ms | tok/s | Token match |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| Baseline | 128 | | | | | | | |
-| Baseline | 512 | | | | | | | |
-| Baseline | 1024 | | | | | | | |
+| Baseline (T1) | 128 | 60.93 | 9.40 | 57.37 | 127.86 | 207.5 | 4.82 | (ref) |
+| Baseline (T2) | 128 | 62.68 | 9.49 | 73.32 | 145.65 | 225.2 | 4.44 | identical to T1 |
+| Baseline (avg) | 128 | 61.80 | 9.45 | 65.34 | 136.75 | 216.3 | 4.63 | — |
+| Baseline (T1) | 512 | 268.69 | 35.04 | 283.32 | 587.22 | 667.4 | 1.50 | (ref) |
+| Baseline (T2) | 512 | 272.90 | 35.12 | 275.69 | 583.88 | 664.3 | 1.51 | identical to T1 |
+| Baseline (avg) | 512 | 270.79 | 35.08 | 279.50 | 585.55 | 665.8 | 1.50 | — |
+| Baseline (T1) | 1024 | 566.90 | 69.27 | 580.86 | 1217.22 | 1298.5 | 0.77 | (ref) |
+| Baseline (T2) | 1024 | 567.25 | 69.34 | 580.88 | 1217.67 | 1299.0 | 0.77 | identical to T1 |
+| Baseline (avg) | 1024 | 567.08 | 69.31 | 580.87 | 1217.45 | 1298.8 | 0.77 | — |
 | Head-major KV | 128 | | | | | | | |
 | Head-major KV | 512 | | | | | | | |
 | Head-major KV | 1024 | | | | | | | |
@@ -218,6 +229,22 @@ Do not change the four-thread linear/IME configuration.
 | Fused multi-Q QK | 1024 | | | | | | | |
 | Fused multi-Q AV | 512 | | | | | | | |
 | Fused multi-Q AV | 1024 | | | | | | | |
+
+**Baseline reading**: QK and AV are essentially co-dominant (~46-48% of the attention bucket each,
+at every context tested), softmax is a small but non-trivial 5.7-6.9% (shrinking slightly as a
+fraction as context grows, since QK/AV scale with context and softmax's cost per call is
+`O(pos+1)` for the max/exp/normalize passes but only `O(hd)`-comparable per-element work, not the
+`O(hd)` dot-product work QK/AV do at every position) — material enough that Phase 5 is worth doing
+eventually, but neither QK nor AV can be ignored in favor of it. QK+softmax+AV sums track the
+`attention` bucket tightly (gap ≤0.2ms at every context, the zero-init/loop overhead the three
+sub-timers don't cover) — the instrumentation is not introducing distorting overhead. Scaling from
+128→512 (4x context) and 512→1024 (2x context) is close to linear for both QK and AV, consistent
+with `codex_recs_1.md` §22.23's aggregate finding, now decomposed into which two components carry
+that slope. AV runs measurably (~2.5% at ctx=1024) more expensive than QK despite comparable FLOP
+counts — plausibly the read-modify-write accumulation into the output vector (`vaxpy_f32` reads
+*and* writes `oh`) versus QK's read-only reduction to a scalar (`vdot_f32` only writes one `sc[j]`
+per position) — relevant to Phase 4's fused-kernel motivation, since both directions redundantly
+re-read the same K/V once per query head sharing a KV head (8x redundant reads either way).
 
 ## Stop conditions
 
