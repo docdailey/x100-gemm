@@ -255,6 +255,15 @@ per the execution directive, no layout/threading/fusion candidate is implemented
 | Fused multi-Q AV (T1) | 1024 | 112.99* | 69.73* | 38.50* | 57.84 | 138.5 | 7.22 | identical to Phase 4.1 |
 | Fused multi-Q AV (T2) | 1024 | 112.97* | 69.64* | 37.07* | 58.07 | 138.7 | 7.21 | identical to Phase 4.1 |
 | Fused multi-Q AV (avg) | 1024 | 112.98* | 69.685* | 37.785* | 57.955 | 138.6 | 7.215 | — |
+| Softmax RVV (T1) | 128 | 16.82* | 8.06* | 4.21* | 8.24 | 87.5 | 11.43 | identical to Phase 4.2 |
+| Softmax RVV (T2) | 128 | 16.77* | 8.05* | 5.49* | 8.35 | 88.0 | 11.37 | identical to Phase 4.2 |
+| Softmax RVV (avg) | 128 | 16.795* | 8.055* | 4.85* | 8.295 | 87.75 | 11.40 | — |
+| Softmax RVV (T1) | 512 | 60.87* | 29.88* | 17.57* | 29.79 | 109.9 | 9.10 | identical to Phase 4.2 |
+| Softmax RVV (T2) | 512 | 60.90* | 29.95* | 16.02* | 29.30 | 109.5 | 9.13 | identical to Phase 4.2 |
+| Softmax RVV (avg) | 512 | 60.885* | 29.915* | 16.795* | 29.545 | 109.7 | 9.115 | — |
+| Softmax RVV (T1) | 1024 | 114.39* | 58.98* | 38.11* | 55.45 | 135.7 | 7.37 | identical to Phase 4.2 |
+| Softmax RVV (T2) | 1024 | 113.73* | 58.99* | 38.01* | 55.27 | 135.3 | 7.39 | identical to Phase 4.2 |
+| Softmax RVV (avg) | 1024 | 114.06* | 58.985* | 38.06* | 55.36 | 135.5 | 7.38 | — |
 
 **Baseline reading**: QK and AV are essentially co-dominant (~46-48% of the attention bucket each,
 at every context tested), softmax is a small but non-trivial 5.7-6.9% (shrinking slightly as a
@@ -406,6 +415,33 @@ and the failure is narrowly isolated to that inlining decision, not the kernel; 
 directive, stop here — softmax (Phase 5), eight-core testing (Phase 6), KV quantization, and
 windowing remain out of scope until separately authorized.
 
+**Phase 5 result (2026-07-28): KEPT — exact softmax RVV vectorization.** Re-profile at production
+default (`qk_fuse=1, av_fuse=1`) found softmax now the single largest attention sub-bucket (43.5ms
+at ctx=256, bigger than QK and far bigger than AV) — QK/AV's own reductions shrank the buckets
+around it while softmax's absolute cost stayed flat. RVV-vectorized only the max reduction and
+final normalization (`rvv_max_f32`/`rvv_scale_f32`); `expf` stays scalar and exact, no approximate
+exponential. Both are bit-exact by construction (order-independent max, per-element multiply) —
+verified via standalone probe (2,155 comparisons incl. n=1 and non-multiple-of-32 tails, 0
+mismatches) and production integration validation (32,740,245 comparisons, 0 mismatches).
+Sanitizers found nothing new — the same two already-characterized Phase 4.2 findings reappear
+unchanged (ASan-`-O2` inlining in `av8_chunk`, UBSan-`-O1` in the pre-existing `qh[]` line), neither
+touching softmax's own code; production (`-O3`) clean under both sanitizers.
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| wall/token | 80.95→80.95ms (0%) | 88.2→87.75ms (**-0.5%**) | 111.05→109.7ms (**-1.2%**) | 138.55→135.5ms (**-2.2%**) |
+| tok/s | 12.36→12.355 (~flat) | 11.335→11.40 (+0.6%) | 9.005→9.115 (+1.2%) | 7.215→7.38 (+2.3%) |
+
+Softmax summed-work alone drops 8.5-15.6%, growing with context. Tokens byte-identical at every
+context. Short-context does not regress at all. A modest win, honestly smaller than QK/AV (softmax
+is what's left after two much bigger fusions already shrank the surrounding buckets), but real,
+reproducible, and meets the explicitly stated Phase 5 gate exactly. **KEPT**: `g_softmax_rvv`
+defaults to 1; `QWEN_SOFTMAX_RVV=0` is the explicit revert. Full writeup in `codex_recs_1.md`
+§22.32.
+
+**All three attention-bucket components (QK, AV, softmax) are now optimized.** Continuing per
+explicit authorization to Phase 6 (eight-core attention) next.
+
 ## Stop conditions
 
 Stop this branch when any of the following becomes true:
@@ -419,9 +455,8 @@ Do not combine layout, threading, and fused kernels into one patch.
 
 ## Immediate next action
 
-Phases 1–3 and Phase 4 (both multi-Q QK and multi-Q AV) are complete and kept — see the scoreboard
-above and `codex_recs_1.md` §22.27–§22.31. Both exact GQA-fused kernels are now the production
-attention path. **Next, if authorized: Phase 5 — exact softmax optimization** (RVV-vectorize the
-max reduction and normalization, keep `expf` exact, no exponential approximation without a separate
-predeclared quality study), only if softmax is shown to be material now that QK/AV have shrunk so
-much. No phase should begin without explicit authorization.
+Phases 1–5 are complete and kept — see the scoreboard above and `codex_recs_1.md` §22.27–§22.32.
+QK, AV, and softmax are all now optimized (fused and/or RVV-vectorized) on the exact path. **Next,
+per explicit authorization: Phase 6 — eight-core attention experiment** (linear/IME work stays on
+four workers, harts 8/10/12/14; attention-only work may additionally use harts 9/11/13/15; keep
+eight-worker attention only if it beats four workers reproducibly).

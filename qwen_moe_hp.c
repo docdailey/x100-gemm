@@ -590,7 +590,80 @@ static void rope_table(float*cosb,float*sinb,int hd,int pos,float base){
 static void rope_apply(float*v,int hd,const float*cosb,const float*sinb){
     for(int i=0;i<hd/2;i++){ float c=cosb[i],s=sinb[i],x=v[i],y=v[i+hd/2]; v[i]=x*c-y*s; v[i+hd/2]=x*s+y*c; }
 }
-static void softmax(float*x,int n){ float m=-1e30f; for(int i=0;i<n;i++)if(x[i]>m)m=x[i]; float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} float inv=1.0f/s; for(int i=0;i<n;i++)x[i]*=inv; }
+/* attention_optimization_plan.md Phase 5 (codex_recs_1.md §22.32): RVV-vectorize softmax's max
+ * reduction and final normalization, per explicit instruction. expf itself stays scalar/exact --
+ * no approximate exponential -- so the exp+sum pass is untouched; only the two purely-arithmetic
+ * passes either side of it are RVV candidates. Max: an elementwise-max reduction is order-
+ * independent for the same finite-float set (no NaNs occur here), so RVV vfmax accumulation
+ * followed by a single vfredmax fold produces the identical scalar to the linear scalar scan.
+ * Normalization: x[i]*=inv is a pure per-element multiply; IEEE-754 single-precision multiply
+ * gives the same bit pattern regardless of scalar-loop vs RVV-lane execution. Both are therefore
+ * expected bit-exact to the scalar path -- verified, not assumed, in bench/softmax_rvv_probe.c and
+ * the production QWEN_SOFTMAX_VALIDATE path below. */
+static float rvv_max_f32(const float*x,int n){
+    vfloat32m1_t vacc=__riscv_vfmv_v_f_f32m1(-1e30f,__riscv_vsetvlmax_e32m1());
+    int i=0;
+    while(i<n){ size_t vl=__riscv_vsetvl_e32m1(n-i);
+        vfloat32m1_t vx=__riscv_vle32_v_f32m1(x+i,vl);
+        vacc=__riscv_vfmax_vv_f32m1(vacc,vx,vl); i+=vl; }
+    vfloat32m1_t vid=__riscv_vfmv_v_f_f32m1(-1e30f,__riscv_vsetvlmax_e32m1());
+    vfloat32m1_t vred=__riscv_vfredmax_vs_f32m1_f32m1(vacc,vid,__riscv_vsetvlmax_e32m1());
+    return __riscv_vfmv_f_s_f32m1_f32(vred);
+}
+static void rvv_scale_f32(float*x,float s,int n){
+    int i=0;
+    while(i<n){ size_t vl=__riscv_vsetvl_e32m1(n-i);
+        vfloat32m1_t vx=__riscv_vle32_v_f32m1(x+i,vl);
+        vx=__riscv_vfmul_vf_f32m1(vx,s,vl);
+        __riscv_vse32_v_f32m1(x+i,vx,vl); i+=vl; }
+}
+/* g_softmax_rvv: Phase 5 (codex_recs_1.md §22.32), KEPT after A/B -- default is now 1 (RVV
+ * max+normalize, scalar expf unchanged in between). 0 = the original fully-scalar softmax below,
+ * byte-for-byte, kept as the explicit revert path. Set via QWEN_SOFTMAX_RVV env var, same
+ * convention as QWEN_QK_FUSE/QWEN_AV_FUSE. A/B (2 trials, short/128/512/1024): wall time 0%/-0.5%/
+ * -1.2%/-2.2%, softmax summed-work -8.5%/-13.9%/-15.0%/-15.6%, token-identical, 0/32,740,245
+ * integration-validation mismatches. Modest relative to QK/AV (softmax's own cost is now the
+ * remaining sub-bucket after both fusions, but still smaller in absolute ms than QK or AV were). */
+static int g_softmax_rvv=1;
+/* g_softmax_validate / QWEN_SOFTMAX_VALIDATE=1: unlike QK/AV, softmax's correctness does not
+ * depend on the multi-threaded dispatch machinery (it's a pure, deterministic per-call function
+ * whether invoked from the serial path or a pool worker), so validation can run both the scalar
+ * and RVV computations on every real call, in place, without needing to replay the whole attention
+ * dispatch twice. Thread-local scratch (grown once per thread, not malloc/free per call) makes
+ * this safe to call concurrently from every pool worker without locking or cross-thread races. */
+static int g_softmax_validate=0;
+static _Thread_local float* g_smval_scratch=NULL;
+static _Thread_local int g_smval_scratch_cap=0;
+static long g_smval_cmp=0, g_smval_mismatch=0; static double g_smval_max_abs=0, g_smval_max_rel=0;
+static void softmax(float*x,int n){
+    if(g_softmax_validate){
+        if(g_smval_scratch_cap<n){ free(g_smval_scratch); g_smval_scratch=malloc((size_t)n*4); g_smval_scratch_cap=n; }
+        float*ref=g_smval_scratch;
+        memcpy(ref,x,(size_t)n*4);
+        { float m=-1e30f; for(int i=0;i<n;i++)if(ref[i]>m)m=ref[i];
+          float s=0; for(int i=0;i<n;i++){ref[i]=expf(ref[i]-m);s+=ref[i];}
+          float inv=1.0f/s; for(int i=0;i<n;i++)ref[i]*=inv; }
+        { float m=rvv_max_f32(x,n);
+          float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];}
+          rvv_scale_f32(x,1.0f/s,n); }
+        for(int i=0;i<n;i++){
+            double a=ref[i], b=x[i]; double ad=fabs(a-b); double rd=fabs(a)>1e-12?ad/fabs(a):ad;
+            if(ad>g_smval_max_abs) g_smval_max_abs=ad;
+            if(rd>g_smval_max_rel) g_smval_max_rel=rd;
+            if(ad>1e-4) g_smval_mismatch++;
+            g_smval_cmp++;
+        }
+        if(!g_softmax_rvv) memcpy(x,ref,(size_t)n*4); /* leave x correct for whatever's configured */
+        return;
+    }
+    if(g_softmax_rvv){
+        float m=rvv_max_f32(x,n);
+        float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];}
+        rvv_scale_f32(x,1.0f/s,n);
+    } else {
+        float m=-1e30f; for(int i=0;i<n;i++)if(x[i]>m)m=x[i]; float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} float inv=1.0f/s; for(int i=0;i<n;i++)x[i]*=inv;
+    }
+}
 /* router matvec was the 2nd-biggest scalar bucket (29.4ms, measured): 128 experts x d=2048
  * unvectorized mults/layer, ~1MB/layer, cache-miss-heavy. RVV fp32 dot, vector-length-agnostic. */
 static float vdot_f32(const float*a,const float*b,int n){
@@ -1722,6 +1795,13 @@ int main(int c,char**v){
      * QWEN_QK_VALIDATE -- runs both AV modes on every real attention dispatch, diffing the real
      * output buffers. Not meant to be left on during the real A/B. */
     { const char*vv=getenv("QWEN_AV_VALIDATE"); if(vv) g_av_validate=atoi(vv); }
+    /* QWEN_SOFTMAX_RVV (env var, same convention): Phase 5 (attention_optimization_plan.md,
+     * codex_recs_1.md §22.32), KEPT after A/B -- default is now 1 (RVV). QWEN_SOFTMAX_RVV=0 is the
+     * explicit scalar revert. */
+    { const char*sr=getenv("QWEN_SOFTMAX_RVV"); if(sr) g_softmax_rvv=atoi(sr); }
+    /* QWEN_SOFTMAX_VALIDATE=1: runs both scalar and RVV softmax on every real call and diffs them
+     * in place (see softmax()'s own comment) -- not meant to be left on during the real A/B. */
+    { const char*sv=getenv("QWEN_SOFTMAX_VALIDATE"); if(sv) g_softmax_validate=atoi(sv); }
     /* ctx must cover prefill+ngen regardless of which prompt path is taken -- the default path's
      * prefill is a fixed 12 tokens (see `np` below), NOT just the QWEN_CTXLEN path. Previously only
      * the QWEN_CTXLEN branch grew ctx, so any ngen (2nd CLI arg, directly user-controlled, no
@@ -1775,9 +1855,9 @@ int main(int c,char**v){
          * "attention bucket" (gT_attn) is the true wall-clock figure and the one that matters for
          * the A/B decision; "total work" is diagnostic (e.g. confirms parallel workers aren't
          * doing duplicate work: it should stay close to the attn_nt=1 total, not grow with nt). */
-        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f (total work, %s) | dispatch %.2f | attention bucket (wall) %.2f, attn_nt=%d, qk_fuse=%d, av_fuse=%d\n",
+        printf("  attention breakdown (avg/%ld tok, ms): QK %.2f | softmax %.2f | AV %.2f (total work, %s) | dispatch %.2f | attention bucket (wall) %.2f, attn_nt=%d, qk_fuse=%d, av_fuse=%d, softmax_rvv=%d\n",
             gT_tok, gT_attn_qk/gT_tok*1e3, gT_attn_sm/gT_tok*1e3, gT_attn_av/gT_tok*1e3,
-            g_attn_nt<=1?"= wall time":"summed across workers", gT_attn_dispatch/gT_tok*1e3, gT_attn/gT_tok*1e3, g_attn_nt, g_qk_fuse, g_av_fuse);
+            g_attn_nt<=1?"= wall time":"summed across workers", gT_attn_dispatch/gT_tok*1e3, gT_attn/gT_tok*1e3, g_attn_nt, g_qk_fuse, g_av_fuse, g_softmax_rvv);
     }
     if(g_router_validate){
         printf("  router int4-HP-vs-fp32: %ld comparisons, %ld expert-set mismatches (avg %.2f/%d experts differ per mismatch), max abs logit delta %e, max rel %e\n",
@@ -1792,6 +1872,10 @@ int main(int c,char**v){
     if(g_av_validate){
         printf("  av_fuse integration validate: %ld comparisons, %ld mismatches(>1e-4 abs), max_abs=%e, max_rel=%e -- %s\n",
             g_avval_cmp, g_avval_mismatch, g_avval_max_abs, g_avval_max_rel, g_avval_mismatch==0?"PASS":"FAIL");
+    }
+    if(g_softmax_validate){
+        printf("  softmax_rvv validate: %ld comparisons, %ld mismatches(>1e-4 abs), max_abs=%e, max_rel=%e -- %s\n",
+            g_smval_cmp, g_smval_mismatch, g_smval_max_abs, g_smval_max_rel, g_smval_mismatch==0?"PASS":"FAIL");
     }
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;

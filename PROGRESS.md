@@ -137,8 +137,23 @@ met; the sanitizer criterion was not a clean sweep (ASan-`-O2` default-inlining 
 production (`-O3`) is clean and the failure is narrowly isolated to that inlining decision, not the
 kernel. **Promoted**: `g_av_fuse` defaults to 1; `QWEN_AV_FUSE=0` is the Phase 4.1 revert. **Both
 exact GQA-fused kernels
-(QK and AV) are now complete and kept** — next, if authorized, is Phase 5 (exact softmax
-optimization), only if softmax is material now that QK/AV have shrunk so much.
+(QK and AV) are now complete and kept**.
+
+**Attention Phase 5 KEPT — exact softmax RVV vectorization (2026-07-28, `codex_recs_1.md`
+§22.32).** Re-profile found softmax now the single largest attention sub-bucket (43.5ms at
+ctx=256) now that QK/AV have shrunk around it. RVV-vectorized only the max reduction and final
+normalization (`rvv_max_f32`/`rvv_scale_f32`); `expf` stays scalar/exact, no approximate
+exponential. Bit-exact by construction, verified via standalone probe (2,155 cmp, 0 mismatches,
+incl. n=1 and non-multiple-of-32 tails) and production integration validation (32,740,245 cmp,
+max_abs=0). Sanitizers found nothing new — same two already-characterized Phase 4.2 findings
+reappear unchanged, neither touching softmax's code; production (`-O3`) clean under both.
+**Attention bucket contribution (softmax alone) vs Phase 4.2: -8.5% (short), -13.9% (ctx=128),
+-15.0% (ctx=512), -15.6% (ctx=1024). Wall time: 0%, -0.5%, -1.2%, -2.2%.** Modest — honestly
+smaller than QK/AV, since softmax is what's left after two much bigger fusions — but reproducible,
+token-identical, and zero short-context regression, meeting the explicit Phase 5 gate. **Promoted**:
+`g_softmax_rvv` defaults to 1; `QWEN_SOFTMAX_RVV=0` is the explicit revert. **All three attention
+sub-buckets (QK, AV, softmax) are now optimized** — continuing per authorization to Phase 6
+(eight-core attention) next.
 
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.3-12.4 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
@@ -163,8 +178,9 @@ same day for a real quality regression (11.0% perplexity inflation at scale) —
 production A/B (§22.21, reconfirmed §22.26); `0` (exact SiLU) remains an explicit revert flag. The
 default attention KV layout is head-major (§22.28, `qwen_moe_hp_kv_timemajor.c` preserved as the
 time-major revert reference), with attention parallelized across `min(nt,nkv)` pool workers
-(§22.29, `QWEN_ATTN_NT=1` as the serial revert flag) and fused multi-Q QK and AV on (§22.30-22.31,
-`QWEN_QK_FUSE=0`/`QWEN_AV_FUSE=0` as the unfused reverts). **Build now REQUIRES `-fno-tree-vectorize`**
+(§22.29, `QWEN_ATTN_NT=1` as the serial revert flag), fused multi-Q QK and AV on (§22.30-22.31,
+`QWEN_QK_FUSE=0`/`QWEN_AV_FUSE=0` as the unfused reverts), and RVV softmax on (§22.32,
+`QWEN_SOFTMAX_RVV=0` as the scalar revert). **Build now REQUIRES `-fno-tree-vectorize`**
 (see the toolchain-hardening entry below and the file's own header comment) — this is not optional,
 it's a correctness/performance fix, not a tuning knob.
 

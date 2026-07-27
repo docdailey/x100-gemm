@@ -2789,3 +2789,77 @@ promoted from 0 to 1; `QWEN_AV_FUSE=0` remains the explicit revert path, byte-id
 **Per the execution directive: stop here.** Softmax optimization (Phase 5), eight-core testing
 (Phase 6), KV quantization, and windowing remain explicitly out of scope until separately
 authorized.
+
+### 22.32 Attention Phase 5: exact softmax RVV vectorization — KEPT
+
+Explicit authorization: continue autonomously through the optimization ladder, same end-to-end
+discipline as prior phases. Re-profile QK/softmax/AV, RVV-vectorize the max reduction and
+normalization, keep `expf` exact (no approximate exponential), A/B at short/128/512/1024, keep only
+a reproducible end-to-end win with identical tokens and ≤2% short-context regression.
+
+**Re-profile before implementing** (production default, `qk_fuse=1, av_fuse=1`): softmax's summed
+work is now 43.5ms at ctx=256/ngen=24 — the single **largest** attention sub-bucket, bigger than QK
+(32.1ms) and far bigger than AV (8.6ms). QK and AV's Phase 4 reductions (22-26% and 76-82%
+respectively) shrank the buckets around it while softmax's own absolute cost stayed essentially
+flat, so its relative share grew sharply — exactly the dynamic §22.29's Phase 3 entry had already
+flagged as "the small regression Phase 5 exists to eventually address."
+
+**Implementation.** `softmax(x,n)` is three passes: (1) scalar linear max-scan, (2) `expf(x[i]-m)`
++ running sum, (3) scalar `x[i]*=inv` normalize. Per explicit instruction only passes 1 and 3 are
+RVV candidates -- pass 2's `expf` stays untouched, scalar, exact. `rvv_max_f32` accumulates an
+elementwise RVV max across chunks then folds with `vfredmax`; `rvv_scale_f32` is a straight
+vector-scalar multiply. Both are expected bit-exact to the scalar versions: max of a finite set (no
+NaNs occur here) is order-independent under IEEE-754, and a per-element multiply's result depends
+only on the two operands, not on scalar-loop vs RVV-lane execution. `g_softmax_rvv` (env var
+`QWEN_SOFTMAX_RVV`) gates the whole function between the two implementations; the scalar path is
+preserved byte-for-byte as the explicit revert.
+
+**Validation.** Standalone probe `bench/softmax_rvv_probe.c` (`rvv_max_f32`/`rvv_scale_f32` copied
+verbatim) at n∈{1,12,32,33,113,128,300,512,1024} — deliberately including n=1 and non-multiples of
+32 to exercise the tail case. **Bit-exact: 2,155 comparisons, 0 mismatches, max_abs=0, max_rel=0.**
+Unlike QK/AV, softmax's correctness doesn't depend on the multi-threaded dispatch machinery (it's a
+pure per-call function regardless of caller), so production integration validation
+(`QWEN_SOFTMAX_VALIDATE=1`) runs both implementations on every real call in place, using thread-
+local scratch (grown once per thread, not malloc/free per call) rather than replaying the whole
+dispatch path twice. **Result: 32,740,245 comparisons, 0 mismatches, max_abs=0, max_rel=0 — PASS.**
+
+**Sanitizers reproduced the same two already-characterized findings from Phase 4.2, nothing new.**
+ASan-`-O1`/`-O3` and UBSan-`-O2`/`-O3`: clean. ASan-`-O2` (default inlining) still shows the
+`stack-use-after-scope` in `av8_chunk` (unchanged code, same line, same signature as §22.31).
+UBSan-`-O1` still shows the pre-existing `qh[]`-population pointer-store diagnostic and garbled
+output (unchanged code, same `-O1` GCC/RVV instability class). Neither trace touches `softmax`,
+`rvv_max_f32`, or `rvv_scale_f32` — this phase's own new code introduces zero new sanitizer
+findings at any tested optimization level. Production (`-O3`) remains clean under both sanitizers.
+
+**A/B, 2 trials per configuration, board otherwise idle, `QWEN_SOFTMAX_RVV=0` vs `1`** (values are
+2-trial averages; `qk_fuse=1, av_fuse=1` in both arms, the current production baseline):
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| wall/token | 80.95→80.95ms (0%) | 88.20→87.75ms (**-0.5%**) | 111.05→109.70ms (**-1.2%**) | 138.55→135.50ms (**-2.2%**) |
+| tok/s | 12.36→12.355 (~flat) | 11.335→11.40 (+0.6%) | 9.005→9.115 (+1.2%) | 7.215→7.38 (+2.3%) |
+| softmax (summed across workers) | 1.595→1.46ms (-8.5%) | 9.355→8.055ms (**-13.9%**) | 35.205→29.915ms (**-15.0%**) | 69.875→58.985ms (**-15.6%**) |
+
+Improvement grows with context length, consistent with softmax's own cost and this reduction's
+benefit both scaling with `n`. Tokens are byte-identical between `fuse=0` and `fuse=1` at every
+context length across both trials. Short-context wall time does not regress at all (flat, not
+negative), comfortably inside the 2% ceiling.
+
+**This is a modest win, honestly smaller in relative and absolute terms than QK or AV** — softmax
+is the remaining sub-bucket after two much larger fusions already shrank the buckets around it, so
+there is proportionally less left to recover, and the wall-time effect (0.5-2.2%) sits closer to
+this board's measurement-noise floor than QK/AV's double-digit wins did (trial-to-trial agreement,
+while still consistent in direction, is not as tight as the earlier phases'). It is nonetheless a
+real, reproducible win in the correct direction at every long context tested, with zero short-
+context cost and zero numerical/token risk — meeting the explicitly stated gate ("a reproducible
+end-to-end win... with identical tokens and ≤2% short-context regression"), which is narrower than
+Phase 3/4's percentage floors and was met deliberately, not by a wide margin.
+
+**KEPT.** `g_softmax_rvv` default promoted from 0 to 1; `QWEN_SOFTMAX_RVV=0` remains the explicit
+scalar revert. Rebuilt the production binary (`-O3 -fno-tree-vectorize`) and confirmed the
+promoted default reproduces the A/B's `fuse=1` numbers and still passes the canonical `' Tokyo'`
+check.
+
+**All three attention-bucket components (QK, AV, softmax) are now RVV-optimized and fused/
+vectorized where each phase's own gate justified it.** Per the execution directive, continuing
+autonomously to Phase 6 (eight-core attention) next.
