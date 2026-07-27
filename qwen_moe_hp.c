@@ -1312,7 +1312,14 @@ int main(int c,char**v){
      * KV cache to fit. Lets the same binary/build measure how the attention bucket scales with
      * context length without a second benchmark harness. */
     int ctxlen_req=0; { const char*cv=getenv("QWEN_CTXLEN"); if(cv) ctxlen_req=atoi(cv); }
-    int ctx=64; if(ctxlen_req>0 && ctxlen_req+ngen+4>ctx) ctx=ctxlen_req+ngen+4;
+    /* ctx must cover prefill+ngen regardless of which prompt path is taken -- the default path's
+     * prefill is a fixed 12 tokens (see `np` below), NOT just the QWEN_CTXLEN path. Previously only
+     * the QWEN_CTXLEN branch grew ctx, so any ngen (2nd CLI arg, directly user-controlled, no
+     * bound) past ~52 on the default 12-token prompt silently overran the KV cache -- caught by the
+     * new forward() bounds guard (codex_recs_1.md §22.25) the first time a longer decode was
+     * actually requested, not hypothetically. */
+    int base_np=(ctxlen_req>0)?ctxlen_req:12;
+    int ctx=64; if(base_np+ngen+4>ctx) ctx=base_np+ngen+4;
     Kv kv; kv.kvd=m.nkv*m.hd; kv.ctx=ctx; kv.Kc=calloc((size_t)m.nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m.nl*ctx*kv.kvd,4);
     int d=m.d,qd=m.nh*m.hd,moe=m.moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
     float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),

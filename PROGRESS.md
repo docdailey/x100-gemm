@@ -56,6 +56,20 @@ rational-Padé was already promoted on the strength of §22.21's production A/B,
 numbers. This was purely a validate-the-validator exercise, and it found and fixed real, previously
 undetected bugs in the harness itself.
 
+**Fresh production A/B reconfirms rational-Padé; a real production-path bug found and fixed along
+the way (2026-07-26, `codex_recs_1.md` §22.26).** Reran §22.21's exact/rational-Padé A/B fresh,
+given everything since (OOM incident, vendor lib fix, harness bugfixes): **92.2% SwiGLU bucket
+reduction, wall -14.5%, tok/s +16.9%** (9.71→11.355 tok/s avg) — reproduces §22.21 almost exactly,
+promotion confirmed sound. Extending the check to `ngen=60` (beyond the canonical 16-token window)
+immediately tripped the new `forward()` guard: `main()`'s KV-cache sizing only grew for `ngen` under
+`QWEN_CTXLEN`, leaving the *default* prompt path's `ctx` hardcoded at 64 regardless of `ngen` — any
+production invocation requesting more than ~52 generated tokens would have silently overrun the KV
+cache. **This was live in the shipped production binary all session**, not harness-only. Fixed
+(`ctx` now sized from whichever prefill length is actually in effect); reverified clean at
+`ngen=60` under both SwiGLU configs, default `ngen=16` unaffected. At `ngen=60`'s longer context,
+SwiGLU's savings barely move tok/s (8.82 vs 8.88) because attention now dominates — a live
+confirmation of §22.23's crossover finding.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 11.35-11.4 tok/s (default config), AT PARITY with the vendor binary at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

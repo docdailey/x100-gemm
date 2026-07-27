@@ -2411,3 +2411,52 @@ narrower but still important: the corpus/generation-length expansion added in §
 real, previously-latent bug (`ppl_reason`'s stale length) plus four newly-discovered ones
 (hp3/hp4/hp9/hp10's stale prefill lengths) that had silently affected every harness run referencing
 those five entries all session, now fixed and ASan-verified clean.
+
+### 22.26 Fresh production A/B, exact vs rational-Padé — reconfirmed, plus a real production-path bug found along the way
+
+Per explicit direction to run a clean production A/B given everything since §22.21 (the OOM
+incident, the vendor library fix, the harness bugfixes), reran the identical methodology: same
+build, same cache, canonical 12-token prompt, `g_router_mode=2` (int8-M1), `nt=4`, `ngen=16`,
+varying only `g_swiglu_fast` (0 vs 2), two paired trials, board otherwise idle.
+
+| trial | config | tok/s | wall/tok | swiglu bucket | tokens |
+|---|---|---|---|---|---|
+| 1 | exact | 9.87 | 101.3ms | 14.5ms | `Tokyo. The capital of Brazil is Brasília. The capital of Canada is Ottawa.` |
+| 1 | ratsig | 11.34 | 88.2ms | 1.3ms | identical |
+| 2 | exact | 9.55 | 104.7ms | 17.6ms | identical |
+| 2 | ratsig | 11.37 | 88.0ms | 1.2ms | identical |
+
+Averages: exact 9.71 tok/s (wall 103.0ms, swiglu 16.05ms); rational-Padé 11.355 tok/s (wall
+88.1ms, swiglu 1.25ms). **SwiGLU bucket reduction 92.2%, wall time -14.5%, tok/s +16.9%** —
+reproduces §22.21's original A/B (92.1%/-14.4%/+16.8%) almost exactly, confirming the promotion
+remains sound after everything that's happened to the board since. Every other bucket
+(act-pack 2.3-2.5, linear 58.6-58.8, attention 9.0-9.2, rope 3.1, router 4.2-4.3, rest 8.0-8.2)
+stayed flat across all four runs — no regression anywhere else. Tokens byte-identical between exact
+and rational-Padé in every trial, `' Tokyo'` PASS throughout.
+
+**Extending the qualitative check past the canonical 16-token window (per "output quality") found
+and fixed a real production-path bug.** Running `ngen=60` with the default 12-token prompt hit the
+new `forward()` bounds guard immediately: `KV position overflow: pos=64 ctx=64`. Cause: `main()`'s
+`ctx` sizing only grew to accommodate `ngen` inside the `QWEN_CTXLEN` branch
+(`ctx=ctxlen_req+ngen+4`) — the *default* 12-token-prompt path left `ctx` hardcoded at 64
+regardless of `ngen`, even though `ngen` is a directly user-controlled 2nd CLI arg with no upper
+bound. **Any production invocation requesting more than ~52 generated tokens on the default prompt
+would have silently overrun the KV cache** — this was always live in the production binary, not
+harness-only, and had simply never been exercised with a large enough `ngen` argument before
+today. Fixed: `ctx` now computed from `base_np+ngen+4` where `base_np` is whichever prefill length
+is actually in effect (12 by default, or `ctxlen_req`), not only the `QWEN_CTXLEN` case. Rebuilt,
+reverified: `ngen=60` now runs clean under both `g_swiglu_fast` settings, `' Tokyo'` PASS, default
+`ngen=16` invocation unaffected (11.23 tok/s, within normal run-to-run noise).
+
+Qualitative spot check at `ngen=60` (well past the §22.23 attention/linear crossover — context
+grows from 12 to 71 across the window, so attention dominates far more here than at the canonical
+16-token setting): both configs stay on-topic and coherent (continuing the "capitals of the world"
+list), diverging only in which specific countries get mentioned after Brazil/Canada, consistent
+with every earlier free-running comparison this session. At this longer window the SwiGLU
+bucket savings (14.0ms→1.2ms) barely move end-to-end tok/s (8.82 vs 8.88) because attention has
+grown to dominate the per-token cost — a live, concrete illustration of §22.23's crossover finding,
+not just a synthetic `QWEN_CTXLEN` sweep.
+
+**Conclusion: the production A/B reconfirms rational-Padé's promotion with fresh numbers, and the
+exercise of actually testing output quality at a non-canonical generation length caught a real bug
+that had been sitting in the shipped production binary the whole session.**
