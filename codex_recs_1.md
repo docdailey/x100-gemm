@@ -2863,3 +2863,92 @@ check.
 **All three attention-bucket components (QK, AV, softmax) are now RVV-optimized and fused/
 vectorized where each phase's own gate justified it.** Per the execution directive, continuing
 autonomously to Phase 6 (eight-core attention) next.
+
+### 22.33 Attention Phase 6: eight-core attention — KEPT
+
+Explicit authorization: linear/IME work stays on four workers (harts 8/10/12/14); attention-only
+work may additionally use harts 9/11/13/15; generalize the persistent pool/job worker count safely,
+idling surplus workers during four-worker linear jobs; measure attention workers 1/2/4/8 at
+ctx=128/512/1024; check cache/memory contention, dispatch overhead, temperatures, end-to-end tok/s;
+keep eight-worker attention only if it beats four workers reproducibly.
+
+**Implementation.** Attention had been capped at `min(nt,nkv)`=4 workers because each KV head's
+work was assigned to exactly one worker atomically (Phase 3's own division). To use more than 4
+workers, each KV head's `gpr` (8) query heads must be SPLIT across `gpk` sub-workers
+(`gpk=attn_nt/nkv`, e.g. 2 at attn_nt=8) instead of striding across more KV heads (there are only
+4). `attn_worker_run` now computes `gpk`, `qi_count` (query heads owned per sub-worker), and each
+worker's `(kvh, qi_start)` assignment from `(tn, attn_nt, nkv, gpr)`; at `attn_nt<=nkv` (`gpk=1`)
+this reduces exactly to the pre-Phase-6 code path byte-for-byte (`qi_start=0`, `qi_count=gpr`), so
+attn_nt=1/2/4 are provably unchanged. Pool sizing was generalized: `g_lin_nt` (new global, `min(nt,
+4)`) caps linear/IME GEMM dispatch independent of the total pool size, while `g_pool_nt` (the
+actual thread count) becomes `max(nt, g_attn_nt)` -- every dispatch (linear or attention) still
+wakes all `g_pool_nt-1` secondary threads, but `lin_mm_hp_worker_run` now no-ops for `tn>=g_lin_nt`
+regardless of how large the pool has grown for attention's sake. `g_hart_order` (already
+`{8,10,12,14,9,11,13,15}`, added in an earlier session per docs/HARDWARE.md's per-pair IME-2
+sharing note) already placed the paired harts last, so no pinning changes were needed -- worker
+threads created for `tn=4..7` naturally land on harts 9/11/13/15.
+
+**A genuine bug was found and fixed before validation -- not another compiler-quirk false alarm.**
+ASan at `-O3` (the production optimization level, unlike every prior anomaly in this file's history)
+reported a **100% reproducible** (10/10 trials) `stack-buffer-overflow`: a write to `ohp[8]`, one
+past the end of an 8-element pointer array, in the line populating `av8_chunk`'s output-pointer
+array. The suspected loop bound (`qi_count`) was checked directly via a temporary debug guard and
+confirmed always in range [1,8] across every run it fired on -- ruling out the obvious "arithmetic
+computes a bad count" explanation. The actual fix: `qh`/`scw`/`ohp` were declared *inside* the
+per-KV-head loop (re-entering scope every iteration) with a runtime-bounded (`qi_count`) population
+loop; hoisting them to function scope (declared once, `={0}`-initialized, matching `qk8_dot`/
+`av8_chunk`'s own `if(n>K)`-guard discipline for the unused tail slots) resolved it completely:
+**0/15 trials** failed post-fix (5 initial + 10 more), vs 10/10 pre-fix -- a clean, deterministic
+before/after, not a coincidence. This is consistent with a real GCC-15.2/`-O3` ASan-instrumentation
+interaction specific to loop-re-entered fixed-size arrays paired with a variable-trip-count
+population loop, though the precise compiler mechanism was not further isolated -- the fix's
+reliability (15/15 clean) was judged sufficient without pursuing a minimal reproduction case.
+
+**Validation** (full order, all on `root@192.168.68.24`): production integration validation
+(`QWEN_WORKERS_VALIDATE=1`, comparing each `attn_nt` against the attn_nt=1 serial baseline on real
+q/K/V through the real dispatch path) — **attn_nt=2/4/8 all report 55,050,240 comparisons, 0
+mismatches, max_abs=0** (attn_nt=1 trivially reports 0 comparisons against itself). Re-confirmed
+identically on the post-fix code. Full sanitizer matrix at `attn_nt=8`, 3 trials each (matching the
+"3/3 clean" bar from Phase 4.1/4.2): **ASan clean 9/9** across `-O1`/`-O2`/`-O3` (including the
+now-fixed `-O3` case). UBSan clean 6/6 at `-O2`/`-O3`; UBSan-`-O1` crashes 3/3 with a silent SIGSEGV
+(no diagnostic text, exit 139) -- this matches, in pattern (fails only at `-O1`, clean at `-O2`/
+`-O3` under both sanitizers), this file's already-documented `-O1` GCC/RVV instability class
+(§22.16, and Phase 4.1/4.2's own `-O1`-only findings), not a new logic bug -- especially given ASan
+is now clean at all three optimization levels including `-O1`. Board temperatures stayed in the
+60-70°C range throughout the full A/B (interleaved baseline/candidate, ~90 minutes), rising
+gradually with sustained load, no thermal-throttling signature in the timing data (trial-to-trial
+agreement stayed tight even in the later, warmer runs).
+
+**A/B, 2 trials per configuration, board otherwise idle, interleaved baseline(`attn_nt=4`)/
+candidate(`attn_nt=8`) per run per the operational rules** (values are 2-trial averages):
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| attention bucket (wall) | 1.52→0.97ms (**-36.2%**) | 8.345→4.505ms (**-46.0%**) | 29.145→16.155ms (**-44.6%**) | 55.52→33.675ms (**-39.3%**) |
+| wall/token | 81.3→81.0ms (-0.4%) | 88.65→84.7ms (**-4.5%**) | 109.5→97.7ms (**-10.8%**) | 135.9→115.7ms (**-14.9%**) |
+| tok/s | 12.30→12.34 (+0.3%) | 11.28→11.805 (**+4.7%**) | 9.13→10.24 (**+12.2%**) | 7.36→8.645 (**+17.5%**) |
+
+Improvement grows with context length -- expected, since eight-way parallelism has more work per
+worker to amortize dispatch/sync overhead against at longer contexts, and the 4-vs-8-worker gap in
+per-worker QK/AV compute (still summed-work bound, not yet bandwidth-bound at these context lengths)
+widens accordingly. Dispatch overhead itself stayed tiny and flat throughout (0.08-0.14ms across
+every configuration, no growth with worker count) -- the coordination cost of the larger pool is not
+eating the gain. Generated token text is byte-identical between `attn_nt=4` and `attn_nt=8` at every
+context length across both trials (also confirmed by the bit-exact integration validation above).
+Short-context wall time does not regress (a small improvement instead), comfortably clear of any
+reasonable regression ceiling.
+
+**KEPT.** `g_attn_nt` default promoted from 4 to 8. `QWEN_ATTN_NT=4` remains the explicit four-
+worker revert (byte-identical to the Phase 3-5 configuration, since `gpk==1` at `attn_nt<=nkv`
+reduces to the exact pre-Phase-6 code path); `QWEN_ATTN_NT=1` remains the serial revert. Rebuilt the
+production binary (`-O3 -fno-tree-vectorize`) and confirmed the promoted default reproduces the
+A/B's `attn_nt=8` numbers exactly and still passes the canonical `' Tokyo'` check. **The canonical-
+prompt HEADLINE number itself moved again: ~12.3-12.35→12.37 tok/s** (a small further gain on top
+of Phases 3-5's own short-context improvements, since short-context attention was already a tiny
+fraction of wall time before this phase).
+
+**Per the execution directive, all of Phase 1 through Phase 6 are now complete and kept.** The next
+tracks (exact-path closure, M-batch/continuous batching, batched prefill, speculative/n-gram
+verification, and quality-changing long-context experiments) proceed per the broader authorization,
+with track 7 (quality-changing experiments) requiring explicit approval before promoting any
+semantics-changing mode, per that authorization's own terms.

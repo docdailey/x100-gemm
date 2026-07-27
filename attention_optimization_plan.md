@@ -264,6 +264,15 @@ per the execution directive, no layout/threading/fusion candidate is implemented
 | Softmax RVV (T1) | 1024 | 114.39* | 58.98* | 38.11* | 55.45 | 135.7 | 7.37 | identical to Phase 4.2 |
 | Softmax RVV (T2) | 1024 | 113.73* | 58.99* | 38.01* | 55.27 | 135.3 | 7.39 | identical to Phase 4.2 |
 | Softmax RVV (avg) | 1024 | 114.06* | 58.985* | 38.06* | 55.36 | 135.5 | 7.38 | — |
+| Eight-core attention (T1) | 128 | 17.45* | 8.10* | 6.54* | 4.52 | 84.8 | 11.79 | identical to Softmax RVV |
+| Eight-core attention (T2) | 128 | 17.38* | 8.12* | 6.42* | 4.49 | 84.6 | 11.82 | identical to Softmax RVV |
+| Eight-core attention (avg) | 128 | 17.415* | 8.11* | 6.48* | 4.505 | 84.7 | 11.805 | — |
+| Eight-core attention (T1) | 512 | 62.60* | 29.69* | 28.10* | 16.58 | 97.7 | 10.24 | identical to Softmax RVV |
+| Eight-core attention (T2) | 512 | 62.80* | 29.75* | 23.08* | 15.73 | 97.7 | 10.24 | identical to Softmax RVV |
+| Eight-core attention (avg) | 512 | 62.70* | 29.72* | 25.59* | 16.155 | 97.7 | 10.24 | — |
+| Eight-core attention (T1) | 1024 | 124.89* | 58.78* | 65.23* | 33.02 | 115.0 | 8.70 | identical to Softmax RVV |
+| Eight-core attention (T2) | 1024 | 123.63* | 58.84* | 69.71* | 34.33 | 116.4 | 8.59 | identical to Softmax RVV |
+| Eight-core attention (avg) | 1024 | 124.26* | 58.81* | 67.47* | 33.675 | 115.7 | 8.645 | — |
 
 **Baseline reading**: QK and AV are essentially co-dominant (~46-48% of the attention bucket each,
 at every context tested), softmax is a small but non-trivial 5.7-6.9% (shrinking slightly as a
@@ -442,6 +451,44 @@ defaults to 1; `QWEN_SOFTMAX_RVV=0` is the explicit revert. Full writeup in `cod
 **All three attention-bucket components (QK, AV, softmax) are now optimized.** Continuing per
 explicit authorization to Phase 6 (eight-core attention) next.
 
+**Phase 6 result (2026-07-28): KEPT — eight-core attention.** Linear/IME stayed on four workers
+(harts 8/10/12/14, `g_lin_nt`); attention gained access to the paired harts 9/11/13/15, splitting
+each KV head's 8 query heads across `gpk=2` sub-workers so all 8 pool threads have real attention
+work (`attn_worker_run` generalized `kvh`/`qi` assignment from `tn`, `attn_nt`, `nkv`, `gpr`;
+reduces exactly to the pre-Phase-6 code at `attn_nt<=nkv`). Pool sizing generalized: `g_lin_nt=
+min(nt,4)` caps linear dispatch, `g_pool_nt=max(nt,g_attn_nt)` sizes the actual thread pool.
+
+A real bug was found and fixed, not another compiler-quirk false alarm: ASan-`-O3` (production
+optimization level) caught a 100%-reproducible stack-buffer-overflow (`ohp[8]`, one past an 8-slot
+array) in the per-KV-head loop populating AV's output-pointer arrays. The suspected loop bound was
+directly checked and always valid — the actual cause was `qh`/`scw`/`ohp` being declared *inside*
+the per-KV-head loop with a runtime-bounded population loop; hoisting them to function scope
+(declared once, zero-initialized) resolved it completely: 0/15 trials failed post-fix vs 10/10
+pre-fix. Full sanitizer sweep post-fix: ASan clean 9/9 across `-O1`/`-O2`/`-O3`; UBSan clean 6/6 at
+`-O2`/`-O3`; UBSan-`-O1` still shows this file's already-documented `-O1` GCC/RVV instability
+(§22.16) — not a new logic bug, and no longer the only clean-sanitizer signal, since ASan is now
+clean at every level including `-O1`. Production integration validation (`QWEN_WORKERS_VALIDATE=1`)
+confirmed bit-exact against the serial baseline at attn_nt=2/4/8 (55,050,240 comparisons, 0
+mismatches each), both pre- and post-fix. Board temperature stayed 60-70°C throughout, no
+throttling signature.
+
+| | short | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| attention bucket | 1.52→0.97ms (**-36.2%**) | 8.345→4.505ms (**-46.0%**) | 29.145→16.155ms (**-44.6%**) | 55.52→33.675ms (**-39.3%**) |
+| wall/token | 81.3→81.0ms (-0.4%) | 88.65→84.7ms (**-4.5%**) | 109.5→97.7ms (**-10.8%**) | 135.9→115.7ms (**-14.9%**) |
+| tok/s | 12.30→12.34 (+0.3%) | 11.28→11.805 (**+4.7%**) | 9.13→10.24 (**+12.2%**) | 7.36→8.645 (**+17.5%**) |
+
+Improvement grows with context, dispatch overhead stayed flat (0.08-0.14ms, no growth with worker
+count), tokens byte-identical at every context, short-context does not regress. **KEPT**:
+`g_attn_nt` defaults to 8; `QWEN_ATTN_NT=4` is the explicit four-worker revert (byte-identical to
+Phase 3-5), `QWEN_ATTN_NT=1` the serial revert. Canonical-prompt HEADLINE moved again:
+~12.3-12.35→12.37 tok/s. Full writeup in `codex_recs_1.md` §22.33.
+
+**Phases 1 through 6 are all complete and kept.** The exact-path attention optimization branch is
+substantially done; per the broader authorization, continuing to exact-path closure, M-batch,
+batched prefill, and beyond, with quality-changing experiments requiring separate approval before
+promotion.
+
 ## Stop conditions
 
 Stop this branch when any of the following becomes true:
@@ -455,8 +502,10 @@ Do not combine layout, threading, and fused kernels into one patch.
 
 ## Immediate next action
 
-Phases 1–5 are complete and kept — see the scoreboard above and `codex_recs_1.md` §22.27–§22.32.
-QK, AV, and softmax are all now optimized (fused and/or RVV-vectorized) on the exact path. **Next,
-per explicit authorization: Phase 6 — eight-core attention experiment** (linear/IME work stays on
-four workers, harts 8/10/12/14; attention-only work may additionally use harts 9/11/13/15; keep
-eight-worker attention only if it beats four workers reproducibly).
+Phases 1–6 are complete and kept — see the scoreboard above and `codex_recs_1.md` §22.27–§22.33.
+QK, AV, softmax, and worker count are all now optimized on the exact path (`attn_nt=8` default).
+This attention-optimization branch's scope is substantially exhausted; per the broader
+authorization, next is exact-path closure (re-profile every bucket, test only evidence-supported
+residuals: KV prefetch, scratch allocation, cache alignment, safe next-layer prefetch — no
+cross-layer compute-overlap claims), then M-batch/continuous batching as the primary remaining
+hardware-throughput lever.

@@ -155,18 +155,38 @@ token-identical, and zero short-context regression, meeting the explicit Phase 5
 sub-buckets (QK, AV, softmax) are now optimized** — continuing per authorization to Phase 6
 (eight-core attention) next.
 
-## HEADLINE: qwen_moe_hp.c is the current best engine — 12.3-12.4 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
+**Attention Phase 6 KEPT — eight-core attention (2026-07-28, `codex_recs_1.md` §22.33).** Linear/
+IME stays on 4 workers (harts 8/10/12/14); attention gained the paired harts 9/11/13/15, splitting
+each KV head's 8 query heads across 2 sub-workers so all 8 pool threads do real attention work. A
+genuine bug (not a compiler-quirk false alarm) was found and fixed: ASan-`-O3` caught a
+100%-reproducible stack-buffer-overflow in the AV output-pointer population loop, root-caused to
+`qh`/`scw`/`ohp` being re-declared every KV-head-loop iteration with a runtime-bounded population
+loop; hoisting them to function scope fixed it completely (0/15 trials failed post-fix vs 10/10
+pre-fix). Post-fix: ASan clean 9/9 across `-O1`/`-O2`/`-O3`; UBSan clean 6/6 at `-O2`/`-O3`;
+UBSan-`-O1` shows this file's already-documented `-O1` GCC/RVV instability, not a new bug.
+Production integration validation (`QWEN_WORKERS_VALIDATE=1`) confirmed bit-exact against the
+serial baseline at every worker count (55,050,240 comparisons, 0 mismatches). Board temperature
+stayed 60-70°C, no throttling. **Attention bucket vs Phase 5: -36.2% (short), -46.0% (ctx=128),
+-44.6% (ctx=512), -39.3% (ctx=1024). Wall time: -0.4%, -4.5%, -10.8%, -14.9%. tok/s: +0.3%, +4.7%,
++12.2%, +17.5%.** Improvement grows with context, dispatch overhead flat, tokens identical, no
+short-context regression. **Promoted**: `g_attn_nt` defaults to 8; `QWEN_ATTN_NT=4` is the
+four-worker revert (byte-identical to Phase 3-5), `QWEN_ATTN_NT=1` the serial revert. Canonical
+short HEADLINE moved again: ~12.3-12.35→12.37 tok/s. **Phases 1-6 of the attention-optimization
+branch are all complete and kept** — next per the broader authorization: exact-path closure, then
+M-batch/continuous batching.
+
+## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
 kernel) — that engine is now the **prior baseline**, superseded but kept as-is (working, committed,
 untouched) for comparison. `qwen_moe_hp.c` is now **~8.3x faster** at its actual default config
-(int8-M1 router + rational-Padé SwiGLU + head-major KV layout + 4-way parallel attention + fused
-multi-Q QK and AV), same correctness bar (`' Tokyo'` PASS, coherent generation, tokens identical
-across every promoted flag's revert-flag comparison). A clean, sequential (no contention) A/B
-against the real vendor `llama-bench` binary found **11.35-11.39 tok/s (ours) vs 11.38±0.21 tok/s
-(vendor) at nt=4 — statistically at parity** *before* the attention-optimization branch
-(§22.27-§22.31) below; that
-branch has since pushed the canonical-prompt default past the vendor figure (12.3-12.4 vs
+(int8-M1 router + rational-Padé SwiGLU + head-major KV layout + 8-way parallel attention + fused
+multi-Q QK/AV + RVV softmax), same correctness bar (`' Tokyo'` PASS, coherent generation, tokens
+identical across every promoted flag's revert-flag comparison). A clean, sequential (no contention)
+A/B against the real vendor `llama-bench` binary found **11.35-11.39 tok/s (ours) vs 11.38±0.21
+tok/s (vendor) at nt=4 — statistically at parity** *before* the attention-optimization branch
+(§22.27-§22.33) below; that
+branch has since pushed the canonical-prompt default past the vendor figure (12.37 vs
 11.38±0.21) — a fresh apples-to-apples vendor re-run hasn't been done post-attention-branch, so
 treat the "past vendor" framing as directional pending that recheck, not yet as its own verified
 A/B. (That earlier vendor gap was itself found to be measured against a stale, since-fixed vendor
@@ -177,10 +197,10 @@ same day for a real quality regression (11.0% perplexity inflation at scale) —
 (rational-Padé), promoted after passing an expanded quality harness (§22.20) *and* a bounded
 production A/B (§22.21, reconfirmed §22.26); `0` (exact SiLU) remains an explicit revert flag. The
 default attention KV layout is head-major (§22.28, `qwen_moe_hp_kv_timemajor.c` preserved as the
-time-major revert reference), with attention parallelized across `min(nt,nkv)` pool workers
-(§22.29, `QWEN_ATTN_NT=1` as the serial revert flag), fused multi-Q QK and AV on (§22.30-22.31,
-`QWEN_QK_FUSE=0`/`QWEN_AV_FUSE=0` as the unfused reverts), and RVV softmax on (§22.32,
-`QWEN_SOFTMAX_RVV=0` as the scalar revert). **Build now REQUIRES `-fno-tree-vectorize`**
+time-major revert reference), with attention parallelized across 8 pool workers (§22.29/§22.33,
+`QWEN_ATTN_NT=4`/`QWEN_ATTN_NT=1` as the four-worker/serial revert flags), fused multi-Q QK and AV
+on (§22.30-22.31, `QWEN_QK_FUSE=0`/`QWEN_AV_FUSE=0` as the unfused reverts), and RVV softmax on
+(§22.32, `QWEN_SOFTMAX_RVV=0` as the scalar revert). **Build now REQUIRES `-fno-tree-vectorize`**
 (see the toolchain-hardening entry below and the file's own header comment) — this is not optional,
 it's a correctness/performance fix, not a tuning knob.
 

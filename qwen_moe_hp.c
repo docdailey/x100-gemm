@@ -440,6 +440,15 @@ static int g_router_mode=0;
  * np<Np; np+=nt), so the actual math is unchanged -- only the dispatch mechanism differs.
  * Generalized (kind field) to also dispatch the int8 M1 kernel through the same pool. */
 #define MAXNT 16
+/* g_lin_nt: Phase 6 (codex_recs_1.md §22.33) safety cap -- linear/IME GEMM work (kind 0/1) must
+ * stay on the primary, non-contended harts (8/10/12/14 at the historical nt=4 default) regardless
+ * of how many TOTAL pool threads exist (g_pool_nt, which Phase 6 may grow up to 8 so attention can
+ * also use the paired harts 9/11/13/15). IME-2 is shared per hart-pair; using both harts of a pair
+ * concurrently for IME-2 work is measured contended (docs/HARDWARE.md, pin_once's own comment).
+ * Set once in main() to min(nt,4) -- nt<4 (an explicit, if untested, caller request for fewer
+ * linear workers) is honored as before; nt>4 is capped at 4, never silently expanded to more than
+ * the historical linear worker count regardless of how large the attention-only pool grows. */
+static int g_lin_nt=4;
 /* kind: 0=int4 HP GEMM, 1=int8 M1 GEMM, 2=attention (Phase 3, codex_recs_1.md §22.29). The
  * attention-only fields are unused by kind 0/1 and vice versa; kept as plain extra fields (not a
  * union) since HpWork is small and this file already treats struct simplicity as more valuable
@@ -458,12 +467,14 @@ static void attn_worker_run(int tn); /* defined after vdot_f32/softmax/vaxpy_f32
 
 static void lin_mm_hp_worker_run(int tn){
     if(g_pool_work.kind==2){ attn_worker_run(tn); return; }
+    if(tn>=g_lin_nt) return; /* Phase 6: extra pool threads (harts 9/11/13/15) idle during every
+        linear/IME dispatch, never participate in GEMM work -- see g_lin_nt's own comment. */
     int Np=g_pool_work.l->N/32;
     if(g_pool_work.kind==0){
-        for(int np=tn; np<Np; np+=g_pool_nt)
+        for(int np=tn; np<Np; np+=g_lin_nt)
             run_hp_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER, g_pool_work.y+np*32, g_pool_work.kb);
     } else {
-        for(int np=tn; np<Np; np+=g_pool_nt)
+        for(int np=tn; np<Np; np+=g_lin_nt)
             run_i8_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BREC_I8, g_pool_work.y+np*32, g_pool_work.kb);
     }
 }
@@ -479,23 +490,32 @@ static void* lin_mm_hp_worker(void*arg){
         atomic_fetch_add_explicit(&g_pool_done,1,memory_order_release);
     }
 }
-static void lin_mm_pool_init(int nt){
-    g_pool_nt=nt; pin_once(0);
-    for(int i=1;i<nt;i++) pthread_create(&g_pool_threads[i],NULL,lin_mm_hp_worker,(void*)(intptr_t)i);
+static void lin_mm_pool_init(int total){
+    /* Phase 6 (codex_recs_1.md §22.33): `total` is the FULL pool size (may exceed g_lin_nt when
+     * attention wants more workers than linear/IME does) -- every created thread is woken on every
+     * dispatch regardless of kind, so the wait bound in lin_mm_hp/lin_mm_i8/attn_dispatch must all
+     * agree on g_pool_nt, not some kind-specific subset. */
+    g_pool_nt=total; pin_once(0);
+    for(int i=1;i<total;i++) pthread_create(&g_pool_threads[i],NULL,lin_mm_hp_worker,(void*)(intptr_t)i);
 }
 static void lin_mm_hp(const Lin*l,const uint8_t*Abuf,float*y,int nt){
+    (void)nt; /* superseded by g_pool_nt (Phase 6) -- kept as a parameter so every call site (many,
+        threaded through forward()) doesn't need touching; the actual worker count used for both
+        the linear-specific stride (g_lin_nt) and the pool-wide wait bound (g_pool_nt) are globals
+        now, decoupled from this historically-named-the-same local. */
     g_pool_work.kind=0; g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/256;
     atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release); /* wake workers 1..nt-1 */
+    atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release); /* wake workers 1..g_pool_nt-1 */
     lin_mm_hp_worker_run(0); /* main thread does its own share (tn=0) */
-    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < nt-1) { /* spin */ }
+    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < g_pool_nt-1) { /* spin */ }
 }
 static void lin_mm_i8(const Lin*l,const uint8_t*Abuf,float*y,int nt){
+    (void)nt; /* superseded by g_pool_nt (Phase 6) -- see lin_mm_hp's own comment */
     g_pool_work.kind=1; g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/32;
     atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
     atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release);
     lin_mm_hp_worker_run(0);
-    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < nt-1) { /* spin */ }
+    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < g_pool_nt-1) { /* spin */ }
 }
 static void lin_mm(const Lin*l,const float*x,float*y,int nt,uint8_t*Abuf){
     double _ta=gT_on?now():0;
@@ -841,46 +861,64 @@ static void attn_scratch_multi_ensure(int ctx,int gpr){
     for(int i=0;i<MAXNT;i++){ free(g_attn_scratch_multi[i]); g_attn_scratch_multi[i]=malloc((size_t)gg*cc*4); }
     g_attn_scratch_multi_ctx=cc; g_attn_scratch_multi_gpr=gg;
 }
+/* Phase 6 (codex_recs_1.md §22.33): attention worker count may now exceed nkv (4) -- up to 8, using
+ * the paired A100 harts (9/11/13/15) alongside the primary four (8/10/12/14). Since each KV head's
+ * work was previously assigned to exactly one worker atomically, attn_nt>nkv needs each KV head's
+ * gpr (8) query heads SPLIT across `gpk` sub-workers (gpk=attn_nt/nkv, e.g. 2 at attn_nt=8) instead
+ * of just striding across more KV heads (there are only nkv=4 of those, so attn_nt=8 would
+ * otherwise leave workers 4-7 permanently idle no-ops). At attn_nt<=nkv (gpk=1) this reduces
+ * exactly to the pre-Phase-6 behavior byte-for-byte: kvh_stride=attn_nt, qi_start=0,
+ * qi_count=gpr -- so nothing changes for the already-KEPT attn_nt=1/2/4 configurations. */
 static void attn_worker_run(int tn){
     if(tn>=g_pool_work.aattn_nt){ g_w_qk[tn]=g_w_sm[tn]=g_w_av[tn]=0; return; }
     int nkv=g_pool_work.ankv, gpr=g_pool_work.agpr, hd=g_pool_work.ahd, pos=g_pool_work.apos, actx=g_pool_work.actx;
+    int attn_nt=g_pool_work.aattn_nt;
     float scale=g_pool_work.ascale;
     const float*q=g_pool_work.aq, *Kc=g_pool_work.aKc, *Vc=g_pool_work.aVc; float*att=g_pool_work.aatt;
     double qk=0, sm=0, av=0;
+    int gpk = (attn_nt>nkv) ? (attn_nt/nkv) : 1;      /* subgroups per KV head */
+    int qi_count = gpr/gpk;                            /* query heads this worker owns per KV head */
+    int kvh_stride = (gpk==1) ? attn_nt : nkv;
+    int kvh_init = (gpk==1) ? tn : (tn/gpk);
+    int qi_start = (gpk==1) ? 0 : (tn%gpk)*qi_count;
     if(g_qk_fuse && gpr<=QK8_MAXGPR){
-        float*scm=g_attn_scratch_multi[tn]; /* [qi*actx+j] */
-        const float*qh[QK8_MAXGPR];
-        for(int kvh=tn; kvh<nkv; kvh+=g_pool_work.aattn_nt){
+        float*scm=g_attn_scratch_multi[tn]; /* [local_qi*actx+j], local_qi in [0,qi_count) */
+        /* qh/scw/ohp declared ONCE at function scope (not re-entered every kvh-loop iteration) --
+         * only [0,qi_count) of each QK8_MAXGPR(8)-sized array is ever populated/read/written;
+         * slots [qi_count,QK8_MAXGPR) are simply unused, never touched, for the lifetime of the
+         * call. This mirrors qk8_dot/av8_chunk's own `if(n>K)` guard discipline exactly. */
+        const float*qh[QK8_MAXGPR]={0};
+        const float*scw[QK8_MAXGPR]={0}; float*ohp[QK8_MAXGPR]={0};
+        for(int kvh=kvh_init; kvh<nkv; kvh+=kvh_stride){
             const float*Kh=Kc+(size_t)kvh*actx*hd, *Vh=Vc+(size_t)kvh*actx*hd;
-            for(int qi=0;qi<gpr;qi++) qh[qi]=q+(size_t)(kvh*gpr+qi)*hd;
+            for(int li=0;li<qi_count;li++) qh[li]=q+(size_t)(kvh*gpr+qi_start+li)*hd;
             double t0=gT_on?now():0;
             for(int j=0;j<=pos;j++){
                 const float*kj=Kh+(size_t)j*hd;
                 float out8[QK8_MAXGPR];
-                qk8_dot(qh,kj,hd,gpr,out8);
-                for(int qi=0;qi<gpr;qi++){
-                    float s=out8[qi]*scale; scm[(size_t)qi*actx+j]=s;
-                    if(g_qk_capture) g_qk_capture[(size_t)(kvh*gpr+qi)*actx+j]=s;
+                qk8_dot(qh,kj,hd,qi_count,out8);
+                for(int li=0;li<qi_count;li++){
+                    float s=out8[li]*scale; scm[(size_t)li*actx+j]=s;
+                    if(g_qk_capture) g_qk_capture[(size_t)(kvh*gpr+qi_start+li)*actx+j]=s;
                 }
             }
             double t1=gT_on?now():0; if(gT_on) qk+=t1-t0;
-            for(int qi=0;qi<gpr;qi++) softmax(scm+(size_t)qi*actx,pos+1);
+            for(int li=0;li<qi_count;li++) softmax(scm+(size_t)li*actx,pos+1);
             double t2=gT_on?now():0; if(gT_on) sm+=t2-t1;
             if(g_av_fuse){
-                /* Phase 4.2 (codex_recs_1.md §22.31): all gpr heads' softmax weights for this KV
-                 * head are ready together (unlike the unfused branch below), so AV can process all
-                 * 8 output heads per hd-chunk, loading each V chunk once instead of gpr times. */
-                const float*scw[QK8_MAXGPR]; float*ohp[QK8_MAXGPR];
-                for(int qi=0;qi<gpr;qi++){ ohp[qi]=att+(size_t)(kvh*gpr+qi)*hd; scw[qi]=scm+(size_t)qi*actx; }
+                /* Phase 4.2 (codex_recs_1.md §22.31): all qi_count heads' softmax weights for this
+                 * KV head (sub)group are ready together, so AV can process them all per hd-chunk,
+                 * loading each V chunk once instead of qi_count times. */
+                for(int li=0;li<qi_count;li++){ ohp[li]=att+(size_t)(kvh*gpr+qi_start+li)*hd; scw[li]=scm+(size_t)li*actx; }
                 int coff=0;
                 while(coff<hd){
                     size_t vl=__riscv_vsetvl_e32m1(hd-coff);
-                    av8_chunk(scw,Vh,hd,pos,gpr,ohp,coff,vl);
+                    av8_chunk(scw,Vh,hd,pos,qi_count,ohp,coff,vl);
                     coff+=(int)vl;
                 }
             } else {
-                for(int qi=0;qi<gpr;qi++){
-                    int hh=kvh*gpr+qi; float*sc=scm+(size_t)qi*actx;
+                for(int li=0;li<qi_count;li++){
+                    int hh=kvh*gpr+qi_start+li; float*sc=scm+(size_t)li*actx;
                     float*oh=att+(size_t)hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
                     for(int j=0;j<=pos;j++){ const float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); }
                 }
@@ -888,11 +926,13 @@ static void attn_worker_run(int tn){
             if(gT_on) av += now()-t2;
         }
     } else {
-        /* Phase 3 code, unchanged -- explicit revert path when g_qk_fuse==0. */
+        /* Phase 3 code, unchanged -- explicit revert path when g_qk_fuse==0. qi ranges over
+         * [qi_start,qi_start+qi_count) directly (no local/global remap needed: g_attn_scratch[tn]
+         * is a plain ctx-sized row reused serially per query head, not gpr-dimensioned). */
         float*sc=g_attn_scratch[tn];
-        for(int kvh=tn; kvh<nkv; kvh+=g_pool_work.aattn_nt){
+        for(int kvh=kvh_init; kvh<nkv; kvh+=kvh_stride){
             const float*Kh=Kc+(size_t)kvh*actx*hd, *Vh=Vc+(size_t)kvh*actx*hd;
-            for(int qi=0; qi<gpr; qi++){
+            for(int qi=qi_start; qi<qi_start+qi_count; qi++){
                 int hh=kvh*gpr+qi; const float*qh=q+(size_t)hh*hd;
                 double t0=gT_on?now():0;
                 for(int j=0;j<=pos;j++){
@@ -1002,6 +1042,38 @@ static void attn_av_validate_and_dispatch(const float*q,const float*Kc,const flo
     }
     g_av_fuse=real_av;
     memcpy(att, real_av?g_avval_fused:g_avval_unfused, (size_t)nh*hd*4); /* leave att correct for the configured mode -- reuse rather than a third dispatch */
+}
+/* Phase 6 integration validation (codex_recs_1.md §22.33): the sub-KV-head work partitioning added
+ * for attn_nt>nkv (see attn_worker_run's own comment) is a pure work-REDISTRIBUTION change -- each
+ * individual query head's QK/softmax/AV math is unchanged, only which worker computes it and how
+ * many OTHER heads it's batched alongside in the same qk8_dot/av8_chunk call (which by construction
+ * doesn't affect any one head's own result, per Phase 4.1/4.2's own validation). Still verified,
+ * not assumed: runs the real attn_dispatch path at attn_nt=1 (the serial baseline, already proven
+ * correct in Phase 2/3) and at the actually-configured attn_nt, on the same real q/Kc/Vc, into
+ * separate buffers, and diffs them. */
+static int g_workers_validate=0; /* set via QWEN_WORKERS_VALIDATE=1 */
+static float *g_wval_ref=NULL, *g_wval_cand=NULL; static int g_wval_cap=0;
+static long g_wval_cmp=0, g_wval_mismatch=0; static double g_wval_max_abs=0, g_wval_max_rel=0;
+static void attn_workers_validate_and_dispatch(const float*q,const float*Kc,const float*Vc,float*att,int pos,float scale,
+        int hd,int nkv,int gpr,int actx,int attn_nt){
+    int nh=nkv*gpr;
+    if(g_wval_cap < nh*hd){
+        free(g_wval_ref); free(g_wval_cand);
+        g_wval_ref=malloc((size_t)nh*hd*4); g_wval_cand=malloc((size_t)nh*hd*4);
+        g_wval_cap=nh*hd;
+    }
+    attn_dispatch(q,Kc,Vc,g_wval_ref,pos,scale,hd,nkv,gpr,actx,1); /* serial baseline */
+    attn_dispatch(q,Kc,Vc,g_wval_cand,pos,scale,hd,nkv,gpr,actx,attn_nt);
+
+    for(int i=0;i<nh*hd;i++){
+        double r=g_wval_ref[i], c=g_wval_cand[i];
+        double ad=fabs(r-c); double rd=fabs(r)>1e-12?ad/fabs(r):ad;
+        if(ad>g_wval_max_abs) g_wval_max_abs=ad;
+        if(rd>g_wval_max_rel) g_wval_max_rel=rd;
+        if(ad>1e-4) g_wval_mismatch++;
+        g_wval_cmp++;
+    }
+    memcpy(att, g_wval_cand, (size_t)nh*hd*4); /* leave att correct for the configured attn_nt */
 }
 /* SwiGLU (codex_recs_1.md §22.18): g_swiglu_fast selects exact SiLU(x)*u (default, `expf`-based,
  * matches the original engine exactly) or a candidate fast approximation, gated behind the flag
@@ -1209,6 +1281,8 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
             attn_qk_validate_and_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         } else if(g_av_validate){
             attn_av_validate_and_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
+        } else if(g_workers_validate){
+            attn_workers_validate_and_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         } else {
             attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         }
@@ -1764,15 +1838,26 @@ int main(int c,char**v){
      * context length without a second benchmark harness. */
     int ctxlen_req=0; { const char*cv=getenv("QWEN_CTXLEN"); if(cv) ctxlen_req=atoi(cv); }
     /* QWEN_ATTN_NT (env var, same convention): number of pool threads that participate in
-     * attention (attention_optimization_plan.md Phase 3, codex_recs_1.md §22.29). DEFAULT since
-     * 2026-07-26 is min(nt,nkv) -- promoted after passing every predeclared keep criterion: tokens
-     * identical at every worker count and context tested, ASan+UBSan clean, attention bucket
-     * -74.4%/-74.9% at ctx=1024/512 (>=20% required), tok/s +160.4%/+117.1% (>=10% required),
-     * short-context wall time *improved* 8.25% (>=2% regression tolerated). `QWEN_ATTN_NT=1`
-     * remains an explicit serial revert flag, byte-identical to Phase 2's code path. Values above
-     * g_pool_nt are clamped (no more workers than exist). */
-    g_attn_nt = nt<m.nkv ? nt : m.nkv;
-    { const char*av=getenv("QWEN_ATTN_NT"); if(av){ g_attn_nt=atoi(av); if(g_attn_nt>nt) g_attn_nt=nt; if(g_attn_nt<1) g_attn_nt=1; } }
+     * attention (attention_optimization_plan.md Phase 3, codex_recs_1.md §22.29). Phase 3 promoted
+     * min(nt,nkv)=4 as the default (2026-07-26). Phase 6 (codex_recs_1.md §22.33, 2026-07-28) KEPT
+     * eight-worker attention -- attn_nt=8 (using the paired harts 9/11/13/15 alongside 8/10/12/14,
+     * decoupled from `nt`, the linear/IME worker count) reproducibly beat attn_nt=4: attention
+     * bucket -36.2%/-46.0%/-44.6%/-39.3% at short/128/512/1024, wall time -0.4%/-4.5%/-10.8%/-14.9%,
+     * tok/s +0.3%/+4.7%/+12.2%/+17.5% -- growing with context, tokens identical throughout, no
+     * short-context regression. DEFAULT is now 8. `QWEN_ATTN_NT=1` remains the serial revert
+     * (byte-identical to Phase 2); `QWEN_ATTN_NT=4` reverts to the Phase 3-5 four-worker
+     * configuration (byte-identical, since gpk==1 at attn_nt<=nkv reduces to the pre-Phase-6 code
+     * path exactly). Clamped at MAXNT's practical limit of 8 (g_hart_order only has 8 entries). */
+    g_attn_nt = 8;
+    { const char*av=getenv("QWEN_ATTN_NT"); if(av){ g_attn_nt=atoi(av); if(g_attn_nt>8) g_attn_nt=8; if(g_attn_nt<1) g_attn_nt=1; } }
+    /* g_lin_nt / pool sizing (Phase 6, codex_recs_1.md §22.33): linear/IME stays capped at min(nt,4)
+     * regardless of how large attention's own request grows the total pool. The pool itself must be
+     * created with enough threads for whichever of the two is larger, since every dispatch (linear
+     * or attention) wakes ALL g_pool_nt-1 secondary threads unconditionally -- see lin_mm_pool_init
+     * and lin_mm_hp_worker_run's own comments for why each no-ops correctly when it isn't this
+     * round's active kind. */
+    g_lin_nt = nt<4 ? nt : 4;
+    int pool_total = g_attn_nt>nt ? g_attn_nt : nt;
     /* QWEN_QK_FUSE (env var, same convention): Phase 4.1 multi-Q QK (attention_optimization_plan.md,
      * codex_recs_1.md §22.30). Default is now 1 (fused, KEPT after A/B); QWEN_QK_FUSE=0 is the
      * explicit unfused revert to the Phase 3 code path. Softmax/AV/layout/scheduling are unaffected
@@ -1802,6 +1887,11 @@ int main(int c,char**v){
     /* QWEN_SOFTMAX_VALIDATE=1: runs both scalar and RVV softmax on every real call and diffs them
      * in place (see softmax()'s own comment) -- not meant to be left on during the real A/B. */
     { const char*sv=getenv("QWEN_SOFTMAX_VALIDATE"); if(sv) g_softmax_validate=atoi(sv); }
+    /* QWEN_WORKERS_VALIDATE=1: Phase 6 (attention_optimization_plan.md, codex_recs_1.md §22.33) --
+     * runs the real attn_dispatch path at attn_nt=1 (serial baseline) and at the actually-
+     * configured g_attn_nt on every real call, diffing the two output buffers. Not meant to be
+     * left on during the real A/B. */
+    { const char*wv=getenv("QWEN_WORKERS_VALIDATE"); if(wv) g_workers_validate=atoi(wv); }
     /* ctx must cover prefill+ngen regardless of which prompt path is taken -- the default path's
      * prefill is a fixed 12 tokens (see `np` below), NOT just the QWEN_CTXLEN path. Previously only
      * the QWEN_CTXLEN branch grew ctx, so any ngen (2nd CLI arg, directly user-controlled, no
@@ -1815,7 +1905,11 @@ int main(int c,char**v){
     float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
          *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m.vocab*4);
     uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
-    lin_mm_pool_init(nt); /* PR8: persistent workers, spawned once, spin-dispatched per lin_mm_hp call */
+    lin_mm_pool_init(pool_total); /* PR8: persistent workers, spawned once, spin-dispatched per
+        lin_mm_hp call. Phase 6 (codex_recs_1.md §22.33): pool_total = max(nt,g_attn_nt), so the
+        common case (no QWEN_ATTN_NT override, or an override <=nt) creates exactly `nt` threads,
+        byte-identical resource footprint to before -- extra threads for harts 9/11/13/15 are only
+        created when an attention worker count above `nt` is explicitly requested. */
 
     /* QWEN_HARNESS=1 (env var, not an 8th CLI arg) triggers the multi-prompt quality harness --
      * see codex_recs_1.md §22.15. NOTE: an 8th positional CLI arg was tried first and reproducibly
@@ -1876,6 +1970,10 @@ int main(int c,char**v){
     if(g_softmax_validate){
         printf("  softmax_rvv validate: %ld comparisons, %ld mismatches(>1e-4 abs), max_abs=%e, max_rel=%e -- %s\n",
             g_smval_cmp, g_smval_mismatch, g_smval_max_abs, g_smval_max_rel, g_smval_mismatch==0?"PASS":"FAIL");
+    }
+    if(g_workers_validate){
+        printf("  attn_workers validate (vs serial): %ld comparisons, %ld mismatches(>1e-4 abs), max_abs=%e, max_rel=%e -- %s\n",
+            g_wval_cmp, g_wval_mismatch, g_wval_max_abs, g_wval_max_rel, g_wval_mismatch==0?"PASS":"FAIL");
     }
     if(!cached){ fprintf(stderr,"saving requant cache -> %s ...\n",cpath); double ts=now(); cache_save(&m,cpath); fprintf(stderr,"cache saved in %.1fs\n",now()-ts); }
     return 0;
