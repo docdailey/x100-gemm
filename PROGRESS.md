@@ -321,6 +321,24 @@ scheduled. Single-user M=1 production behavior untouched throughout this entire 
 explicit direction: design work for larger-N continuous serving (workload goals, N sweep, memory/KV
 budget, latency constraints, an expert-overlap oracle) BEFORE any production code changes.
 
+**Larger-N continuous serving: design phase, no code changes (2026-07-28, `codex_recs_1.md`
+§22.41).** Key finding: all 8 A100 harts are already committed to keeping ONE M4-wide round moving
+(linear≤4, attention≤8) — no spare parallelism for a second independent lane under the current
+allocation, so "larger N" can't come from raw added compute unless hart allocation is redesigned.
+Surfaced two candidate architectures: **(A)** single M4-lane continuous batching (real scheduling on
+top of the already-built M4 mechanism, filling free slots as sequences arrive/finish instead of
+milestones 1-3's artificially-synchronized fixed-4 test) vs **(B)** hart-partitioned multi-lane (2+
+independent single-sequence M1 lanes, e.g. 4 harts each — genuinely parallel, bit-exact, no
+quantization approximation, trades peak single-lane speed for concurrency). Real numbers: KV cache
+is exactly 192 KiB/position/sequence; ~10GiB usable headroom (31GiB total, ~17GiB weights resident)
+supports ~6-26 concurrent sequences at realistic 2-8K context — memory is very unlikely to be the
+binding constraint. Latency cost of (A), re-derived from milestone 2's own numbers: a sequence
+sharing a 4-wide round pays ~3.6-3.7x a solo step's latency for its own next token — a much steeper
+throughput/latency trade than GPU-style batching, since M4 arithmetic genuinely scales with M.
+Next: expert-overlap oracle (extends milestone 3's N=4 measurement to larger queue depths),
+primarily relevant to architecture (A) — flagged for the user's input on which architecture(s) to
+pursue before further engineering.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
