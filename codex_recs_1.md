@@ -3803,3 +3803,89 @@ conservative in architecture (B)'s favor, not overstated against it.
 
 Current M1 production behavior (nt=4 default, `g_attn_nt=8` default) is completely untouched — this section
 is measurement and analysis only, no code changed.
+
+### 22.43 Q3_K engine branch, step 1: standalone pack/dequant oracle + hot/cold kernel benchmark — PASS
+
+Explicit direction: "Start a separate Q3_K engine branch without modifying the working W4
+production path. Port the vendor's existing nrow_block_q3_k<32> repacker and
+gemm_kernel_i8i3k_m1 exactly, using the same oracle-first ladder that succeeded for W4: standalone
+pack/dequant oracle, hot and cold kernel benchmark, then full-engine integration with a new cache
+version." `qwen_moe_hp.c` is untouched by this entire section — all new code lives in a standalone
+probe, `bench/q3k_probe.c`.
+
+**Investigation** (delegated to a research pass, then spot-checked directly against the source
+before trusting any of it — the A2 saga earlier in this session showed how costly a wrong-kernel-
+pairing mistake is). Confirmed facts, each independently verified against
+`reference/spacemit-backend/` source, not just the investigation's own summary:
+
+- `gemm_kernel_i8i3k_m1` (`ime2_kernels.cpp:1419-2029`) contains a `#if 0 ... #else ... #endif`
+  split. The `#if 0` branch (~1445-1758) is DEAD CODE — uses plain `vmadot ... i8` and never reads
+  A's `a_sum`. The LIVE branch is the `#else` (1759-2027) — uses `vmadot.hp`, the same custom-
+  instruction family as the already-validated W4 HP kernels. Confirmed live via a real dispatch
+  trace (`ime.cpp:295-301`, `if constexpr (std::is_same_v<BLOC_TYPE, block_q3_K>)` → `quantize_a_row_i8k`
+  + `q8k_blk_size` + `gemm_kernel_i8i3k`), spot-checked directly, not trusted from a paraphrase.
+- B-side repacker: `repack_q3_k_to_q3_k_32_bl` (`repack.cpp:452-555`), read verbatim (not
+  paraphrased) before porting. Reads GGUF-native `block_q3_K` (110 bytes: `hmask[32]`, `qs[64]`,
+  `scales[12]`, `ggml_half d` — the well-known, standard ggml layout; not re-derivable from a header
+  in this checkout, cross-validated instead by self-consistency between the repacker's own read
+  offsets, the kernel's own consumption pattern, and the canonical ggml Q3_K dequant algorithm).
+  Writes `nrow_block_q3_k<32>` (3648 bytes: `scales[512]`, `hmask[1024]`, `qs[2048]`,
+  `scales16[64]`).
+- A-side packer: `quantize_a_row_i8k` (`rvv_kernels.cpp:2305-2394`), ported to plain scalar C (a
+  format-production routine, not a hot inner loop — matches how this engine's own `pack_A_hp`/
+  `pack_act_hp` are scalar C too). Produces a 292-byte/superblock "q8k" format: fp32 `a_scale` +
+  int16 `a_sum[16]` (a RAW negated sum, NOT the fp16 `-asum*8` trick W4's own HP packer uses) +
+  int8 `a_qs[256]`. This q8k format is shared ONLY between Q2_K and Q3_K (confirmed via `ime.cpp`'s
+  own dispatch table) — relevant when Q2_K work begins later, per the explicit "only after that
+  decision should Q2_K be attempted" instruction.
+- **Key correctness property**: the M1 kernel never reads A's `a_sum` field (no `lh` instruction
+  touches it in either branch) — Q3_K has no zero-point
+  (`block_type_has_zp<block_q3_K>()==false`, `ime.cpp:107`), so the sum term is dead weight for
+  this quant type. Computed correctly anyway in the port (matching the vendor packer exactly)
+  rather than skipped, to keep the port a faithful byte-format match.
+- `gemm_kernel_i8i3k_m4` (`ime2_kernels.cpp:2031-2428`) exists but uses a DIFFERENT instruction
+  family (plain `vmadot`, not `.hp`) than M1's live path — explicitly NOT ported here, flagged for
+  its own independent trace if/when an M4 port is attempted (do not assume it mirrors M1's
+  HP/scale-fusion trick).
+
+**Port**: `bench/q3k_probe.c` — `dequantize_q3_K_block` (independent canonical-ggml reference,
+not part of the port itself), `pack_B_q3k32` (verbatim transcription of the repacker's per-row
+body), `pack_A_q3k` (scalar port of the A-packer), `run_hp_q3k_m1` (verbatim asm transcription of
+the live `#else` branch — same register allocation, same immediates, same instruction order as the
+vendor source). One deliberate deviation from the vendor's own upstream source: added the full
+v0-v31 clobber list to the asm constraints, even though the vendor's own source declares none —
+matching the same correction this session's own prior W4 ports (`run_hp_m1`/`run_hp_m4`) already
+made, needed for GCC to avoid register-allocation conflicts with surrounding C at an arbitrary call
+site (a clobber-list difference, not a computational one).
+
+**Oracle methodology**: matching `vendor_ime_m4_probe.c`'s own proven approach — the reference is
+reconstructed from the SAME quantized bytes the kernel itself consumes (canonical dequant of the
+synthetic `block_q3_K` rows, times A's own stored int8 `qs` and stored `scale_a`), NOT the
+pre-quantization "true" random floats, which would conflate A-side int8 quantization's own inherent
+rounding error with kernel/repack correctness (the exact bug the M4 probe caught and fixed,
+§22.35). 32 synthetic output rows × 8 K256-superblocks (2048 K total), random-but-well-formed
+`block_q3_K` data (any bit pattern is valid for this format, so no need for a real fp32→Q3_K
+quantizer at this stage).
+
+**Result: PASS.** `sizeof(block_q3_K)=110`, `sizeof(nrow_block_q3_k32)=3648`, `AREC_Q3K=292` — all
+match expectation exactly. Kernel vs. reference: **max_abs_diff=0.1538, mean_abs_diff=0.0479,
+mean_rel_diff=0.0766%** across all 32 rows — small, consistent per-row relative error (0.0035%-
+0.25%), the expected signature of fp16 intermediate-accumulation rounding (the kernel accumulates
+`vmadot.hp` partial sums in fp16 before the final fp32 widen), not a bug — comparable in kind to,
+and noticeably tighter than, the W4 M1 kernel's own already-validated noise level. **ASan and UBSan
+both clean** (`detect_leaks=0` for the same pre-existing-buffer reason established in §22.38);
+error numbers bit-identical across plain/ASan/UBSan builds.
+
+**Hot/cold kernel benchmark** (per the ladder's own explicit requirement): cold (first-touch, fresh
+buffers) 5.3-8.3us/call across the three builds; hot (2000 repeated calls on resident data)
+4.3-5.8us/call, ~11.2-15.3 Gelem/s. No meaningful cold-start penalty at this problem size (2048 K ×
+32 cols) — timing is consistent across plain/ASan/UBSan within normal instrumentation overhead.
+
+**Status**: standalone pack/dequant oracle and hot/cold benchmark both done and PASS, per the
+ladder's first two steps. `qwen_moe_hp.c` untouched throughout. Not yet started: fp32→Q3_K
+quantizer (needed once real model integration begins — the oracle above used synthetic, not
+model-derived, Q3_K data, which is sufficient for kernel/repack correctness but not for loading a
+real checkpoint), full-engine integration with a new cache version, and the checkpoint itself
+(downloading `bartowski/Qwen_Qwen3-30B-A3B-GGUF`'s `Q3_K_S` variant, 13.4GB, from the exact same
+base checkpoint already in use — confirmed via its Q4_0 sibling matching the board's existing file
+size — in progress in parallel with this step, not yet complete at time of writing).

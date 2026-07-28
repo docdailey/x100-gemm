@@ -356,6 +356,24 @@ NOT implemented.** This closes both halves of the larger-N track: architecture (
 §22.41 (steep per-round latency cost), architecture (B) rejected here (measured gain doesn't clear
 its own gate). Current M1 production behavior completely untouched.
 
+**Q3_K engine branch, step 1: standalone pack/dequant oracle + hot/cold kernel benchmark — PASS
+(2026-07-29, `codex_recs_1.md` §22.43).** New track, explicit direction: port the vendor's
+`gemm_kernel_i8i3k_m1`/`nrow_block_q3_k<32>` repacker exactly, in a SEPARATE file from
+`qwen_moe_hp.c` (untouched throughout), same oracle-first ladder that succeeded for W4. Traced the
+vendor source directly (not just an investigation summary): the kernel has a `#if 0`/`#else` split,
+live code is the `#else` branch (`vmadot.hp`, same family as the validated W4 HP kernels), confirmed
+via a real `ime.cpp` dispatch trace. B-repacker reads GGUF-native `block_q3_K` (110B, standard ggml
+layout) into `nrow_block_q3_k<32>` (3648B); A-packer produces a 292B "q8k" format (shared only
+between Q2_K/Q3_K) that the kernel's own `a_sum` field goes unused for (Q3_K has no zero-point).
+Ported to `bench/q3k_probe.c`: canonical dequant reference, repacker, A-packer, verbatim asm
+transcription of the kernel. **Oracle PASS**: mean_rel_diff=0.0766% vs a reference reconstructed
+from the kernel's own quantized bytes (not pre-quantization floats — the same methodology that
+caught the M4 probe's own earlier bug), max_abs_diff=0.1538, consistent with expected fp16-
+accumulation noise. ASan/UBSan clean, bit-identical across builds. Hot/cold benchmark: 4.3-5.8us/call
+hot, 5.3-8.3us/call cold, no meaningful cold-start penalty. Next: fp32→Q3_K quantizer, full-engine
+integration with a new cache version — waiting on the Q3_K_S checkpoint download
+(`bartowski/Qwen_Qwen3-30B-A3B-GGUF`, 13.4GB, same base checkpoint already in use) to complete.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
