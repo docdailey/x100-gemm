@@ -312,6 +312,15 @@ detectable-repetition fast path with a low-acceptance bailout; investigate a che
 mechanism; or close this track as a documented negative-for-general/positive-for-niche finding and
 move to larger-N continuous serving instead.
 
+**Decision: track CLOSED.** Explicit direction: the oracle failed its predeclared gate for
+general-purpose decode, no integrated M4 verifier will be built; the repetition-gated fast path's
+~1.12x niche gain is too small relative to its own implementation/validation cost, so that isn't
+built either. `ngram_propose`/`run_speculative_oracle` (`QWEN_SPEC_ORACLE=1`) stay in the codebase
+as a standing diagnostic tool, re-runnable if the calculus changes later, but nothing further is
+scheduled. Single-user M=1 production behavior untouched throughout this entire track. Next, per
+explicit direction: design work for larger-N continuous serving (workload goals, N sweep, memory/KV
+budget, latency constraints, an expert-overlap oracle) BEFORE any production code changes.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
