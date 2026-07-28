@@ -508,6 +508,336 @@ static void run_i8_m1(const uint8_t*a_data, const uint8_t*b_data, float*dst_c, l
           "v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory");
 }
 
+/* ===================== Q3_K engine branch (codex_recs_1.md §22.43-44) =====================
+ * Ported from reference/spacemit-backend/ per the explicit "same oracle-first ladder that
+ * succeeded for W4" instruction; validated standalone in bench/q3k_probe.c (mean_rel_diff=0.0766%
+ * vs a same-methodology reference, ASan/UBSan clean) before being wired in here. See that file's
+ * own header comment for the full source trace (kernel: ime2_kernels.cpp:1419-2029, live branch is
+ * the #else at 1759-2027; B-repacker: repack.cpp:452-555; A-packer: rvv_kernels.cpp:2305-2394).
+ * Scope, per explicit direction ("do not optimize anything else concurrently"): only the tensors
+ * that are ACTUALLY Q3_K in the real checkpoint (attn_q, attn_v, all three expert-FFN weights,
+ * token_embd -- confirmed via gguf_dump against the real downloaded Q3_K_S file) get this new
+ * kernel. The checkpoint is genuinely mixed-precision: attn_k is Q8_0 (reuses the EXISTING,
+ * already-validated int8 M1 path unchanged -- gguf_dequant_into already supports type 8, and
+ * dequant-then-requantize through quantize_q8_0_native is provably lossless for well-formed Q8_0
+ * data, since the encoder already chose d such that max(|q|)=127, so recomputing d from the
+ * dequantized floats recovers the identical d and int8 values); attn_output is Q5_K and
+ * output/lm_head is Q6_K, both handled as unoptimized fallbacks (dequant to fp32 via a plain
+ * scalar port of the standard ggml algorithm, then reuse the existing int8 M1 path -- NOT a new
+ * kernel, just the already-fast int8 GEMM the router already uses, deliberately not a bespoke
+ * "optimize Q5_K/Q6_K too" effort). */
+
+/* GGUF-native block_q3_K (110 bytes) and block_q5_K (176 bytes), standard ggml QK_K=256 layouts. */
+typedef struct { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; _Float16 d; } block_q3_K;
+typedef struct { _Float16 d; _Float16 dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } block_q5_K;
+
+static inline void q5k_get_scale_min(int j,const uint8_t*q,uint8_t*d,uint8_t*m){
+    if(j<4){ *d=q[j]&63; *m=q[j+4]&63; }
+    else{ *d=(uint8_t)((q[j+4]&0xF)|((q[j-4]>>6)<<4)); *m=(uint8_t)((q[j+4]>>4)|((q[j]>>6)<<4)); }
+}
+/* standard ggml dequant, verbatim algorithm -- unoptimized fallback path only, not the thing under
+ * test. Fills 256 floats. */
+static void dequantize_q5_K_block(const block_q5_K*x,float*y){
+    float d=(float)x->d, min=(float)x->dmin;
+    const uint8_t*ql=x->qs,*qh=x->qh;
+    int is=0; uint8_t u1=1,u2=2;
+    for(int j=0;j<256;j+=64){
+        uint8_t sc,m; q5k_get_scale_min(is+0,x->scales,&sc,&m); float d1=d*sc,m1=min*m;
+        q5k_get_scale_min(is+1,x->scales,&sc,&m); float d2=d*sc,m2=min*m;
+        for(int l=0;l<32;l++) y[j+l]    = d1*(float)((ql[l]&0xF)+((qh[l]&u1)?16:0)) - m1;
+        for(int l=0;l<32;l++) y[j+32+l] = d2*(float)((ql[l]>>4)+((qh[l]&u2)?16:0)) - m2;
+        ql+=32; is+=2; u1=(uint8_t)(u1<<2); u2=(uint8_t)(u2<<2);
+    }
+}
+/* canonical ggml Q3_K dequant reference -- used ONLY for the embedding table (token_embd is a row
+ * gather, not a matmul, so there's no kernel to test there -- dequantize once at load, same as the
+ * W4 engine already does for its own tok_embd). Verbatim algorithm, matches bench/q3k_probe.c's own
+ * dequantize_q3_K_block exactly (kept as a private static copy here rather than sharing a header,
+ * matching this whole file's existing single-translation-unit convention). */
+static void dequantize_q3_K_block(const block_q3_K*x,float*y){
+    const uint32_t kmask1=0x03030303,kmask2=0x0f0f0f0f;
+    uint32_t aux[4]; int8_t*scales=(int8_t*)aux; float d_all=(float)x->d;
+    const uint8_t*q=x->qs,*hm=x->hmask; uint8_t m=1;
+    memcpy(aux,x->scales,12);
+    uint32_t tmp=aux[2];
+    aux[2]=((aux[0]>>4)&kmask2)|(((tmp>>4)&kmask1)<<4); aux[3]=((aux[1]>>4)&kmask2)|(((tmp>>6)&kmask1)<<4);
+    aux[0]=(aux[0]&kmask2)|(((tmp>>0)&kmask1)<<4); aux[1]=(aux[1]&kmask2)|(((tmp>>2)&kmask1)<<4);
+    int is=0; float dl;
+    for(int n=0;n<256;n+=128){ int shift=0;
+        for(int j=0;j<4;j++){
+            dl=d_all*(float)(scales[is++]-32);
+            for(int l=0;l<16;l++) y[n+j*32+l]=dl*(float)((int)((q[l]>>shift)&3) - ((hm[l]&m)?0:4));
+            dl=d_all*(float)(scales[is++]-32);
+            for(int l=0;l<16;l++) y[n+j*32+16+l]=dl*(float)((int)((q[l+16]>>shift)&3) - ((hm[l+16]&m)?0:4));
+            shift+=2; m=(uint8_t)(m<<1);
+        }
+        q+=32;
+    }
+}
+
+/* nrow_block_q3_k<32>, repacked B layout (3648 bytes), verbatim from bench/q3k_probe.c. */
+typedef struct { int8_t scales[32*16]; uint8_t hmask[32*32]; uint8_t qs[32*64]; _Float16 scales16[32]; } nrow_block_q3_k32;
+#define BSUPER_Q3K ((long)sizeof(nrow_block_q3_k32)) /* 3648: bytes per 256-wide-K x 32-wide-N B superblock */
+/* verbatim transcription of repack_q3_k_to_q3_k_32_bl's per-row body -- see bench/q3k_probe.c for
+ * the full derivation/citation. */
+static void pack_B_q3k32(const block_q3_K rows[32],nrow_block_q3_k32*dst){
+    const uint32_t kmask1=0x03030303,kmask2=0x0f0f0f0f; uint8_t qs_aux[256];
+    for(int i=0;i<32;i++){
+        const block_q3_K*src_block=&rows[i];
+        uint32_t auxs[4]; int8_t*scale=(int8_t*)auxs;
+        memcpy(auxs,src_block->scales,12);
+        uint32_t tmp=auxs[2];
+        auxs[2]=((auxs[0]>>4)&kmask2)|(((tmp>>4)&kmask1)<<4); auxs[3]=((auxs[1]>>4)&kmask2)|(((tmp>>6)&kmask1)<<4);
+        auxs[0]=(auxs[0]&kmask2)|(((tmp>>0)&kmask1)<<4); auxs[1]=(auxs[1]&kmask2)|(((tmp>>2)&kmask1)<<4);
+        for(int j=0;j<16;j++) dst->scales[j*32+i]=(int8_t)(scale[j]-32);
+        for(int k=0;k<4;k++) for(int j=0;j<32;j++) qs_aux[k*32+j]=(src_block->qs[j]>>(2*k))&0x03;
+        for(int k=0;k<4;k++) for(int j=0;j<32;j++) qs_aux[k*32+j+128]=(src_block->qs[j+32]>>(2*k))&0x03;
+        for(int k=0;k<4;k++) for(int j=0;j<16;j++){
+            uint8_t qs0=qs_aux[j+k*64],qs16=qs_aux[j+16+k*64],qs32=qs_aux[j+32+k*64],qs48=qs_aux[j+48+k*64];
+            dst->qs[(k*32+i)*16+j]=(uint8_t)((qs0&0x03)|((qs16&0x03)<<2)|((qs32&0x03)<<4)|((qs48&0x03)<<6));
+        }
+        uint16_t*dst_mask=((uint16_t*)dst->hmask)+i;
+        for(int j=0;j<16;j++, dst_mask+=32){
+            uint8_t b_shift=(uint8_t)(j/2); const uint8_t*b_mask_col=src_block->hmask+(j%2)*16; uint16_t msk=0;
+            for(int k=0;k<8;k++)  msk|=(uint16_t)(((b_mask_col[k]>>b_shift)&1))<<k;
+            for(int k=8;k<16;k++) msk|=(uint16_t)(((b_mask_col[k]>>b_shift)&1))<<k;
+            dst_mask[0]=msk;
+        }
+        dst->scales16[i]=src_block->d;
+    }
+}
+/* A-side "q8k" activation packer, scalar port of quantize_a_row_i8k. 292 bytes/superblock. a_sum
+ * is unused by the M1 kernel (Q3_K has no zero-point) but computed correctly anyway -- see
+ * bench/q3k_probe.c's own header comment. */
+#define AREC_Q3K 292
+static void pack_A_q3k(const float*a,uint8_t*out){
+    float max_abs=0.0f; for(int i=0;i<256;i++){ float v=fabsf(a[i]); if(v>max_abs) max_abs=v; }
+    float scale_a=max_abs/127.0f; float rep=scale_a?1.0f/scale_a:0.0f;
+    memcpy(out,&scale_a,4);
+    int16_t*sum_ptr=(int16_t*)(out+4); int8_t*qs_ptr=(int8_t*)(out+4+32);
+    for(int bki=0;bki<16;bki++){ int32_t sum=0;
+        for(int l=0;l<16;l++){ float v=a[bki*16+l]*rep; int q=(int)roundf(v); if(q>127)q=127; if(q<-128)q=-128;
+            qs_ptr[bki*16+l]=(int8_t)q; sum+=q; }
+        sum_ptr[bki]=(int16_t)(-sum);
+    }
+}
+static void pack_act_q3k(const float*x,int K,uint8_t*Abuf){ int Sb=K/256; for(int sb=0;sb<Sb;sb++) pack_A_q3k(x+sb*256,Abuf+(size_t)sb*AREC_Q3K); }
+
+/* M1 kernel, verbatim asm transcription of the live #else branch (ime2_kernels.cpp:1761-2020) --
+ * see bench/q3k_probe.c for the full citation/derivation. Validated standalone (mean_rel_diff=
+ * 0.0766%, ASan/UBSan clean) before being wired in here unchanged. */
+static void run_hp_q3k_m1(const uint8_t*a_data,const uint8_t*b_data,float*dst_c,long k_blks,long nb_real,long b_str){
+    const _Float16 q3_step=(_Float16)0.0625f; const float a_post_mul=16.0f;
+    __asm__ volatile(
+        "mv           t2, %[KBLKS]            \n\t"
+        "li           t3, 4                   \n\t"
+        "mv           s2, %[pA]               \n\t"
+        "addi         s3, %[pA], 4+32         \n\t"
+        "addi         s5, %[pB], 32*16        \n\t"
+        "mv           s4, %[pB]               \n\t"
+        "addi         s6, s5, 1024            \n\t"
+        "addi         s8, s6, 1024            \n\t"
+        "addi         s8, s8, 1024            \n\t"
+        "mv           s7, %[pB]               \n\t"
+
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vxor.vv      v31, v0, v0             \n\t"
+
+        "vsetvli      t0, x0, e16, mf2        \n\t"
+        "vle16.v      v1, (s8)                \n\t"
+        "vsetvli      t0, x0, e16, m1         \n\t"
+        "vpack.vv     v26, v1, v1, 3          \n\t"
+        "vmv.v.v      v17, v26                \n\t"
+        "vsetvli      t0, x0, e16, m1         \n\t"
+        "vfmul.vf     v30, v17, %[q3_step]    \n\t"
+
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vxor.vv      v24, v16, v16           \n\t"
+        "vxor.vv      v25, v16, v16           \n\t"
+        "vxor.vv      v26, v16, v16           \n\t"
+        "vxor.vv      v27, v16, v16           \n\t"
+
+        ".align 4                             \n\t"
+        "BLK_LPST%=:                          \n\t"
+        "K64_LPST%=:                          \n\t"
+
+        "vsetvli      t0, x0, e8, m1          \n\t"
+        "vle8.v       v2, (s4)                \n\t"
+        "addi         s4, s4, 128             \n\t"
+
+        "vle8.v       v4, (s6)                \n\t"
+        "addi         s6, s6, 128             \n\t"
+        "vle8.v       v5, (s6)                \n\t"
+        "addi         s6, s6, 128             \n\t"
+        "vle8.v       v6, (s6)                \n\t"
+        "addi         s6, s6, 128             \n\t"
+        "vle8.v       v7, (s6)                \n\t"
+        "addi         s6, s6, 128             \n\t"
+
+        "vsetvli      t0, x0, e8, mf2         \n\t"
+        "vle8.v       v0, (s5)                \n\t"
+        "addi         s5, s5, 64              \n\t"
+
+        "vsetvli      t0, x0, e8, mf2         \n\t"
+        "vle8.v       v3, (s3)                \n\t"
+        "addi         s3, s3, 64              \n\t"
+
+        "vsetvli      t0, x0, e8, m1          \n\t"
+        "vfwcvt.f.x.v v28, v2                 \n\t"
+        "vsetvli      t0, x0, e16, m1         \n\t"
+        "vfmul.vv     v1, v28, v30            \n\t"
+        "vfmul.vv     v29, v29, v30           \n\t"
+
+        "vsetvli      t0, x0, e8, m1          \n\t"
+        "vnot.v       v0, v0                  \n\t"
+        "vand.vi      v12, v4, 0x3            \n\t"
+        "vand.vi      v13, v5, 0x3            \n\t"
+        "vand.vi      v14, v6, 0x3            \n\t"
+        "vand.vi      v15, v7, 0x3            \n\t"
+        "vsetvli      t0, x0, e8, m4          \n\t"
+        "vadd.vi      v12, v12, -4, v0.t      \n\t"
+
+        "vsetvli      t0, x0, e8, mf2         \n\t"
+        "vle8.v       v0, (s5)                \n\t"
+        "addi         s5, s5, 64              \n\t"
+
+        "vsetvli      t0, x0, e8, m1          \n\t"
+        "vsll.vi      v8, v4, 4               \n\t"
+        "vsll.vi      v9, v5, 4               \n\t"
+        "vsll.vi      v10, v6, 4              \n\t"
+        "vsll.vi      v11, v7, 4              \n\t"
+        "vsrl.vi      v16, v8, 6              \n\t"
+        "vsrl.vi      v17, v9, 6              \n\t"
+        "vnot.v       v0, v0                  \n\t"
+        "vsrl.vi      v18, v10, 6             \n\t"
+        "vsrl.vi      v19, v11, 6             \n\t"
+        "vsetvli      t0, x0, e8, m4          \n\t"
+        "vadd.vi      v16, v16, -4, v0.t      \n\t"
+
+        "vsetvli      t0, x0, e64, mf2        \n\t"
+        "vslidedown.vi  v2, v3, 2             \n\t"
+
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vmadot.hp    v24, v3, v12, v1, 0, i8 \n\t"
+        "vmadot.hp    v25, v3, v13, v1, 1, i8 \n\t"
+        "vmadot.hp    v26, v3, v14, v1, 2, i8 \n\t"
+        "vmadot.hp    v27, v3, v15, v1, 3, i8 \n\t"
+        "vmadot.hp    v24, v2, v16, v1, 4, i8 \n\t"
+        "vmadot.hp    v25, v2, v17, v1, 5, i8 \n\t"
+        "vmadot.hp    v26, v2, v18, v1, 6, i8 \n\t"
+        "vmadot.hp    v27, v2, v19, v1, 7, i8 \n\t"
+
+        "vsetvli      t0, x0, e64, m1         \n\t"
+        "vmv.v.v      v1, v29                 \n\t"
+
+        "vsetvli      t0, x0, e8, mf2         \n\t"
+        "vle8.v       v0, (s5)                \n\t"
+        "addi         s5, s5, 64              \n\t"
+
+        "vsetvli      t0, x0, e64, mf2        \n\t"
+        "vslidedown.vi  v3, v3, 4             \n\t"
+
+        "vsetvli      t0, x0, e8, m1          \n\t"
+        "vsll.vi      v8, v4, 2               \n\t"
+        "vsll.vi      v9, v5, 2               \n\t"
+        "vsll.vi      v10, v6, 2              \n\t"
+        "vsll.vi      v11, v7, 2              \n\t"
+
+        "vsrl.vi      v20, v8, 6              \n\t"
+        "vsrl.vi      v21, v9, 6              \n\t"
+        "vnot.v       v0, v0                  \n\t"
+        "vsrl.vi      v22, v10, 6             \n\t"
+        "vsrl.vi      v23, v11, 6             \n\t"
+
+        "vsetvli      t0, x0, e8, m4          \n\t"
+        "vadd.vi      v20, v20, -4, v0.t      \n\t"
+
+        "vsetvli      t0, x0, e8, mf2         \n\t"
+        "vle8.v       v0, (s5)                \n\t"
+        "addi         s5, s5, 64              \n\t"
+
+        "vsetvli      t0, x0, e8, m1          \n\t"
+        "vsrl.vi      v8, v4, 6               \n\t"
+        "vsrl.vi      v9, v5, 6               \n\t"
+        "vnot.v       v0, v0                  \n\t"
+        "vsrl.vi      v10, v6, 6              \n\t"
+        "vsrl.vi      v11, v7, 6              \n\t"
+
+        "vsetvli      t0, x0, e8, m4          \n\t"
+        "vadd.vi      v8, v8, -4, v0.t        \n\t"
+
+        "vsetvli      t0, x0, e64, mf2        \n\t"
+        "vslidedown.vi  v2, v3, 2             \n\t"
+
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vmadot.hp    v24, v3, v20, v1, 0, i8 \n\t"
+        "vmadot.hp    v25, v3, v21, v1, 1, i8 \n\t"
+        "vmadot.hp    v26, v3, v22, v1, 2, i8 \n\t"
+        "vmadot.hp    v27, v3, v23, v1, 3, i8 \n\t"
+        "vmadot.hp    v24, v2, v8, v1, 4, i8  \n\t"
+        "vmadot.hp    v25, v2, v9, v1, 5, i8  \n\t"
+        "vmadot.hp    v26, v2, v10, v1, 6, i8 \n\t"
+        "vmadot.hp    v27, v2, v11, v1, 7, i8 \n\t"
+
+        "addi         t3, t3, -1              \n\t"
+        "bgtz         t3, K64_LPST%=          \n\t"
+        "K64_LPND%=:                          \n\t"
+
+        "vsetvli      t0, x0, e16, m1         \n\t"
+        "vpack.vv     v12, v24, v25, 1        \n\t"
+        "vpack.vv     v14, v26, v27, 1        \n\t"
+        "vpack.vv     v16, v12, v14, 2        \n\t"
+        "vsetvli      t0, x0, e16, mf2        \n\t"
+        "vfwcvt.f.f.v v26, v16                \n\t"
+
+        "flw          f0, (s2)                \n\t"
+        "addi         s2, s2, 4+32+256        \n\t"
+        "add          t4, s7, %[B_STR]        \n\t"
+        "addi         s3, s2, 4+32            \n\t"
+
+        "addi         s5, t4, 32*16           \n\t"
+        "mv           s4, t4                  \n\t"
+        "addi         s6, s5, 32*32           \n\t"
+        "addi         s8, s6, 1024            \n\t"
+        "addi         s8, s8, 1024            \n\t"
+        "addi         s7, t4, 0               \n\t"
+        "addi         t2, t2, -1              \n\t"
+
+        "fmul.s       f0, f0, %[a_post_mul]   \n\t"
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vfmacc.vf    v31, f0, v26            \n\t"
+
+        "beqz         t2, BLK_LPND%=          \n\t"
+
+        "vsetvli      t0, x0, e16, mf2        \n\t"
+        "vle16.v      v1, (s8)                \n\t"
+        "vsetvli      t0, x0, e16, m1         \n\t"
+        "vpack.vv     v26, v1, v1, 3          \n\t"
+        "vmv.v.v      v17, v26                \n\t"
+        "vsetvli      t0, x0, e16, m1         \n\t"
+        "vfmul.vf     v30, v17, %[q3_step]    \n\t"
+
+        "vsetvli      t0, x0, e32, m1         \n\t"
+        "vxor.vv      v24, v16, v16           \n\t"
+        "vxor.vv      v25, v16, v16           \n\t"
+        "vxor.vv      v26, v16, v16           \n\t"
+        "vxor.vv      v27, v16, v16           \n\t"
+
+        "li           t3, 4                   \n\t"
+        "bgtz         t2, BLK_LPST%=          \n\t"
+
+        "BLK_LPND%=:                          \n\t"
+        "vsetvli      t0, %[NBLKS], e32, m1   \n\t"
+        "vse32.v      v31, (%[pC])            \n\t"
+
+        :
+        : [KBLKS] "r"(k_blks), [NBLKS] "r"(nb_real), [pA] "r"(a_data), [pB] "r"(b_data),
+          [pC] "r"(dst_c), [B_STR] "r"(b_str), [q3_step] "f"(q3_step), [a_post_mul] "f"(a_post_mul)
+        : "cc", "memory", "t0", "t2", "t3", "t4", "t5", "f0", "f1", "s2", "s3", "s4", "s5", "s6", "s7", "s8",
+          "v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11","v12","v13","v14","v15",
+          "v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31");
+}
+
 typedef struct { int N,K; uint8_t*B; } Lin; /* B: (N/32)*(K/256)*BSUPER bytes for int4-HP Lins; int8 Lins use BREC_I8*(K/32) per panel instead -- see lin_new_i8 */
 
 static Lin lin_new_hp(const float*wf32,int N,int K){
@@ -556,6 +886,26 @@ static Lin lin_new_i8(const float*wf32,int N,int K){
 }
 static void pack_act_i8(const float*x,int K,uint8_t*Abuf){
     int Kg=K/32; for(int kg=0;kg<Kg;kg++) pack_A_i8(x+kg*32, Abuf+(size_t)kg*38);
+}
+/* Q3_K weight loader: reads RAW block_q3_K bytes directly from the mmap'd GGUF tensor data (NOT
+ * via gguf_dequant -- dequantizing to fp32 and requantizing to a different format would defeat the
+ * whole point of testing Q3_K's own real quantization). `blocks` points at the tensor's first
+ * block_q3_K; `elem0` is the flat element offset (matching gguf_dequant_into's own convention for
+ * indexing into a multi-expert 3D tensor -- e*moe*d for expert e), always a multiple of 256 here.
+ * Row-major, K/256 blocks per row, matching every other loader in this file (lin_new_hp/lin_new_i8
+ * assume the same GGUF row-major layout for their own fp32 source data). */
+static Lin lin_new_q3k(const block_q3_K*blocks,size_t elem0,int N,int K){
+    Lin l; l.N=N; l.K=K; int Np=N/32, Sb=K/256;
+    l.B=malloc((size_t)Np*Sb*BSUPER_Q3K);
+    size_t blk0=elem0/256; int rowblocks=K/256;
+    for(int np=0;np<Np;np++){
+        for(int sb=0;sb<Sb;sb++){
+            block_q3_K rows[32];
+            for(int r=0;r<32;r++){ int row=np*32+r; rows[r]=blocks[blk0+(size_t)row*rowblocks+sb]; }
+            pack_B_q3k32(rows,(nrow_block_q3_k32*)(l.B+((size_t)np*Sb+sb)*BSUPER_Q3K));
+        }
+    }
+    return l;
 }
 static double gT_actpack=0, gT_lin=0, gT_attn=0, gT_rest=0, gT_rope=0, gT_router=0, gT_swiglu=0; static long gT_tok=0; static int gT_on=0;
 /* linear(kernel) subclass breakdown (codex synthesis + PROGRESS next step): total gT_lin stays
@@ -647,14 +997,13 @@ static void lin_mm_hp_worker_run(int tn){
     } else if(g_pool_work.kind==1){
         for(int np=tn; np<Np; np+=g_lin_nt)
             run_i8_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BREC_I8, g_pool_work.y+np*32, g_pool_work.kb);
-    } else /* kind==3: M-batch track milestone 1 (codex_recs_1.md §22.35) -- M4-batched dense
-        linear, dispatches gemm_kernel_i8i4_hp_m4 (validated bench/vendor_ime_m4_probe.c) across
-        N-tiles the exact same way kind==0 dispatches M1, just with a 4-row-batched A-record
-        (1160B, pack_A_hp_m4) and a 4-row-batched output write (ldc=l->N so each of the 4 rows'
-        destinations land in its own contiguous N-wide slice of y). */ {
-        long ldc=g_pool_work.l->N;
+    } else /* kind==4: Q3_K M1 GEMM (codex_recs_1.md §22.43-44) -- dispatches run_hp_q3k_m1 across
+        N-tiles exactly the same way kind==0 dispatches the int4-HP kernel; Q3_K's own NB_COLS=32
+        (the vendor kernel's own "only support 32 in ASM" constraint) matches the existing 32-wide
+        panel tiling exactly, so no new tiling logic is needed, just a different per-panel B stride
+        (BSUPER_Q3K=3648 instead of BSUPER=4608) and a different kernel/A-record format. */ {
         for(int np=tn; np<Np; np+=g_lin_nt)
-            run_hp_m4(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER, g_pool_work.y+np*32, g_pool_work.kb, ldc);
+            run_hp_q3k_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER_Q3K, g_pool_work.y+np*32, g_pool_work.kb, 32, BSUPER_Q3K);
     }
 }
 static void* lin_mm_hp_worker(void*arg){
@@ -696,14 +1045,9 @@ static void lin_mm_i8(const Lin*l,const uint8_t*Abuf,float*y,int nt){
     lin_mm_hp_worker_run(0);
     while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < g_pool_nt-1) { /* spin */ }
 }
-/* M-batch track milestone 1 (codex_recs_1.md §22.35): M4-batched dense linear. `Abuf4` is a single
- * packed 4-row activation (from pack_act_hp_m4, one call covering all K/256 blocks). `y4` is a
- * 4*l->N contiguous float buffer, row-major: row r's N outputs live at y4+r*l->N (matches
- * run_hp_m4's own ldc=l->N addressing, driven straight through the kind==3 dispatch path above).
- * Same weight matrix `l` as lin_mm_hp -- the whole point of M-batching is that this ONE weight
- * stream read now serves 4 independent sequences' activation rows instead of 1. */
-static void lin_mm_hp_m4(const Lin*l,const uint8_t*Abuf4,float*y4){
-    g_pool_work.kind=3; g_pool_work.l=l; g_pool_work.Abuf=Abuf4; g_pool_work.y=y4; g_pool_work.kb=l->K/256;
+static void lin_mm_q3k(const Lin*l,const uint8_t*Abuf,float*y,int nt){
+    (void)nt;
+    g_pool_work.kind=4; g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/256;
     atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
     atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release);
     lin_mm_hp_worker_run(0);
@@ -714,6 +1058,25 @@ static void lin_mm(const Lin*l,const float*x,float*y,int nt,uint8_t*Abuf){
     pack_act_hp(x,l->K,Abuf);
     double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
     lin_mm_hp(l,Abuf,y,nt);
+    if(gT_on) lin_add(now()-_tb);
+}
+/* Q3_K equivalent of lin_mm -- packs raw fp32 activation via the q8k format then dispatches
+ * run_hp_q3k_m1 across N-tiles. Abuf must be sized for K/256 * AREC_Q3K bytes. */
+static void lin_mm_q3k_x(const Lin*l,const float*x,float*y,int nt,uint8_t*Abuf){
+    double _ta=gT_on?now():0;
+    pack_act_q3k(x,l->K,Abuf);
+    double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
+    lin_mm_q3k(l,Abuf,y,nt);
+    if(gT_on) lin_add(now()-_tb);
+}
+/* int8 equivalent of lin_mm -- packs raw fp32 activation via pack_act_i8 then dispatches
+ * run_i8_m1. Abuf must be sized for K/32 * 38 bytes. Used for the Q8_0/Q5_K/Q6_K fallback tensors
+ * (attn_k, attn_output, lm_head) -- the same int8 path the router's own int8 mode already uses. */
+static void lin_mm_i8_x(const Lin*l,const float*x,float*y,int nt,uint8_t*Abuf){
+    double _ta=gT_on?now():0;
+    pack_act_i8(x,l->K,Abuf);
+    double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
+    lin_mm_i8(l,Abuf,y,nt);
     if(gT_on) lin_add(now()-_tb);
 }
 
@@ -774,6 +1137,14 @@ static void gguf_dequant_into(Gguf*g,TInfo*ti,size_t elem0,size_t n,float*out){
         for(int j=0;j<32 && bl*32+j<n;j++){ int nib=(j<16)?(qs[j]&0xf):(qs[j-16]>>4); out[bl*32+j]=(nib-8)*d; } } return; }
     if(ti->typ==3){ for(size_t bl=0;bl<nb;bl++){ unsigned char*q=base+(bl0+bl)*20; float d=f16f(*(uint16_t*)q),m=f16f(*(uint16_t*)(q+2)); unsigned char*qs=q+4;
         for(int j=0;j<32 && bl*32+j<n;j++){ int nib=(j<16)?(qs[j]&0xf):(qs[j-16]>>4); out[bl*32+j]=nib*d+m; } } return; }
+    if(ti->typ==11){ size_t nbk=(n+255)/256; /* Q3_K, 110B/block -- elem0 always 0 for the one
+        whole-tensor caller (token_embd.weight), matching the same simplification typ==14 already
+        makes below. */
+        for(size_t sb=0;sb<nbk;sb++) dequantize_q3_K_block((const block_q3_K*)(base+sb*110), out+sb*256);
+        return; }
+    if(ti->typ==13){ size_t nbk=(n+255)/256; /* Q5_K, 176B/block -- same elem0==0-only caveat. */
+        for(size_t sb=0;sb<nbk;sb++) dequantize_q5_K_block((const block_q5_K*)(base+sb*176), out+sb*256);
+        return; }
     if(ti->typ==14){ size_t nbk=(n+255)/256;
         for(size_t sb=0;sb<nbk;sb++){ unsigned char*blk=base+sb*210; unsigned char*ql=blk,*qh=blk+128; int8_t*sc=(int8_t*)(blk+192);
             float d=f16f(*(uint16_t*)(blk+208)); float*y=out+sb*256;
@@ -1357,16 +1728,25 @@ static int g_swiglu_fast=0; /* 0=exact(revert flag) 1=hard-swish(REJECTED, §22.
  * top-8 selection, so quantization noise could flip which experts get chosen, not just perturb a
  * smooth activation -- validated against the fp32 reference (g_router_* counters below/forward()),
  * not just eyeballed via ' Tokyo' coherence. ly->router (fp32) is kept only as that reference. */
+/* Q3_K engine's own model_load (codex_recs_1.md §22.44). Per-tensor quant type is fixed by the
+ * real checkpoint's own layout (confirmed via gguf_dump against the actual downloaded Q3_K_S file,
+ * not assumed): attn_q/attn_v/all three expert-FFN weights/token_embd are Q3_K (the tensors this
+ * whole track is testing); attn_k is Q8_0 (reuses the existing int8 path unchanged -- provably
+ * lossless dequant-then-requantize round trip for well-formed Q8_0 data, see this file's own
+ * top-of-section comment); attn_output is Q5_K and output/lm_head is Q6_K, both routed through the
+ * SAME existing int8 path as an unoptimized fallback (dequant via the new scalar Q5_K/Q6_K
+ * algorithms in gguf_dequant_into, then quantize_q8_0_native -- not a new kernel, deliberately not
+ * "optimizing Q5_K/Q6_K too"); router/norms are F32, unchanged from the original engine. */
 static void model_load(Model*m,Gguf*g,int nt){
     m->d=g->embd; m->nl=g->block_count; m->nh=g->nh; m->nkv=g->nkv; m->hd=g->hd; m->vocab=g->vocab;
     m->rope_base=g->rope_base; m->eps=1e-6f; m->nt=nt; m->n_exp=g->n_exp; m->n_act=g->n_act; m->moe=g->moe_ffn;
     int qd=m->nh*m->hd, kvd=m->nkv*m->hd, d=m->d, moe=m->moe, ne=m->n_exp;
     if(d%256||qd%256||kvd%256||moe%256){ fprintf(stderr,"model dims not multiples of 256 -- HP kernel needs remainder handling not implemented here\n"); exit(1); }
-    fprintf(stderr,"packing token_embd + lm_head (vendor int4) ... "); fflush(stderr);
+    fprintf(stderr,"packing token_embd (Q3_K dequant) + lm_head (Q6_K->int8 fallback) ... "); fflush(stderr);
     m->tok_embd=gguf_dequant(g,"token_embd.weight"); m->out_norm=gguf_dequant(g,"output_norm.weight");
-    if(gguf_has(g,"output.weight")){ float*ow=gguf_dequant(g,"output.weight"); m->lm=lin_new_hp(ow,m->vocab,d); free(ow);
+    if(gguf_has(g,"output.weight")){ float*ow=gguf_dequant(g,"output.weight"); m->lm=lin_new_i8(ow,m->vocab,d); free(ow);
         fprintf(stderr,"(untied lm_head from output.weight) "); }
-    else m->lm=lin_new_hp(m->tok_embd,m->vocab,d);
+    else m->lm=lin_new_i8(m->tok_embd,m->vocab,d);
     fprintf(stderr,"done\n");
     m->L=malloc(m->nl*sizeof(Layer));
     { cpu_set_t s; CPU_ZERO(&s); for(int i=0;i<8;i++)CPU_SET(i,&s); sched_setaffinity(0,sizeof(s),&s); }
@@ -1374,10 +1754,15 @@ static void model_load(Model*m,Gguf*g,int nt){
     #pragma omp parallel for schedule(dynamic) num_threads(8)
     for(int l=0;l<m->nl;l++){ char nm[64]; Layer*ly=&m->L[l];
         #define DQ(suf) ({ snprintf(nm,64,"blk.%d.%s",l,suf); gguf_dequant(g,nm); })
-        #define LN(suf,N,K) ({ snprintf(nm,64,"blk.%d.%s",l,suf); float*w=gguf_dequant(g,nm); Lin lin=lin_new_hp(w,N,K); free(w); lin; })
+        /* Q3_K tensors: read raw block_q3_K bytes directly, no fp32 round trip. */
+        #define LQ3(suf,N,K) ({ snprintf(nm,64,"blk.%d.%s",l,suf); TInfo*ti=gguf_find(g,nm); \
+            const block_q3_K*blk=(const block_q3_K*)(g->p+g->data_start+ti->off); lin_new_q3k(blk,0,N,K); })
+        /* Q8_0/Q5_K fallback tensors: dequant to fp32 (gguf_dequant_into already knows both types),
+         * then reuse the existing, already-validated int8 path (lin_new_i8). */
+        #define LI8(suf,N,K) ({ snprintf(nm,64,"blk.%d.%s",l,suf); float*w=gguf_dequant(g,nm); Lin lin=lin_new_i8(w,N,K); free(w); lin; })
         ly->attn_norm=DQ("attn_norm.weight"); ly->ffn_norm=DQ("ffn_norm.weight");
         ly->q_norm=DQ("attn_q_norm.weight"); ly->k_norm=DQ("attn_k_norm.weight");
-        ly->q=LN("attn_q.weight",qd,d); ly->k=LN("attn_k.weight",kvd,d); ly->v=LN("attn_v.weight",kvd,d); ly->o=LN("attn_output.weight",d,qd);
+        ly->q=LQ3("attn_q.weight",qd,d); ly->k=LI8("attn_k.weight",kvd,d); ly->v=LQ3("attn_v.weight",kvd,d); ly->o=LI8("attn_output.weight",d,qd);
         ly->router=DQ("ffn_gate_inp.weight");
         ly->router_hp=lin_new_hp(ly->router,ne,d);
         ly->router_i8=lin_new_i8(ly->router,ne,d);
@@ -1385,13 +1770,17 @@ static void model_load(Model*m,Gguf*g,int nt){
         snprintf(nm,64,"blk.%d.ffn_gate_exps.weight",l); TInfo*tg=gguf_find(g,nm);
         snprintf(nm,64,"blk.%d.ffn_up_exps.weight",l);   TInfo*tu=gguf_find(g,nm);
         snprintf(nm,64,"blk.%d.ffn_down_exps.weight",l); TInfo*td=gguf_find(g,nm);
-        float*eg=malloc((size_t)moe*d*4),*eu=malloc((size_t)moe*d*4),*ed=malloc((size_t)d*moe*4);
+        const block_q3_K*bg=(const block_q3_K*)(g->p+g->data_start+tg->off);
+        const block_q3_K*bu=(const block_q3_K*)(g->p+g->data_start+tu->off);
+        const block_q3_K*bd=(const block_q3_K*)(g->p+g->data_start+td->off);
         for(int e=0;e<ne;e++){
-            gguf_dequant_into(g,tg,(size_t)e*moe*d,(size_t)moe*d,eg); ly->eg[e]=lin_new_hp(eg,moe,d);
-            gguf_dequant_into(g,tu,(size_t)e*moe*d,(size_t)moe*d,eu); ly->eu[e]=lin_new_hp(eu,moe,d);
-            gguf_dequant_into(g,td,(size_t)e*d*moe,(size_t)d*moe,ed); ly->ed[e]=lin_new_hp(ed,d,moe);
+            ly->eg[e]=lin_new_q3k(bg,(size_t)e*moe*d,moe,d);
+            ly->eu[e]=lin_new_q3k(bu,(size_t)e*moe*d,moe,d);
+            ly->ed[e]=lin_new_q3k(bd,(size_t)e*d*moe,d,moe);
         }
-        free(eg);free(eu);free(ed);
+        #undef DQ
+        #undef LQ3
+        #undef LI8
         #pragma omp atomic
         _done++;
         #pragma omp critical
@@ -1400,20 +1789,29 @@ static void model_load(Model*m,Gguf*g,int nt){
     fprintf(stderr,"\n");
 }
 
-/* ===================== requant cache (new format, ver=2, incompatible with qwen_moe.c's) ===================== */
+/* ===================== requant cache (new format, ver=3 -- Q3_K engine branch, incompatible with
+ * qwen_moe_hp.c's ver=2 W4 cache and qwen_moe.c's original cache) ===================== */
+static void wlin_q3k(FILE*f,Lin*l){ int Np=l->N/32,Sb=l->K/256; fwrite(&l->N,4,1,f); fwrite(&l->K,4,1,f);
+    fwrite(l->B,1,(size_t)Np*Sb*BSUPER_Q3K,f); }
+static Lin rlin_q3k(FILE*f){ Lin l; fread(&l.N,4,1,f); fread(&l.K,4,1,f); int Np=l.N/32,Sb=l.K/256;
+    l.B=malloc((size_t)Np*Sb*BSUPER_Q3K); fread(l.B,1,(size_t)Np*Sb*BSUPER_Q3K,f); return l; }
+static void wlin_i8(FILE*f,Lin*l){ int Np=l->N/32,Kg=l->K/32; fwrite(&l->N,4,1,f); fwrite(&l->K,4,1,f);
+    fwrite(l->B,1,(size_t)Np*Kg*BREC_I8,f); }
+static Lin rlin_i8(FILE*f){ Lin l; fread(&l.N,4,1,f); fread(&l.K,4,1,f); int Np=l.N/32,Kg=l.K/32;
+    l.B=malloc((size_t)Np*Kg*BREC_I8); fread(l.B,1,(size_t)Np*Kg*BREC_I8,f); return l; }
 static void wlin(FILE*f,Lin*l){ int Np=l->N/32,Sb=l->K/256; fwrite(&l->N,4,1,f); fwrite(&l->K,4,1,f);
     fwrite(l->B,1,(size_t)Np*Sb*BSUPER,f); }
 static Lin rlin(FILE*f){ Lin l; fread(&l.N,4,1,f); fread(&l.K,4,1,f); int Np=l.N/32,Sb=l.K/256;
     l.B=malloc((size_t)Np*Sb*BSUPER); fread(l.B,1,(size_t)Np*Sb*BSUPER,f); return l; }
 static void cache_save(Model*m,const char*path){
     FILE*f=fopen(path,"wb"); if(!f){fprintf(stderr,"cache write fail\n");return;}
-    int hdr[9]={m->d,m->nl,m->nh,m->nkv,m->hd,m->vocab,m->n_exp,m->n_act,m->moe}; fwrite("IMEC",1,4,f); int ver=2; fwrite(&ver,4,1,f);
+    int hdr[9]={m->d,m->nl,m->nh,m->nkv,m->hd,m->vocab,m->n_exp,m->n_act,m->moe}; fwrite("IMEC",1,4,f); int ver=3; fwrite(&ver,4,1,f);
     fwrite(hdr,4,9,f); fwrite(&m->rope_base,4,1,f); fwrite(&m->eps,4,1,f);
-    fwrite(m->tok_embd,4,(size_t)m->vocab*m->d,f); fwrite(m->out_norm,4,m->d,f); wlin(f,&m->lm);
+    fwrite(m->tok_embd,4,(size_t)m->vocab*m->d,f); fwrite(m->out_norm,4,m->d,f); wlin_i8(f,&m->lm);
     for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l]; fwrite(ly->attn_norm,4,m->d,f); fwrite(ly->ffn_norm,4,m->d,f);
         fwrite(ly->q_norm,4,m->hd,f); fwrite(ly->k_norm,4,m->hd,f); fwrite(ly->router,4,(size_t)m->n_exp*m->d,f);
-        wlin(f,&ly->q); wlin(f,&ly->k); wlin(f,&ly->v); wlin(f,&ly->o);
-        for(int e=0;e<m->n_exp;e++){ wlin(f,&ly->eg[e]); wlin(f,&ly->eu[e]); wlin(f,&ly->ed[e]); } }
+        wlin_q3k(f,&ly->q); wlin_i8(f,&ly->k); wlin_q3k(f,&ly->v); wlin_i8(f,&ly->o);
+        for(int e=0;e<m->n_exp;e++){ wlin_q3k(f,&ly->eg[e]); wlin_q3k(f,&ly->eu[e]); wlin_q3k(f,&ly->ed[e]); } }
     fwrite("ENDIMEC",1,8,f);
     if(fflush(f)||fclose(f)) fprintf(stderr,"cache write error\n");
 }
@@ -1422,11 +1820,11 @@ static int cache_load(Model*m,const char*path,int nt){
     char mg[4]; if(fread(mg,1,4,f)!=4 || memcmp(mg,"IMEC",4)){fclose(f);return 0;}
     char foot[8]; if(fseek(f,-8,SEEK_END)||fread(foot,1,8,f)!=8||memcmp(foot,"ENDIMEC",8)){ fprintf(stderr,"cache incomplete/corrupt -> requant\n"); fclose(f); return 0; }
     fseek(f,4,SEEK_SET);
-    int ver; fread(&ver,4,1,f); if(ver!=2){ fprintf(stderr,"cache is v%d, this binary needs v2 (vendor HP format) -> requant\n",ver); fclose(f); return 0; }
+    int ver; fread(&ver,4,1,f); if(ver!=3){ fprintf(stderr,"cache is v%d, this binary needs v3 (Q3_K engine format) -> requant\n",ver); fclose(f); return 0; }
     int hdr[9]; fread(hdr,4,9,f); m->d=hdr[0];m->nl=hdr[1];m->nh=hdr[2];m->nkv=hdr[3];m->hd=hdr[4];m->vocab=hdr[5];m->n_exp=hdr[6];m->n_act=hdr[7];m->moe=hdr[8];
     fread(&m->rope_base,4,1,f); fread(&m->eps,4,1,f); m->nt=nt;
     m->tok_embd=malloc((size_t)m->vocab*m->d*4); fread(m->tok_embd,4,(size_t)m->vocab*m->d,f);
-    m->out_norm=malloc((size_t)m->d*4); fread(m->out_norm,4,m->d,f); m->lm=rlin(f);
+    m->out_norm=malloc((size_t)m->d*4); fread(m->out_norm,4,m->d,f); m->lm=rlin_i8(f);
     m->L=malloc(m->nl*sizeof(Layer));
     for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
         ly->attn_norm=malloc(m->d*4); fread(ly->attn_norm,4,m->d,f); ly->ffn_norm=malloc(m->d*4); fread(ly->ffn_norm,4,m->d,f);
@@ -1434,9 +1832,9 @@ static int cache_load(Model*m,const char*path,int nt){
         ly->router=malloc((size_t)m->n_exp*m->d*4); fread(ly->router,4,(size_t)m->n_exp*m->d,f);
         ly->router_hp=lin_new_hp(ly->router,m->n_exp,m->d);
         ly->router_i8=lin_new_i8(ly->router,m->n_exp,m->d);
-        ly->q=rlin(f); ly->k=rlin(f); ly->v=rlin(f); ly->o=rlin(f);
+        ly->q=rlin_q3k(f); ly->k=rlin_i8(f); ly->v=rlin_q3k(f); ly->o=rlin_i8(f);
         ly->eg=malloc(m->n_exp*sizeof(Lin)); ly->eu=malloc(m->n_exp*sizeof(Lin)); ly->ed=malloc(m->n_exp*sizeof(Lin));
-        for(int e=0;e<m->n_exp;e++){ ly->eg[e]=rlin(f); ly->eu[e]=rlin(f); ly->ed[e]=rlin(f); } }
+        for(int e=0;e<m->n_exp;e++){ ly->eg[e]=rlin_q3k(f); ly->eu[e]=rlin_q3k(f); ly->ed[e]=rlin_q3k(f); } }
     fclose(f); return 1;
 }
 
@@ -1450,10 +1848,16 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
     if(gT_on) gT_rope += now()-_tr0;
     for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
         rmsnorm(hn,h,ly->attn_norm,d,m->eps);
-        { double _ta=gT_on?now():0; pack_act_hp(hn,d,Abuf2);
+        { /* q,v are Q3_K (the tensors this track tests); k is Q8_0, reuses the existing int8 path
+           * unchanged (see this file's own top-of-Q3_K-section comment for why that round trip is
+           * lossless). Two different activation formats now, so two separate packs -- unlike the
+           * original engine where q/k/v all shared one int4-HP pack. */
+          double _ta=gT_on?now():0;
+          uint8_t AbufQ3K_d[3000]; pack_act_q3k(hn,d,AbufQ3K_d);
+          uint8_t Abuf_i8_d[3000]; pack_act_i8(hn,d,Abuf_i8_d);
           double _tb=gT_on?now():0; if(gT_on) gT_actpack+=_tb-_ta;
           g_lin_class=LIN_QKV;
-          lin_mm_hp(&ly->q,Abuf2,q,nt); lin_mm_hp(&ly->k,Abuf2,k,nt); lin_mm_hp(&ly->v,Abuf2,vv,nt);
+          lin_mm_q3k(&ly->q,AbufQ3K_d,q,nt); lin_mm_i8(&ly->k,Abuf_i8_d,k,nt); lin_mm_q3k(&ly->v,AbufQ3K_d,vv,nt);
           if(gT_on) lin_add(now()-_tb); g_lin_class=LIN_NONE; }
         { double _tr=gT_on?now():0;
           for(int hh=0;hh<nh;hh++){ rmsnorm(q+hh*hd,q+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q+hh*hd,hd,cosb,sinb); }
@@ -1507,7 +1911,7 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
             attn_dispatch(q,Kc,Vc,att,pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
         }
         if(gT_on) gT_attn += now()-_at;
-        g_lin_class=LIN_O; lin_mm(&ly->o,att,tmp,nt,Abuf); g_lin_class=LIN_NONE;
+        g_lin_class=LIN_O; { uint8_t Abuf_i8_qd[5200]; lin_mm_i8_x(&ly->o,att,tmp,nt,Abuf_i8_qd); } g_lin_class=LIN_NONE;
         for(int i=0;i<d;i++)h[i]+=tmp[i];
         rmsnorm(hn,h,ly->ffn_norm,d,m->eps);
         /* router precision mode (codex_recs_1.md §22.7-22.8, §22.15): int8-M1 is the DEFAULT
@@ -1554,308 +1958,28 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
             if(diffi8) g_rtr_i8_mismatch++; g_rtr_i8_diffcount+=ndiffi8;
         }
         for(int i=0;i<d;i++)eout[i]=0;
+          /* eg/eu/ed are all Q3_K -- hn's Q3_K pack (K=d) is shared across eg/eu (same input,
+           * matching the original engine's own "pack once, reuse for both" pattern); ed needs its
+           * own pack since its input is g (post-SwiGLU, K=moe), a different width. */
+          uint8_t AbufQ3K_d2[3000]; pack_act_q3k(hn,d,AbufQ3K_d2);
           for(int a=0;a<na;a++){ int e=sel[a]; float w=sw[a];
               g_lin_class=LIN_EXP;
               double _tb=gT_on?now():0;
-              lin_mm_hp(&ly->eg[e],Abuf2,g,nt); lin_mm_hp(&ly->eu[e],Abuf2,u,nt);
+              lin_mm_q3k(&ly->eg[e],AbufQ3K_d2,g,nt); lin_mm_q3k(&ly->eu[e],AbufQ3K_d2,u,nt);
               if(gT_on) lin_add(now()-_tb);
               double _ts=gT_on?now():0;
               if(g_swiglu_fast==1) swiglu_hswish_rvv(g,u,moe);
               else if(g_swiglu_fast==2) swiglu_ratsig_rvv(g,u,moe);
               else swiglu_exact(g,u,moe);
               if(gT_on) gT_swiglu+=now()-_ts;
-              lin_mm(&ly->ed[e],g,tmp,nt,Abuf); /* attributes to gT_lin_exp via g_lin_class */
+              { uint8_t AbufQ3K_moe[1200]; lin_mm_q3k_x(&ly->ed[e],g,tmp,nt,AbufQ3K_moe); } /* attributes to gT_lin_exp via g_lin_class */
               g_lin_class=LIN_NONE;
               for(int i=0;i<d;i++)eout[i]+=w*tmp[i]; } }
         for(int i=0;i<d;i++)h[i]+=eout[i];
     } }
     rmsnorm(hn,h,m->out_norm,d,m->eps);
-    g_lin_class=LIN_LM; lin_mm(&m->lm,hn,logits,nt,Abuf); g_lin_class=LIN_NONE;
+    g_lin_class=LIN_LM; { uint8_t Abuf_i8_lm[3000]; lin_mm_i8_x(&m->lm,hn,logits,nt,Abuf_i8_lm); } g_lin_class=LIN_NONE;
     if(gT_on){ double ft=now()-_f0; gT_rest += ft-(gT_actpack-_a0)-(gT_lin-_l0)-(gT_attn-_at0)-(gT_rope-_r0)-(gT_router-_ro0)-(gT_swiglu-_sw0); gT_tok++; }
-}
-/* M-batch track milestone 1 (codex_recs_1.md §22.35): batched decode for 4 GENUINELY INDEPENDENT
- * sequences -- each has its own token, position, and KV cache (own attention history), but they
- * share every DENSE weight-stream read (QKV, O, router, lm_head) via one M4 dispatch instead of 4
- * separate M1 dispatches. Per the explicit scoping decision (only dense layers batched this
- * milestone): the MoE expert FFN (gate/up/down) stays per-sequence via the existing M1 path,
- * because each sequence's router independently selects its own top-8 of 128 experts from its own
- * hidden state -- different sequences will generally select different, only-partially-overlapping
- * expert sets, so batching THAT would need a genuinely different mechanism (grouping activations
- * by which expert they routed to, gather/scatter across the batch), a separate, comparably-sized
- * undertaking not attempted here. Attention is also per-sequence for the same reason M1 always was
- * (each sequence's own KV history). Mirrors forward()'s own per-layer structure closely by design,
- * to minimize the risk of introducing new bugs relative to the already-validated serial path. */
-static void forward4_dense_batch(Model*m,int tok[4],int pos[4],Kv*kv[4],float*logits[4],
-        float*h[4],float*hn[4],float*q[4],float*k[4],float*vv[4],float*att[4],float*tmp[4],
-        float*g[4],float*u[4],float*eout[4],uint8_t*Abuf[4],uint8_t*Abuf4,uint8_t*Abuf2_4){
-    int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
-    for(int s=0;s<4;s++) memcpy(h[s],m->tok_embd+(size_t)tok[s]*d,d*4);
-    float cosb[4][256],sinb[4][256];
-    for(int s=0;s<4;s++) rope_table(cosb[s],sinb[s],hd,pos[s],m->rope_base);
-    /* Large per-call scratch, function-local static (matches forward()'s own static float*h=NULL
-     * convention for reused large buffers) -- allocated once on first use, not per-call/per-layer,
-     * and NOT on the stack (avoids risking stack overflow at these sizes, e.g. y4lm alone is up to
-     * 4*vocab floats). */
-    static float *y4q=NULL,*y4k=NULL,*y4v=NULL,*y4o=NULL,*y4r=NULL,*y4lm=NULL,*y4eg=NULL,*y4eu=NULL,*y4ed=NULL;
-    if(!y4q){ int maxqkv=nh*hd>nkv*hd?nh*hd:nkv*hd; y4q=malloc((size_t)4*maxqkv*4); y4k=malloc((size_t)4*maxqkv*4); y4v=malloc((size_t)4*maxqkv*4);
-        y4o=malloc((size_t)4*d*4); y4r=malloc((size_t)4*256*4); y4lm=malloc((size_t)4*(size_t)m->vocab*4);
-        y4eg=malloc((size_t)4*moe*4); y4eu=malloc((size_t)4*moe*4); y4ed=malloc((size_t)4*d*4); }
-
-    for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
-        for(int s=0;s<4;s++) rmsnorm(hn[s],h[s],ly->attn_norm,d,m->eps);
-        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-        lin_mm_hp_m4(&ly->q,Abuf4,y4q); lin_mm_hp_m4(&ly->k,Abuf4,y4k); lin_mm_hp_m4(&ly->v,Abuf4,y4v);
-        for(int s=0;s<4;s++){ memcpy(q[s],y4q+s*ly->q.N,ly->q.N*4); memcpy(k[s],y4k+s*ly->k.N,ly->k.N*4); memcpy(vv[s],y4v+s*ly->v.N,ly->v.N*4); }
-        for(int s=0;s<4;s++){
-            for(int hh=0;hh<nh;hh++){ rmsnorm(q[s]+hh*hd,q[s]+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q[s]+hh*hd,hd,cosb[s],sinb[s]); }
-            for(int hh=0;hh<nkv;hh++){ rmsnorm(k[s]+hh*hd,k[s]+hh*hd,ly->k_norm,hd,m->eps); rope_apply(k[s]+hh*hd,hd,cosb[s],sinb[s]); }
-        }
-        float scale=1.0f/sqrtf(hd);
-        for(int s=0;s<4;s++){
-            if(pos[s]<0 || pos[s]>=kv[s]->ctx){ fprintf(stderr,"KV position overflow: pos=%d ctx=%d\n",pos[s],kv[s]->ctx); abort(); }
-            int kvd_s=nkv*hd;
-            float*Kc=kv[s]->Kc+(size_t)l*kv[s]->ctx*kvd_s,*Vc=kv[s]->Vc+(size_t)l*kv[s]->ctx*kvd_s;
-            for(int kvh=0;kvh<nkv;kvh++){
-                memcpy(Kc+(size_t)kvh*kv[s]->ctx*hd+(size_t)pos[s]*hd, k[s]+(size_t)kvh*hd, hd*4);
-                memcpy(Vc+(size_t)kvh*kv[s]->ctx*hd+(size_t)pos[s]*hd, vv[s]+(size_t)kvh*hd, hd*4);
-            }
-            /* attention stays per-sequence, exactly the existing serial/pool-dispatched path --
-             * each sequence has its own KV history, nothing to batch here (see this function's own
-             * top comment). */
-            if(g_attn_nt<=1){
-                for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q[s]+hh*hd,*sc=tmp[s];
-                    float*Kh=Kc+(size_t)kvh*kv[s]->ctx*hd,*Vh=Vc+(size_t)kvh*kv[s]->ctx*hd;
-                    for(int j=0;j<=pos[s];j++){ float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
-                    softmax(sc,pos[s]+1);
-                    float*oh=att[s]+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-                    for(int j=0;j<=pos[s];j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); } }
-            } else {
-                attn_dispatch(q[s],Kc,Vc,att[s],pos[s],scale,hd,nkv,gpr,kv[s]->ctx,g_attn_nt);
-            }
-        }
-        pack_act_hp_m4(att[0],att[1],att[2],att[3],ly->o.K,Abuf4); /* att is qd(=nh*hd)-wide, NOT
-            d-wide -- ly->o.K is the O-projection's real input width (qd here); packing with `d`
-            would silently under-pack (miss (qd-d)/256 blocks) since qd>d for this model's GQA
-            shape (nh*hd=4096 vs d=2048). */
-        lin_mm_hp_m4(&ly->o,Abuf4,y4o);
-        for(int s=0;s<4;s++){ for(int i=0;i<d;i++) h[s][i]+=y4o[s*ly->o.N+i]; }
-        for(int s=0;s<4;s++) rmsnorm(hn[s],h[s],ly->ffn_norm,d,m->eps);
-        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-        int sel[4][32]; float sw[4][32];
-        if(g_router_mode==1) lin_mm_hp_m4(&ly->router_hp,Abuf4,y4r);
-        else if(g_router_mode==2){
-            /* int8-M1 router has no M4 port in this milestone (scoped to the int4-HP path only,
-             * matching the ALREADY-validated kernel) -- falls back to 4 separate M1 dispatches.
-             * Still correct, just not batched; router is a small bucket (~4ms/token) regardless. */
-            for(int s=0;s<4;s++){ uint8_t Ai8[3000]; pack_act_i8(hn[s],d,Ai8); lin_mm_i8(&ly->router_i8,Ai8,y4r+s*ly->router_i8.N,nt); }
-        } else {
-            for(int s=0;s<4;s++) for(int e=0;e<ne;e++) y4r[s*ne+e]=vdot_f32(ly->router+(size_t)e*d,hn[s],d);
-        }
-        for(int s=0;s<4;s++){
-            float rl[256]; memcpy(rl,y4r+s*ne,(size_t)ne*4); softmax(rl,ne);
-            for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[s][b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[s][a]=bi; sw[s][a]=bv; }
-            float ssum=0; for(int a=0;a<na;a++)ssum+=sw[s][a]; for(int a=0;a<na;a++)sw[s][a]/=ssum;
-        }
-        /* MoE expert FFN (codex_recs_1.md §22.37, M-batch milestone 3): each sequence independently
-         * selects its own top-8-of-128 experts from its own hidden state, so most experts are NOT
-         * shared across the 4-sequence batch. This section batches the one case worth batching --
-         * an expert selected by ALL 4 sequences at once -- via M4, and falls back to the existing
-         * per-sequence M1 path for everything else (an expert selected by only 1-3 sequences).
-         * Deliberately NOT padding 2- or 3-way overlaps up to a full M4 call: milestone 2
-         * (codex_recs_1.md §22.36) found M4's own arithmetic work scales with M rather than being a
-         * fixed cost, so a padded call with 1-3 real rows would do CLOSE TO the same arithmetic as
-         * a full 4-row call while only saving 1-3 weight-stream reads vs 1-3 separate M1 calls --
-         * plausibly a net loss, not clearly a win, and not worth the added complexity/risk without
-         * first knowing (from THIS milestone's own overlap statistics, reported by the caller)
-         * whether partial overlaps are even common enough to matter. */
-        /* esel[e][s] = the slot index a such that sel[s][a]==e (i.e. sequence s's own selection
-         * order for expert e), or -1 if sequence s did not select expert e; ecount[e] = how many
-         * of the 4 sequences selected expert e (0..4). */
-        int esel[128][4]; int ecount[128];
-        for(int e=0;e<ne;e++){ ecount[e]=0; for(int s=0;s<4;s++) esel[e][s]=-1; }
-        for(int s=0;s<4;s++) for(int a=0;a<na;a++){ int e=sel[s][a]; esel[e][s]=a; ecount[e]++; }
-        int processed[4][32]={{0}};
-        for(int s=0;s<4;s++) for(int i=0;i<d;i++)eout[s][i]=0;
-        for(int e=0;e<ne;e++){
-            g_moe4_total_expert_slots += ecount[e]>0 ? 1 : 0;
-            g_moe_ecount_hist[ecount[e]]++;
-            if(ecount[e]!=4) continue;
-            g_moe4_hits++;
-            pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-            lin_mm_hp_m4(&ly->eg[e],Abuf4,y4eg); lin_mm_hp_m4(&ly->eu[e],Abuf4,y4eu);
-            for(int s=0;s<4;s++){
-                float*gs=y4eg+(size_t)s*moe,*us=y4eu+(size_t)s*moe;
-                if(g_swiglu_fast==1) swiglu_hswish_rvv(gs,us,moe);
-                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(gs,us,moe);
-                else swiglu_exact(gs,us,moe);
-            }
-            pack_act_hp_m4(y4eg+0*(size_t)moe,y4eg+1*(size_t)moe,y4eg+2*(size_t)moe,y4eg+3*(size_t)moe,moe,Abuf4);
-            lin_mm_hp_m4(&ly->ed[e],Abuf4,y4ed);
-            for(int s=0;s<4;s++){
-                int a=esel[e][s]; float w=sw[s][a];
-                for(int i=0;i<d;i++) eout[s][i]+=w*y4ed[s*ly->ed[e].N+i];
-                processed[s][a]=1;
-            }
-        }
-        /* Each sequence's OWN hn must be packed into M1's (290B/block) format before the fallback
-         * loop -- this is the direct equivalent of forward()'s own `pack_act_hp(hn,d,Abuf2)` call,
-         * just done once per sequence into that sequence's own Abuf2_4 slot instead of once for the
-         * single stream. */
-        for(int s=0;s<4;s++) pack_act_hp(hn[s],d,Abuf2_4+(size_t)s*3000);
-        for(int s=0;s<4;s++){
-            for(int a=0;a<na;a++){ if(processed[s][a]) continue; int e=sel[s][a]; float w=sw[s][a];
-                lin_mm_hp(&ly->eg[e],Abuf2_4+(size_t)s*3000,g[s],nt); lin_mm_hp(&ly->eu[e],Abuf2_4+(size_t)s*3000,u[s],nt);
-                if(g_swiglu_fast==1) swiglu_hswish_rvv(g[s],u[s],moe);
-                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(g[s],u[s],moe);
-                else swiglu_exact(g[s],u[s],moe);
-                lin_mm(&ly->ed[e],g[s],tmp[s],nt,Abuf[s]);
-                for(int i=0;i<d;i++)eout[s][i]+=w*tmp[s][i]; }
-            for(int i=0;i<d;i++)h[s][i]+=eout[s][i];
-        }
-    }
-    for(int s=0;s<4;s++) rmsnorm(hn[s],h[s],m->out_norm,d,m->eps);
-    pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-    lin_mm_hp_m4(&m->lm,Abuf4,y4lm);
-    for(int s=0;s<4;s++) memcpy(logits[s],y4lm+s*m->lm.N,(size_t)m->lm.N*4);
-}
-
-/* Batched prefill track (codex_recs_1.md §22.38): batches the DENSE layers (QKV, O, router,
- * lm_head) across 4 CONSECUTIVE positions of one prompt/sequence via the same validated M4 kernel
- * used for decode-phase M-batching (§22.35-37), instead of the current token-at-a-time prefill
- * (N sequential forward() calls). Unlike decode's M-batch, all 4 positions' input tokens are known
- * upfront from the prompt -- no cross-position autoregressive dependency for the dense layers, so
- * batching them is a strictly simpler case than decode's own (there, 4 independent sequences had
- * to genuinely coexist; here, 4 positions of the SAME known prompt trivially do).
- *
- * Attention stays per-position, exact, UNBATCHED this milestone -- a genuine flash-attention-style
- * tiled/blocked causal computation (sharing K/V reads across the 4 chunk positions) is a separate,
- * larger undertaking with its own numerical-tiling risk, deliberately not attempted here, matching
- * the same "batch what clearly batches, defer the harder fused piece" scoping used for decode's
- * own dense-vs-expert split. Correctness of the per-position split is straightforward: each
- * position's own K/V depends only on that position's own (now M4-batched) QKV output, not on any
- * OTHER position in the chunk, so all 4 positions' K/V can be written into the cache up front; each
- * position's own attention then reads with its OWN correct causal bound (`j<=pos0+i`), which is
- * exactly equivalent to writing+attending one position at a time -- the causal bound alone
- * guarantees position pos0+i's attention never reads position pos0+i+1..3's K/V, independent of
- * whether that later K/V happens to already be present in memory.
- *
- * MoE expert FFN stays per-position via the existing M1 path, same reasoning as decode's own
- * scoping (§22.37): each position's own router, from its own hidden state, generally selects a
- * different expert set; whether WITHIN-sequence positions (which share context/content, unlike
- * decode's independent sequences) show meaningfully more expert-selection overlap than across-
- * sequence decode did is an open, checkable question, deferred to this milestone's own measurement
- * report rather than assumed. */
-static void prefill_chunk4(Model*m,const int toks[4],int pos0,Kv*kv,float*logits[4],
-        float*h[4],float*hn[4],float*q[4],float*k[4],float*vv[4],float*att[4],float*tmp[4],
-        float*g[4],float*u[4],float*eout[4],uint8_t*Abuf[4],uint8_t*Abuf4,uint8_t*Abuf2_4){
-    int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
-    for(int i=0;i<4;i++) memcpy(h[i],m->tok_embd+(size_t)toks[i]*d,d*4);
-    float cosb[4][256],sinb[4][256];
-    for(int i=0;i<4;i++) rope_table(cosb[i],sinb[i],hd,pos0+i,m->rope_base); /* absolute position,
-        NOT chunk-relative -- rope angle depends on the token's real position in the sequence. */
-    static float *y4q=NULL,*y4k=NULL,*y4v=NULL,*y4o=NULL,*y4r=NULL,*y4lm=NULL,*y4eg=NULL,*y4eu=NULL,*y4ed=NULL;
-    if(!y4q){ int maxqkv=nh*hd>nkv*hd?nh*hd:nkv*hd; y4q=malloc((size_t)4*maxqkv*4); y4k=malloc((size_t)4*maxqkv*4); y4v=malloc((size_t)4*maxqkv*4);
-        y4o=malloc((size_t)4*d*4); y4r=malloc((size_t)4*256*4); y4lm=malloc((size_t)4*(size_t)m->vocab*4);
-        y4eg=malloc((size_t)4*moe*4); y4eu=malloc((size_t)4*moe*4); y4ed=malloc((size_t)4*d*4); }
-
-    for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
-        for(int i=0;i<4;i++) rmsnorm(hn[i],h[i],ly->attn_norm,d,m->eps);
-        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-        lin_mm_hp_m4(&ly->q,Abuf4,y4q); lin_mm_hp_m4(&ly->k,Abuf4,y4k); lin_mm_hp_m4(&ly->v,Abuf4,y4v);
-        for(int i=0;i<4;i++){ memcpy(q[i],y4q+i*ly->q.N,ly->q.N*4); memcpy(k[i],y4k+i*ly->k.N,ly->k.N*4); memcpy(vv[i],y4v+i*ly->v.N,ly->v.N*4); }
-        for(int i=0;i<4;i++){
-            for(int hh=0;hh<nh;hh++){ rmsnorm(q[i]+hh*hd,q[i]+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q[i]+hh*hd,hd,cosb[i],sinb[i]); }
-            for(int hh=0;hh<nkv;hh++){ rmsnorm(k[i]+hh*hd,k[i]+hh*hd,ly->k_norm,hd,m->eps); rope_apply(k[i]+hh*hd,hd,cosb[i],sinb[i]); }
-        }
-        int kvd_s=nkv*hd;
-        float*Kc=kv->Kc+(size_t)l*kv->ctx*kvd_s,*Vc=kv->Vc+(size_t)l*kv->ctx*kvd_s;
-        for(int i=0;i<4;i++){
-            int pos=pos0+i;
-            if(pos<0 || pos>=kv->ctx){ fprintf(stderr,"KV position overflow: pos=%d ctx=%d\n",pos,kv->ctx); abort(); }
-            for(int kvh=0;kvh<nkv;kvh++){
-                memcpy(Kc+(size_t)kvh*kv->ctx*hd+(size_t)pos*hd, k[i]+(size_t)kvh*hd, hd*4);
-                memcpy(Vc+(size_t)kvh*kv->ctx*hd+(size_t)pos*hd, vv[i]+(size_t)kvh*hd, hd*4);
-            }
-        }
-        float scale=1.0f/sqrtf(hd);
-        for(int i=0;i<4;i++){
-            /* exact per-position causal attention, unbatched -- see this function's own top
-             * comment for why. The pos bound alone guarantees correctness even though positions
-             * pos0+i+1..pos0+3's K/V are already resident in the cache by this point. */
-            int pos=pos0+i;
-            if(g_attn_nt<=1){
-                for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q[i]+hh*hd,*sc=tmp[i];
-                    float*Kh=Kc+(size_t)kvh*kv->ctx*hd,*Vh=Vc+(size_t)kvh*kv->ctx*hd;
-                    for(int j=0;j<=pos;j++){ float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
-                    softmax(sc,pos+1);
-                    float*oh=att[i]+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
-                    for(int j=0;j<=pos;j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); } }
-            } else {
-                attn_dispatch(q[i],Kc,Vc,att[i],pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
-            }
-        }
-        pack_act_hp_m4(att[0],att[1],att[2],att[3],ly->o.K,Abuf4);
-        lin_mm_hp_m4(&ly->o,Abuf4,y4o);
-        for(int i=0;i<4;i++){ for(int t=0;t<d;t++) h[i][t]+=y4o[i*ly->o.N+t]; }
-        for(int i=0;i<4;i++) rmsnorm(hn[i],h[i],ly->ffn_norm,d,m->eps);
-        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-        int sel[4][32]; float sw[4][32];
-        if(g_router_mode==1) lin_mm_hp_m4(&ly->router_hp,Abuf4,y4r);
-        else if(g_router_mode==2){
-            for(int i=0;i<4;i++){ uint8_t Ai8[3000]; pack_act_i8(hn[i],d,Ai8); lin_mm_i8(&ly->router_i8,Ai8,y4r+i*ly->router_i8.N,nt); }
-        } else {
-            for(int i=0;i<4;i++) for(int e=0;e<ne;e++) y4r[i*ne+e]=vdot_f32(ly->router+(size_t)e*d,hn[i],d);
-        }
-        for(int i=0;i<4;i++){
-            float rl[256]; memcpy(rl,y4r+i*ne,(size_t)ne*4); softmax(rl,ne);
-            for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[i][b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[i][a]=bi; sw[i][a]=bv; }
-            float ssum=0; for(int a=0;a<na;a++)ssum+=sw[i][a]; for(int a=0;a<na;a++)sw[i][a]/=ssum;
-        }
-        /* MoE expert FFN: same exact-4-way-overlap batching as decode's own §22.37, plus the same
-         * per-sequence (here, per-position) M1 fallback for everything else. Reuses the identical
-         * grouping logic; see forward4_dense_batch's own MoE-FFN comment for the full rationale. */
-        int esel[128][4]; int ecount[128];
-        for(int e=0;e<ne;e++){ ecount[e]=0; for(int i=0;i<4;i++) esel[e][i]=-1; }
-        for(int i=0;i<4;i++) for(int a=0;a<na;a++){ int e=sel[i][a]; esel[e][i]=a; ecount[e]++; }
-        int processed[4][32]={{0}};
-        for(int i=0;i<4;i++) for(int t=0;t<d;t++)eout[i][t]=0;
-        for(int e=0;e<ne;e++){
-            g_moe4_total_expert_slots += ecount[e]>0 ? 1 : 0;
-            g_moe_ecount_hist[ecount[e]]++;
-            if(ecount[e]!=4 || !g_prefill_moe4) continue;
-            g_moe4_hits++;
-            pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-            lin_mm_hp_m4(&ly->eg[e],Abuf4,y4eg); lin_mm_hp_m4(&ly->eu[e],Abuf4,y4eu);
-            for(int i=0;i<4;i++){
-                float*gs=y4eg+(size_t)i*moe,*us=y4eu+(size_t)i*moe;
-                if(g_swiglu_fast==1) swiglu_hswish_rvv(gs,us,moe);
-                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(gs,us,moe);
-                else swiglu_exact(gs,us,moe);
-            }
-            pack_act_hp_m4(y4eg+0*(size_t)moe,y4eg+1*(size_t)moe,y4eg+2*(size_t)moe,y4eg+3*(size_t)moe,moe,Abuf4);
-            lin_mm_hp_m4(&ly->ed[e],Abuf4,y4ed);
-            for(int i=0;i<4;i++){
-                int a=esel[e][i]; float w=sw[i][a];
-                for(int t=0;t<d;t++) eout[i][t]+=w*y4ed[i*ly->ed[e].N+t];
-                processed[i][a]=1;
-            }
-        }
-        for(int i=0;i<4;i++) pack_act_hp(hn[i],d,Abuf2_4+(size_t)i*3000);
-        for(int i=0;i<4;i++){
-            for(int a=0;a<na;a++){ if(processed[i][a]) continue; int e=sel[i][a]; float w=sw[i][a];
-                lin_mm_hp(&ly->eg[e],Abuf2_4+(size_t)i*3000,g[i],nt); lin_mm_hp(&ly->eu[e],Abuf2_4+(size_t)i*3000,u[i],nt);
-                if(g_swiglu_fast==1) swiglu_hswish_rvv(g[i],u[i],moe);
-                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(g[i],u[i],moe);
-                else swiglu_exact(g[i],u[i],moe);
-                lin_mm(&ly->ed[e],g[i],tmp[i],nt,Abuf[i]);
-                for(int t=0;t<d;t++)eout[i][t]+=w*tmp[i][t]; }
-            for(int t=0;t<d;t++)h[i][t]+=eout[i][t];
-        }
-    }
-    for(int i=0;i<4;i++) rmsnorm(hn[i],h[i],m->out_norm,d,m->eps);
-    pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
-    lin_mm_hp_m4(&m->lm,Abuf4,y4lm);
-    for(int i=0;i<4;i++) memcpy(logits[i],y4lm+i*m->lm.N,(size_t)m->lm.N*4);
 }
 static int argmax(const float*l,int n){ int b=0; float bv=l[0]; for(int i=1;i<n;i++)if(l[i]>bv){bv=l[i];b=i;} return b; }
 
@@ -1869,41 +1993,6 @@ static void tok_print(Gguf*g,int id){ if(!g_bi)bdec_init(); if(id<0||id>=g->ntok
         else if((c>>4)==14){cp=((c&0xf)<<12)|(((unsigned char)s[i+1]&0x3f)<<6)|((unsigned char)s[i+2]&0x3f);i+=3;} else {cp=c;i+=1;}
         if(cp<0x200)putchar(g_bdec[cp]); } }
 
-/* ===== Multi-prompt quality harness (codex_recs_1.md §22.15) =====
- * Replaces single-prompt ' Tokyo' coherence with teacher-forced evaluation across a fixed prompt
- * set spanning factual/reasoning/code/multilingual/long-context. "First use it to decide the int8
- * router" (int4-HP already decided against via the single-prompt test, not retested here).
- *
- * Promotion thresholds are fixed HERE, before any harness run -- not tuned after seeing results:
- *   1. router expert-set mismatch < 10% of layer-token decisions
- *   2. avg NLL delta (int8 teacher-forced on fp32's tokens, minus fp32's own self-NLL) < 0.5 nats/token
- *   3. token-argmax divergence (does int8 predict the same next token fp32 chose?) < 15%
- *   4. router bucket must be >=10% faster than fp32 -- no quality risk is worth taking for free
- * All four must PASS for a promotion verdict; any single FAIL blocks it.
- *
- * Methodology: for each prompt, (1) generate a reference continuation greedily under fp32
- * (g_router_mode=0), recording each chosen token's own self-NLL (a confidence baseline, not a
- * comparison metric by itself); (2) replay the SAME prompt+reference-token sequence under int8
- * (g_router_mode=2) via TEACHER FORCING -- at each step, feed the REFERENCE token regardless of
- * what int8 itself would have picked, so divergence never compounds into a different context for
- * later positions. At each step, before feeding, compare argmax(int8_logits) against the
- * reference token (divergence) and compute NLL of the reference token under int8's distribution.
- * Router expert-set mismatch stats come from the SAME int8 pass (g_router_validate=1), so they
- * reflect genuine in-context behavior (hidden states already perturbed by int8's own earlier
- * routing), not a counterfactual-only comparison against fp32 hidden states. */
-/* Expanded 2026-07-26 per explicit direction to grow quality validation well past the 1,063-token
- * checkpoint (§22.20-21): teacher-forced positions roughly double (376->752-ish) emphasizing the
- * two long-context/free-running prompts, real-text corpus grows separately (see PPL_NTEXTS below)
- * with a heavier weight on code/multilingual/reasoning.
- *
- * MAXCTX MUST cover the max of (a) every HarnessPrompt's prefill+gen (worst case hp9/hp10:
- * 113+60=173) and (b) every PplText's raw length, since harness_eval_ppl() walks positions
- * 0..txt->n-2 over the SAME kv.ctx-sized cache (worst case ppl_code2: 355 tokens) -- confirmed
- * real bug (codex_recs_1.md §22.25): with the prior HARNESS_MAXCTX=200, harness_eval_ppl's forward()
- * calls at pos>=200 silently overran kv.Kc/kv.Vc (calloc'd to exactly nl*200*kvd floats), corrupting
- * unrelated heap allocations -- the eventual segfault surfaced much later, in an unrelated SwiGLU
- * phase, exactly the kind of delayed, misleading symptom heap corruption produces. 512 gives
- * comfortable headroom past the actual 355-token requirement. */
 #define HARNESS_NP 10
 #define HARNESS_MAXCTX 512
 #define HARNESS_GEN_SHORT 80
@@ -1986,946 +2075,96 @@ static double harness_logsumexp(const float*l,int n){ float mx=l[0]; for(int i=1
 __attribute__((noinline,optimize("no-tree-vectorize")))
 static float harness_nll(const float*logits,int n,int target){ return (float)(harness_logsumexp(logits,n)-(double)logits[target]); }
 
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void harness_run_fp32(Model*m,const HarnessPrompt*hp,int*out_toks,float*out_selfnll,Kv*kv,
+/* Q3_K engine's own quality harness (codex_recs_1.md §22.44), QWEN_Q3K_HARNESS=1: teacher-forces
+ * against W4's own reference tokens, captured separately via qwen_moe_hp.c's QWEN_Q3K_REFGEN=1 (a
+ * purely additive hook added to the W4 binary -- see that function's own comment). Router/SwiGLU
+ * stay at this engine's own default config (int8-M1 + rational-Pade, identical to what generated
+ * the W4 reference), so the ONLY thing this measures is the effect of the Q3_K weight quantization
+ * itself -- not a re-litigation of router/SwiGLU, matching this whole session's own "reference held
+ * at production config" convention (§22.19's own framing). */
+/* Captured from qwen_moe_hp.c (W4 production, int8-M1 router + rational-Pade SwiGLU),
+ * QWEN_Q3K_REFGEN=1 -- codex_recs_1.md §22.44. */
+static const int w4_ref0[]={26194,13,576,6722,315,15948,374,61124,75372,13,576,6722,315,6864,374,32166,13,576,6722,315,8330,374,68790,13,576,6722,315,14867,374,52550,13,576,6722,315,6747,374,1532,21996,13,576,6722,315,4882,11862,374,50189,13,576,6722,315,8359,374,22415,13,576,6722,315,279,3639,4180,374,6515,11,422,727,13,576,6722,315,17689,374,24081,13,576,6722,315,15344,374,21718,13};
+static const int w4_ref1[]={23552,11,323,432,594,264,4185,19699,304,1039,7298,6305,13,15920,315,279,2701,12239,911,3015,374,4396,30,320,14582,3897,553,279,6022,315,41746,323,30909,16595,11,43372,927,84,9976,315,11791,26,11102,553,279,60822,27051,20909,17458,340,32,13,3197,3015,374,72296,15905,11,279,8123,11341,315,34684,311,23552,6819,8947,374,220,16,25,23,198,33,13,758,279,72296,14406,315};
+static const int w4_ref2[]={9898,13,2160,419,264,2697,5693,30,7281,11,1128,374,279,6672,1948,264,2697,5693,323,264,5112,5693,30,2980,458,5693,387,2697,1496,421,279,33922,525,895,30,3555,374,264,274,3923,839,2142,11,323,1246,1558,432,28143,311,419,3110,30,3555,374,279,3476,315,12218,304,25597,279,31839,315,458,5693,1939,9454,11,279,5693,330,2679,678,19423,525,55569,11,323,678,55569};
+static const int w4_ref3[]={220,21,19,13,3555,374,279,5383,315,279,8500,1939,785,5383,315,279,8500,374,84192,553,220,17,1817,882,13,220,17,856,220,17,284,220,19,11,220,19,856,220,17,284,220,23,11,220,23,856,220,17,284,220,16,21,11,220,16,21,856,220,17,284,220,18,17,11,323,220,18,17,856,220,17,284,220,21,19,13,2055,11,279,8500};
+static const int w4_ref4[]={75698,1445,12,17,692,77,284,526,5384,445,6269,264,1372,25,40964,1350,955,579,39345,1445,593,198,198,2,4120,23094,25,506,7,17,86167,8,1576,1817,1618,23091,1119,1378,803,6738,13,198,2,11487,23094,25,506,1445,8,4152,311,279,50262,5611,7990,13,198,2,1096,374,264,49665,30819,5486,323,374,537,11050,369,3460,308,13,198,2,1084,594,1483,1588,438,264};
+static const int w4_ref5[]={3557,198,262,369,600,304,2088,7,17,11,526,1445,334,15,13,20,7257,16,982,286,421,308,1018,600,621,220,15,510,310,470,3557,198,262,470,3007,271,2,5712,311,1477,279,1790,10250,1372,1283,264,2661,1372,198,750,1790,38217,8068,982,262,1629,1421,220,16,198,262,1393,3007,510,286,421,374,38217,8068,982,310,470,1629,198,286,1629,1421,220,16,271};
+static const int w4_ref6[]={12095,11,9870,512,29706,2852,25173,409,1187,87000,59108,273,6810,7276,34106,1788,27363,12095,13,356,12769,517,11,512,29706,2852,25173,409,1187,87000,409,326,6,71807,273,6810,7276,34106,1788,12095,11,9870,512,29706,2852,25173,409,1187,87000,409,326,6,71807,273,6810,7276,34106,1788,12095,13,25968,61898,1788,53212,1709,512,29706,2852,25173,409,1187,87000,409,326,6,71807,273,6810,7276,34106};
+static const int w4_ref7[]={101059,9370,106114,3837,100000,101059,104003,99490,3837,32664,101037,11319,220,107513,20412,101059,9370,106114,3837,100000,101059,104003,99490,3837,32664,101037,26850,107513,20412,101059,9370,106114,3837,100000,101059,104003,99490,3837,32664,101037,11319,220,107513,20412,101059,9370,106114,3837,100000,101059,104003,99490,3837,32664,101037,26850,107513,20412,101059,9370,106114,3837,100000,101059,104003,99490,3837,32664,101037,11319,220,107513,20412,101059,9370,106114,3837,100000,101059,104003};
+static const int w4_ref8[]={330,1986,3736,374,537,10865,13,1084,594,8580,369,279,1290,4445,311,1191,1549,1189,576,33958,572,86320,11,714,85656,28576,389,67237,432,13,4636,3807,2849,315,95178,975,11,85656,8975,311,5046,279,3736,11,323,979,566,22593,432,1182,311,279,33958,11,432,3855,82337,518,6896,32333};
+static const int w4_ref9[]={279,4401,315,279,8003,29474,11,438,432,8970,279,13420,2628,2022,323,3072,5670,315,18495,11,3259,1105,15614,311,279,4586,584,13,1096,18770,17113,279,16266,369,279,7377,4231,11,27362,279,11048,82687,304,5440,429,8110,13,4710,23085,315,279,2701,374,4183,264,8760,315,279,8003,29474};
+static const double w4_ref_selfnll_sum[10]={13.48627450,21.13125783,19.43968249,9.67866765,20.61854125,6.87543578,29.82261907,11.31101747,22.65654044,24.72858263};
+static const double w4_ppl_nll[9]={0.55054666,1.87731741,0.27632271,1.60729695,0.29639198,1.61581453,1.35117656,1.16457770,2.70053341};
+
+/* real-text perplexity for the Q3_K engine -- pure forward pass over real preceding context, same
+ * methodology as the original harness_eval_ppl, minus the router_mode/swiglu_fast parameters (this
+ * engine only has one weight config to evaluate, no need to parametrize). */
+static double harness_eval_ppl_q3k(Model*m,const PplText*txt,Kv*kv,
         float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
     memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=0; g_router_validate=0;
-    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    int cur=argmax(logits,m->vocab); out_toks[0]=cur; out_selfnll[0]=harness_nll(logits,m->vocab,cur);
-    for(int s=1;s<hp->gen;s++){
-        forward(m,cur,hp->n+s-1,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-        cur=argmax(logits,m->vocab); out_toks[s]=cur; out_selfnll[s]=harness_nll(logits,m->vocab,cur);
-    }
-}
-/* SwiGLU evaluation (§22.18): reference generation under int8-M1 router (g_router_mode=2 -- NOT
- * fp32/mode=0 like harness_run_fp32 above, which is the original router-promotion ground truth,
- * kept as-is for history) with EXACT SwiGLU, hardcoded (g_swiglu_fast=0) regardless of whatever
- * the CLI/production default currently is -- this is the fixed gold reference every SwiGLU
- * candidate is measured against, so it must stay pinned to exact math even after §22.21 promoted
- * rational-Pade to the production default. This is deliberately a separate function rather than a
- * parameterized reuse of harness_run_fp32: the SwiGLU question is "does adding fast SwiGLU on top
- * of what's already shipping cause a problem", not a re-litigation of the router decision, so the
- * router must match current production exactly while SwiGLU stays exact. */
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void harness_run_prod_reference(Model*m,const HarnessPrompt*hp,int*out_toks,float*out_selfnll,Kv*kv,
-        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
-    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=2; g_router_validate=0; g_swiglu_fast=0;
-    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    int cur=argmax(logits,m->vocab); out_toks[0]=cur; out_selfnll[0]=harness_nll(logits,m->vocab,cur);
-    for(int s=1;s<hp->gen;s++){
-        forward(m,cur,hp->n+s-1,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-        cur=argmax(logits,m->vocab); out_toks[s]=cur; out_selfnll[s]=harness_nll(logits,m->vocab,cur);
-    }
-}
-/* teacher-forces under the given (router_mode, swiglu_fast) config -- same teacher-forcing
- * methodology as the router harness (feed the reference token regardless of what this config
- * would itself pick, so one divergence never compounds into a different context for later
- * positions). router_mode is a parameter (not hardcoded to production) so this same function can
- * measure either "SwiGLU's marginal effect on top of production routing" (router_mode=2) or "the
- * full combined stack's total deviation from the original fp32-exact engine" (router_mode=2
- * teacher-forced against a router_mode=0 reference) -- codex_recs_1.md §22.20 remediation step 3.
- * No router validation needed here (not testing router quality), so no do_validate split like the
- * router version required. */
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void harness_run_swiglu_teacherforced(Model*m,const HarnessPrompt*hp,const int*ref,int router_mode,int swiglu_fast,int*out_div,float*out_nll,Kv*kv,
-        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
-    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=router_mode; g_router_validate=0; g_swiglu_fast=swiglu_fast;
-    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    for(int s=0;s<hp->gen;s++){
-        out_div[s]=(argmax(logits,m->vocab)!=ref[s]); out_nll[s]=harness_nll(logits,m->vocab,ref[s]);
-        forward(m,ref[s],hp->n+s,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    }
-    g_swiglu_fast=0;
-}
-/* real-text perplexity: pure forward pass over independently-authored text under the given
- * (router_mode, swiglu_fast) config, accumulating NLL of each REAL next token given the REAL
- * preceding context -- not teacher-forced against any model's own generation. Returns avg
- * nats/token; caller exponentiates for a perplexity figure. */
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static double harness_eval_ppl(Model*m,const PplText*txt,int router_mode,int swiglu_fast,Kv*kv,
-        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
-    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=router_mode; g_router_validate=0; g_swiglu_fast=swiglu_fast;
     double total_nll=0; int count=0;
     for(int p=0;p<txt->n-1;p++){
         forward(m,txt->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
         total_nll+=harness_nll(logits,m->vocab,txt->toks[p+1]); count++;
     }
-    g_swiglu_fast=0;
     return count?total_nll/count:0.0;
 }
-/* free-running generation under the given (router_mode, swiglu_fast) config -- NOT teacher-forced,
- * each config generates its own independent continuation. Qualitative spot-check: teacher-forcing
- * always resets to the reference token every step, which structurally cannot reveal whether a
- * candidate's errors compound differently over a longer, uncorrected horizon (codex_recs_1.md
- * §22.20 remediation step 2). */
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void harness_generate_generic(Model*m,const HarnessPrompt*hp,int*out_toks,int router_mode,int swiglu_fast,Kv*kv,
-        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
-    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=router_mode; g_router_validate=0; g_swiglu_fast=swiglu_fast;
-    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    int cur=argmax(logits,m->vocab); out_toks[0]=cur;
-    for(int s=1;s<hp->gen;s++){
-        forward(m,cur,hp->n+s-1,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-        cur=argmax(logits,m->vocab); out_toks[s]=cur;
-    }
-    g_swiglu_fast=0;
-}
-/* do_validate=1 also computes router expert-set mismatch stats (g_router_validate=1), which
- * makes EVERY forward() call additionally compute the other router variants plus O(experts)
- * sentinel-argmax/mismatch-counting overhead -- real cost, but not part of what int8's own
- * decode buckets cost in actual production use. Call with do_validate=0 for a clean, apples-to-
- * apples SPEED comparison against the fp32 pass; call again with do_validate=1 (timing discarded)
- * to harvest router-mismatch stats separately. Mixing the two in one pass is exactly the kind of
- * "measure the wrong thing" bug this session has hit before (research_feed_paths.md §12) -- the
- * first version of this harness did that and produced a bogus "int8 router is 29% slower" result
- * (all in the untimed 'rest' bucket, from validation overhead, not real work). */
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void harness_run_teacherforced(Model*m,const HarnessPrompt*hp,const int*ref,int mode,int do_validate,int*out_div,float*out_nll,
-        int*out_rtr_cmp,int*out_rtr_mm,int*out_rtr_dc,float*out_rtr_ma,Kv*kv,
-        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits){
-    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=mode; g_router_validate=do_validate;
-    long cmp0=g_rtr_cmp, mm0=(mode==1?g_rtr_hp_mismatch:g_rtr_i8_mismatch), dc0=(mode==1?g_rtr_hp_diffcount:g_rtr_i8_diffcount);
-    for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    for(int s=0;s<hp->gen;s++){
-        out_div[s]=(argmax(logits,m->vocab)!=ref[s]); out_nll[s]=harness_nll(logits,m->vocab,ref[s]);
-        forward(m,ref[s],hp->n+s,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    }
-    *out_rtr_cmp=(int)(g_rtr_cmp-cmp0); *out_rtr_mm=(int)((mode==1?g_rtr_hp_mismatch:g_rtr_i8_mismatch)-mm0);
-    *out_rtr_dc=(int)((mode==1?g_rtr_hp_diffcount:g_rtr_i8_diffcount)-dc0); *out_rtr_ma=(mode==1?g_rtr_hp_maxabs:g_rtr_i8_maxabs);
-    g_router_validate=0;
-}
-
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void run_quality_harness(Model*m,Gguf*gguf){
+static void run_q3k_quality_harness(Model*m){
     int ctx=HARNESS_MAXCTX; Kv kv; kv.kvd=m->nkv*m->hd; kv.ctx=ctx;
     kv.Kc=calloc((size_t)m->nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m->nl*ctx*kv.kvd,4);
     int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
     float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
          *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m->vocab*4);
     uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
+    const int*w4refs[HARNESS_NP]={w4_ref0,w4_ref1,w4_ref2,w4_ref3,w4_ref4,w4_ref5,w4_ref6,w4_ref7,w4_ref8,w4_ref9};
 
-    static int ref_toks[HARNESS_NP][HARNESS_GEN_SHORT];
-    static float self_nll[HARNESS_NP][HARNESS_GEN_SHORT];
-
-    printf("\n=== quality harness: phase 1/2 -- fp32 reference generation (%d prompts) ===\n",HARNESS_NP); fflush(stdout);
-    gT_on=1; gT_tok=0; gT_actpack=gT_lin=gT_attn=gT_rope=gT_router=gT_swiglu=gT_rest=0;
-    double t0=now();
+    printf("\n=== Q3_K quality harness: phase 1 -- teacher-forced vs W4 reference tokens ===\n");
+    long total_gen=0,total_div=0; double total_nll_q3k=0,total_nll_w4=0;
     for(int i=0;i<HARNESS_NP;i++){
-        harness_run_fp32(m,&g_hprompts[i],ref_toks[i],self_nll[i],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        printf("  [%2d/%d] %-24s prefill=%3d gen=%2d done\n",i+1,HARNESS_NP,g_hprompts[i].name,g_hprompts[i].n,g_hprompts[i].gen);
-    }
-    long tok_fp32=gT_tok; double lin_fp32=gT_lin,attn_fp32=gT_attn,rope_fp32=gT_rope,router_fp32=gT_router,swiglu_fp32=gT_swiglu,actpack_fp32=gT_actpack,rest_fp32=gT_rest;
-    fprintf(stderr,"  phase 1 wall: %.1fs\n",now()-t0);
-
-    printf("\n=== quality harness: phase 2a/2 -- int8-M1 router expert-set mismatch (validate on, timing discarded) ===\n");
-    typedef struct { const char*name; int gen,divergent,rtr_cmp,rtr_mm,rtr_dc; float nll_i8,nll_fp32,rtr_ma; } HRes;
-    HRes res[HARNESS_NP];
-    for(int i=0;i<HARNESS_NP;i++){
-        int div[HARNESS_GEN_SHORT]; float nll[HARNESS_GEN_SHORT]; int rc,rm,rd; float rma;
-        int save_gTon=gT_on; gT_on=0; /* this pass's cost must not leak into any speed bucket */
-        harness_run_teacherforced(m,&g_hprompts[i],ref_toks[i],2,1,div,nll,&rc,&rm,&rd,&rma,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        gT_on=save_gTon;
-        HRes*r=&res[i]; r->name=g_hprompts[i].name; r->gen=g_hprompts[i].gen; r->divergent=0; r->nll_i8=0; r->nll_fp32=0;
-        for(int s=0;s<r->gen;s++){ r->divergent+=div[s]; r->nll_i8+=nll[s]; r->nll_fp32+=self_nll[i][s]; }
-        r->rtr_cmp=rc; r->rtr_mm=rm; r->rtr_dc=rd; r->rtr_ma=rma;
-        printf("  [%2d/%d] %-24s divergent=%2d/%-2d  nll_delta=%+.4f  rtr_mismatch=%3d/%-4d\n",
-            i+1,HARNESS_NP,r->name,r->divergent,r->gen,(r->nll_i8-r->nll_fp32)/r->gen,r->rtr_mm,r->rtr_cmp);
-    }
-
-    printf("\n=== quality harness: phase 2b/2 -- int8-M1 router speed (validate off, clean apples-to-apples timing) ===\n");
-    t0=now();
-    for(int i=0;i<HARNESS_NP;i++){
-        int div[HARNESS_GEN_SHORT]; float nll[HARNESS_GEN_SHORT]; int rc,rm,rd; float rma;
-        harness_run_teacherforced(m,&g_hprompts[i],ref_toks[i],2,0,div,nll,&rc,&rm,&rd,&rma,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        printf("  [%2d/%d] %-24s done\n",i+1,HARNESS_NP,g_hprompts[i].name);
-    }
-    long tok_i8=gT_tok-tok_fp32; double lin_i8=gT_lin-lin_fp32,attn_i8=gT_attn-attn_fp32,rope_i8=gT_rope-rope_fp32,
-        router_i8=gT_router-router_fp32,swiglu_i8=gT_swiglu-swiglu_fp32,actpack_i8=gT_actpack-actpack_fp32,rest_i8=gT_rest-rest_fp32;
-    fprintf(stderr,"  phase 2 wall: %.1fs\n",now()-t0);
-    gT_on=0;
-
-    int total_gen=0,total_div=0,total_rc=0,total_rm=0,total_rd=0; double total_nll_i8=0,total_nll_fp32=0; float max_rma=0;
-    for(int i=0;i<HARNESS_NP;i++){ total_gen+=res[i].gen; total_div+=res[i].divergent; total_nll_i8+=res[i].nll_i8; total_nll_fp32+=res[i].nll_fp32;
-        total_rc+=res[i].rtr_cmp; total_rm+=res[i].rtr_mm; total_rd+=res[i].rtr_dc; if(res[i].rtr_ma>max_rma)max_rma=res[i].rtr_ma; }
-    double div_rate=100.0*total_div/total_gen, nll_delta=(total_nll_i8-total_nll_fp32)/total_gen, rtr_rate=100.0*total_rm/total_rc;
-    double fp32_router_ms=tok_fp32?router_fp32/tok_fp32*1e3:0, i8_router_ms=tok_i8?router_i8/tok_i8*1e3:0;
-    double speedup_pct=fp32_router_ms?100.0*(fp32_router_ms-i8_router_ms)/fp32_router_ms:0;
-
-    printf("\n=== QUALITY HARNESS REPORT (int8-M1 router vs fp32, %d prompts, %d total generated tokens, teacher-forced) ===\n",HARNESS_NP,total_gen);
-    printf("token-argmax divergence:  %d/%d (%.1f%%)\n",total_div,total_gen,div_rate);
-    printf("avg NLL delta (int8 tf - fp32 self): %+.4f nats/token\n",nll_delta);
-    printf("router expert-set mismatch: %d/%d (%.1f%%), max abs logit delta %e\n",total_rm,total_rc,rtr_rate,max_rma);
-    printf("speed: fp32 router %.1fms/tok, int8 router %.1fms/tok (%.1f%% %s)\n",
-        fp32_router_ms,i8_router_ms,speedup_pct>=0?speedup_pct:-speedup_pct,speedup_pct>=0?"faster":"slower");
-    printf("fp32 buckets (avg/%ld tok, ms): act-pack %.1f | linear %.1f | attention %.1f | rope %.1f | router %.1f | swiglu %.1f | rest %.1f\n",
-        tok_fp32,actpack_fp32/tok_fp32*1e3,lin_fp32/tok_fp32*1e3,attn_fp32/tok_fp32*1e3,rope_fp32/tok_fp32*1e3,router_fp32/tok_fp32*1e3,swiglu_fp32/tok_fp32*1e3,rest_fp32/tok_fp32*1e3);
-    printf("int8 buckets (avg/%ld tok, ms): act-pack %.1f | linear %.1f | attention %.1f | rope %.1f | router %.1f | swiglu %.1f | rest %.1f\n",
-        tok_i8,actpack_i8/tok_i8*1e3,lin_i8/tok_i8*1e3,attn_i8/tok_i8*1e3,rope_i8/tok_i8*1e3,router_i8/tok_i8*1e3,swiglu_i8/tok_i8*1e3,rest_i8/tok_i8*1e3);
-
-    printf("\n--- promotion thresholds (fixed before this run, codex_recs_1.md §22.15) ---\n");
-    int p1=rtr_rate<10.0, p2=nll_delta<0.5, p3=div_rate<15.0, p4=speedup_pct>=10.0;
-    printf("  [%s] router expert-set mismatch < 10%%      (got %.1f%%)\n",p1?"PASS":"FAIL",rtr_rate);
-    printf("  [%s] avg NLL delta < 0.5 nats/token         (got %+.4f)\n",p2?"PASS":"FAIL",nll_delta);
-    printf("  [%s] token divergence < 15%%                 (got %.1f%%)\n",p3?"PASS":"FAIL",div_rate);
-    printf("  [%s] router bucket >=10%% faster than fp32   (got %.1f%%)\n",p4?"PASS":"FAIL",speedup_pct);
-    printf("VERDICT: int8-M1 router %s promotion to default.\n",(p1&&p2&&p3&&p4)?"PASSES all thresholds -- ELIGIBLE FOR":"FAILS at least one threshold -- NOT ELIGIBLE FOR");
-
-    /* ===== SwiGLU evaluation v2 (codex_recs_1.md §22.20, remediation after §22.19's retraction).
-     * Thresholds tightened and RESTATED IN PERPLEXITY-MULTIPLIER TERMS per external review of the
-     * first attempt -- §22.18's "0.3 nats/tok" bound was, unnoticed at the time, a 35% perplexity-
-     * inflation ceiling, far too loose; hard-swish's actual 0.0969 nats = 10.2% inflation should
-     * have read as an obvious warning sign, not a threshold pass. New bar: perplexity multiplier
-     * < 1.05 (5% inflation, ln(1.05)=0.0488 nats/tok). Divergence and speed bars unchanged.
-     * Evaluated two ways per candidate: marginal effect on top of production routing (int8 router
-     * held constant, matching §22.18's original scope) AND full combined-stack deviation from the
-     * ORIGINAL fp32-router+exact-SiLU ground truth (§22.18 never measured this). */
-    static int swiglu_ref[HARNESS_NP][HARNESS_GEN_SHORT];
-    static float swiglu_selfnll[HARNESS_NP][HARNESS_GEN_SHORT];
-    printf("\n=== quality harness: SwiGLU phase 1 -- production reference (int8 router + exact SwiGLU) ===\n");
-    gT_on=1; gT_tok=0; gT_actpack=gT_lin=gT_attn=gT_rope=gT_router=gT_swiglu=gT_rest=0;
-    for(int i=0;i<HARNESS_NP;i++){
-        harness_run_prod_reference(m,&g_hprompts[i],swiglu_ref[i],swiglu_selfnll[i],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        printf("  [%2d/%d] %-24s done\n",i+1,HARNESS_NP,g_hprompts[i].name);
-    }
-    long tok_exact=gT_tok; double swiglu_exact_t=gT_swiglu;
-    gT_on=0;
-
-    const char* cand_names[3] = {"","hard-swish","rational-Pade"};
-    int teacher_gate_pass[3] = {0,0,0};
-    for(int cand_mode=1; cand_mode<=2; cand_mode++){
-        printf("\n=== quality harness: SwiGLU phase 2 -- %s candidate ===\n", cand_names[cand_mode]);
-        typedef struct { const char*name; int gen,divergent; float nll_fast,nll_exact; } SRes;
-        SRes sres[HARNESS_NP];
-        gT_on=1; gT_tok=0; gT_swiglu=0;
-        for(int i=0;i<HARNESS_NP;i++){
-            int div[HARNESS_GEN_SHORT]; float nll[HARNESS_GEN_SHORT];
-            harness_run_swiglu_teacherforced(m,&g_hprompts[i],swiglu_ref[i],2,cand_mode,div,nll,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-            SRes*r=&sres[i]; r->name=g_hprompts[i].name; r->gen=g_hprompts[i].gen; r->divergent=0; r->nll_fast=0; r->nll_exact=0;
-            for(int s=0;s<r->gen;s++){ r->divergent+=div[s]; r->nll_fast+=nll[s]; r->nll_exact+=swiglu_selfnll[i][s]; }
-            printf("  [%2d/%d] %-24s divergent=%2d/%-2d  nll_delta=%+.4f\n",i+1,HARNESS_NP,r->name,r->divergent,r->gen,(r->nll_fast-r->nll_exact)/r->gen);
+        memset(kv.Kc,0,(size_t)m->nl*ctx*kv.kvd*4); memset(kv.Vc,0,(size_t)m->nl*ctx*kv.kvd*4);
+        const int*ref=w4refs[i];
+        for(int p=0;p<g_hprompts[i].n;p++) forward(m,g_hprompts[i].toks[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+        int div=0; double sumnll=0;
+        for(int s=0;s<g_hprompts[i].gen;s++){
+            div += (argmax(logits,m->vocab)!=ref[s]);
+            sumnll += harness_nll(logits,m->vocab,ref[s]);
+            forward(m,ref[s],g_hprompts[i].n+s,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
         }
-        long tok_fast=gT_tok; double swiglu_fast_t=gT_swiglu;
-        gT_on=0;
-
-        int total_gen2=0,total_div2=0; double total_nll_fast=0,total_nll_exact2=0;
-        for(int i=0;i<HARNESS_NP;i++){ total_gen2+=sres[i].gen; total_div2+=sres[i].divergent; total_nll_fast+=sres[i].nll_fast; total_nll_exact2+=sres[i].nll_exact; }
-        double div_rate2=100.0*total_div2/total_gen2, nll_delta2=(total_nll_fast-total_nll_exact2)/total_gen2;
-        double exact_ms=tok_exact?swiglu_exact_t/tok_exact*1e3:0, fast_ms=tok_fast?swiglu_fast_t/tok_fast*1e3:0;
-        double swiglu_speedup=exact_ms?100.0*(exact_ms-fast_ms)/exact_ms:0;
-        double ppl_mult=exp(nll_delta2);
-
-        /* full-stack deviation: teacher-force the SAME candidate against the ORIGINAL fp32+exact
-         * ground truth (ref_toks/self_nll, computed in the router phase above) -- remediation
-         * step 3, never measured in §22.18. */
-        int total_div3=0,total_gen3=0; double total_nll_fast3=0,total_nll_exact3=0;
-        for(int i=0;i<HARNESS_NP;i++){
-            int div3[HARNESS_GEN_SHORT]; float nll3[HARNESS_GEN_SHORT];
-            harness_run_swiglu_teacherforced(m,&g_hprompts[i],ref_toks[i],2,cand_mode,div3,nll3,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-            int gen=g_hprompts[i].gen;
-            for(int s=0;s<gen;s++){ total_div3+=div3[s]; total_nll_fast3+=nll3[s]; total_nll_exact3+=self_nll[i][s]; }
-            total_gen3+=gen;
-        }
-        double div_rate3=100.0*total_div3/total_gen3, nll_delta3=(total_nll_fast3-total_nll_exact3)/total_gen3;
-        double ppl_mult3=exp(nll_delta3);
-
-        printf("\n--- %s vs int8+exact PRODUCTION (marginal SwiGLU effect) ---\n", cand_names[cand_mode]);
-        printf("  divergence %d/%d (%.1f%%), NLL delta %+.4f nats/tok, perplexity multiplier x%.4f (%.1f%% inflation)\n",
-            total_div2,total_gen2,div_rate2,nll_delta2,ppl_mult,100.0*(ppl_mult-1.0));
-        printf("--- %s vs ORIGINAL fp32+exact ground truth (full combined-stack deviation) ---\n", cand_names[cand_mode]);
-        printf("  divergence %d/%d (%.1f%%), NLL delta %+.4f nats/tok, perplexity multiplier x%.4f (%.1f%% inflation)\n",
-            total_div3,total_gen3,div_rate3,nll_delta3,ppl_mult3,100.0*(ppl_mult3-1.0));
-        printf("speed: exact swiglu %.2fms/tok, %s %.2fms/tok (%.1f%% time reduction, %.2fx faster)\n",
-            exact_ms,cand_names[cand_mode],fast_ms,swiglu_speedup,fast_ms?exact_ms/fast_ms:0.0);
-
-        printf("--- %s promotion thresholds (perplexity multiplier restated per external review, codex_recs_1.md §22.20) ---\n", cand_names[cand_mode]);
-        int q1=ppl_mult<1.05, q2=div_rate2<15.0, q3=swiglu_speedup>=15.0;
-        printf("  [%s] perplexity multiplier < 1.05 (5%% inflation ceiling), vs production  (got x%.4f, %.1f%%)\n",q1?"PASS":"FAIL",ppl_mult,100.0*(ppl_mult-1.0));
-        printf("  [%s] token divergence < 15%% (vs production)                              (got %.1f%%)\n",q2?"PASS":"FAIL",div_rate2);
-        printf("  [%s] swiglu bucket >=15%% faster than exact                                (got %.1f%%)\n",q3?"PASS":"FAIL",swiglu_speedup);
-        printf("  (informational, not gated) full-stack perplexity multiplier vs fp32+exact ground truth: x%.4f (%.1f%%)\n",ppl_mult3,100.0*(ppl_mult3-1.0));
-        teacher_gate_pass[cand_mode]=q1&&q2&&q3;
-        printf("PRELIMINARY VERDICT: %s %s teacher-forced gates; final eligibility also requires the real-text gates below.\n",
-            cand_names[cand_mode],teacher_gate_pass[cand_mode]?"PASSES":"FAILS");
+        printf("  [%2d/%d] %-24s divergent=%2d/%-2d  nll_q3k=%.6f  nll_w4=%.6f  delta=%+.6f\n",
+            i+1,HARNESS_NP,g_hprompts[i].name,div,g_hprompts[i].gen,sumnll,w4_ref_selfnll_sum[i],sumnll-w4_ref_selfnll_sum[i]);
+        total_gen+=g_hprompts[i].gen; total_div+=div; total_nll_q3k+=sumnll; total_nll_w4+=w4_ref_selfnll_sum[i];
     }
+    double div_rate=100.0*total_div/total_gen;
+    double nll_delta=(total_nll_q3k-total_nll_w4)/total_gen;
+    double ppl_mult=exp(nll_delta);
+    printf("\nteacher-forced: divergence %ld/%ld (%.2f%%), NLL delta %+.6f nats/tok, perplexity multiplier x%.4f (%.2f%% inflation)\n",
+        total_div,total_gen,div_rate,nll_delta,ppl_mult,100.0*(ppl_mult-1.0));
 
-    /* ===== real-text perplexity: independently-authored text, 4 configs (codex_recs_1.md §22.20
-     * remediation step 2/3) -- pure forward-pass NLL over REAL preceding context, not teacher-
-     * forced against any model's own generated continuation. ===== */
-    printf("\n=== quality harness: real-text perplexity (%d independently-authored texts) ===\n",PPL_NTEXTS);
-    struct { const char*name; int router_mode, swiglu_mode; } cfgs[4] = {
-        {"fp32+exact (original ground truth)",0,0}, {"int8+exact (production)",2,0},
-        {"int8+hard-swish",2,1}, {"int8+rational-Pade",2,2},
-    };
-    double ppl_agg[4], ppl_by_text[4][PPL_NTEXTS];
-    for(int c=0;c<4;c++){
-        double sum=0; int total_toks=0;
-        printf("  --- %s ---\n",cfgs[c].name);
-        for(int t=0;t<PPL_NTEXTS;t++){
-            double nll=harness_eval_ppl(m,&g_ppltexts[t],cfgs[c].router_mode,cfgs[c].swiglu_mode,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-            ppl_by_text[c][t]=nll;
-            printf("      %-28s NLL=%.4f nats/tok  perplexity=%.3f\n",g_ppltexts[t].name,nll,exp(nll));
-            sum+=nll*(g_ppltexts[t].n-1); total_toks+=g_ppltexts[t].n-1;
-        }
-        ppl_agg[c]=sum/total_toks;
-        printf("    aggregate: NLL=%.4f nats/tok  perplexity=%.3f  (%d tokens)\n",ppl_agg[c],exp(ppl_agg[c]),total_toks);
-    }
-    printf("  real-text perplexity multiplier vs fp32+exact ground truth: int8+exact x%.4f | int8+hard-swish x%.4f | int8+rational-Pade x%.4f\n",
-        exp(ppl_agg[1]-ppl_agg[0]), exp(ppl_agg[2]-ppl_agg[0]), exp(ppl_agg[3]-ppl_agg[0]));
-    printf("  real-text perplexity multiplier vs int8+exact production:                      int8+hard-swish x%.4f | int8+rational-Pade x%.4f\n",
-        exp(ppl_agg[2]-ppl_agg[1]), exp(ppl_agg[3]-ppl_agg[1]));
-
-    /* Final promotion gates were fixed before running the larger evaluation: aggregate real-text
-     * perplexity inflation must stay below 5%, and no individual corpus may exceed 10%.  These
-     * supplement (not replace) the teacher-forced quality/speed gates above. */
-    printf("\n=== SwiGLU final promotion gates (predeclared before larger board run) ===\n");
-    for(int cand_mode=1;cand_mode<=2;cand_mode++){
-        int cfg=cand_mode+1;
-        double agg_mult=exp(ppl_agg[cfg]-ppl_agg[1]);
-        double worst_mult=0; int worst_text=0;
-        for(int t=0;t<PPL_NTEXTS;t++){
-            double mult=exp(ppl_by_text[cfg][t]-ppl_by_text[1][t]);
-            if(mult>worst_mult){ worst_mult=mult; worst_text=t; }
-        }
-        int real_gate=agg_mult<1.05 && worst_mult<1.10;
-        int final_pass=teacher_gate_pass[cand_mode] && real_gate;
-        printf("  %s: aggregate x%.4f (<1.05), worst corpus x%.4f (<1.10, %s) -- %s\n",
-            cand_names[cand_mode],agg_mult,worst_mult,g_ppltexts[worst_text].name,
-            final_pass?"ELIGIBLE FOR PRODUCTION A/B":"NOT ELIGIBLE");
-    }
-
-    /* ===== free-running generation, not teacher-forced (remediation step 2) ===== */
-    printf("\n=== quality harness: free-running generation (independent, qualitative spot-check) ===\n");
-    int freerun_idx[2] = {0,8}; /* factual/capitals (short); long-context/narrative (long) */
-    for(int fi=0; fi<2; fi++){
-        int i=freerun_idx[fi];
-        printf("  prompt: %s\n",g_hprompts[i].name);
-        for(int c=1;c<4;c++){
-            int toks[HARNESS_GEN_SHORT];
-            harness_generate_generic(m,&g_hprompts[i],toks,cfgs[c].router_mode,cfgs[c].swiglu_mode,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-            printf("    %-24s: ",cfgs[c].name);
-            for(int s=0;s<g_hprompts[i].gen;s++) tok_print(gguf,toks[s]);
-            printf("\n");
-        }
-    }
-
-    free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
-    free(kv.Kc);free(kv.Vc);
-}
-
-/* Batched prefill quality harness (codex_recs_1.md §22.39), QWEN_PREFILL_HARNESS=1: per explicit
- * user direction after §22.38's opt-in validation -- "run the full quality harness on
- * QWEN_PREFILL_CHUNK=1, using predeclared acceptance thresholds consistent with the router/SwiGLU
- * promotions." Reference is `harness_run_prod_reference` UNCHANGED (today's actual production
- * config: int8-M1 router + rational-Pade SwiGLU + SEQUENTIAL prefill) -- this asks "does adding
- * chunked-M4 prefill on top of what already ships cause a problem", the same framing established
- * for SwiGLU's own evaluation, not a re-litigation of router/SwiGLU. The candidate differs from
- * every prior teacher-forced harness only in HOW the prompt itself is ingested (chunked-M4 via
- * `prefill_chunk4` in groups of 4 consecutive positions + per-token `forward()` for any N-mod-4
- * remainder, exactly `run_prefill_test`/`main()`'s own already-validated QWEN_PREFILL_CHUNK=1
- * mechanism) -- router/SwiGLU stay pinned at production (2/2) throughout, and decode after the
- * prompt is the unchanged, untouched forward() loop either way. */
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void harness_run_prefill_teacherforced(Model*m,const HarnessPrompt*hp,const int*ref,int*out_div,float*out_nll,Kv*kv,
-        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits,
-        float*h4[4],float*hn4[4],float*q4[4],float*k4[4],float*vv4[4],float*att4[4],float*tmp4[4],
-        float*g4[4],float*u4[4],float*eout4[4],float*logits4[4],uint8_t*Abuf4arr[4],uint8_t*Abuf4buf,uint8_t*Abuf2_4){
-    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=2; g_router_validate=0; g_swiglu_fast=2;
-    int nchunks=hp->n/4, rem=hp->n%4;
-    for(int c=0;c<nchunks;c++){
-        int toks4[4]; for(int i=0;i<4;i++) toks4[i]=hp->toks[c*4+i];
-        prefill_chunk4(m,toks4,c*4,kv,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
-        if(c==nchunks-1 && rem==0) memcpy(logits,logits4[3],(size_t)m->vocab*4);
-    }
-    for(int r=0;r<rem;r++){
-        int p=nchunks*4+r;
-        forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    }
-    /* `logits` now holds the prediction for the token right after the prompt -- decode step 0,
-     * exactly like every other teacher-forced harness's post-prefill `logits` state. */
-    for(int s=0;s<hp->gen;s++){
-        out_div[s]=(argmax(logits,m->vocab)!=ref[s]); out_nll[s]=harness_nll(logits,m->vocab,ref[s]);
-        forward(m,ref[s],hp->n+s,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    }
-    g_swiglu_fast=0;
-}
-/* real-text perplexity under chunked-M4 prefill, same "reconstruct NLL of the REAL next token from
- * REAL preceding context" methodology as `harness_eval_ppl`, batched across the text's own
- * consecutive positions instead of one token at a time. Router/SwiGLU pinned to production (2/2),
- * matching the teacher-forced candidate above -- this measures the prefill mechanism's own effect
- * only. */
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static double harness_eval_ppl_prefill(Model*m,const PplText*txt,Kv*kv,
-        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits,
-        float*h4[4],float*hn4[4],float*q4[4],float*k4[4],float*vv4[4],float*att4[4],float*tmp4[4],
-        float*g4[4],float*u4[4],float*eout4[4],float*logits4[4],uint8_t*Abuf4arr[4],uint8_t*Abuf4buf,uint8_t*Abuf2_4){
-    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
-    g_router_mode=2; g_router_validate=0; g_swiglu_fast=2;
-    double total_nll=0; int count=0;
-    int n=txt->n-1; /* positions 0..n-1 each predict their own next token, matching
-        harness_eval_ppl's own `p<txt->n-1` bound -- the last token has no next-token target */
-    int nchunks=n/4, rem=n%4;
-    for(int c=0;c<nchunks;c++){
-        int toks4[4]; for(int i=0;i<4;i++) toks4[i]=txt->toks[c*4+i];
-        prefill_chunk4(m,toks4,c*4,kv,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
-        for(int i=0;i<4;i++){ int p=c*4+i; total_nll+=harness_nll(logits4[i],m->vocab,txt->toks[p+1]); count++; }
-    }
-    for(int r=0;r<rem;r++){
-        int p=nchunks*4+r;
-        forward(m,txt->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-        total_nll+=harness_nll(logits,m->vocab,txt->toks[p+1]); count++;
-    }
-    g_swiglu_fast=0;
-    return count?total_nll/count:0.0;
-}
-__attribute__((noinline,optimize("no-tree-vectorize")))
-static void run_prefill_quality_harness(Model*m){
-    int ctx=HARNESS_MAXCTX; Kv kv; kv.kvd=m->nkv*m->hd; kv.ctx=ctx;
-    kv.Kc=calloc((size_t)m->nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m->nl*ctx*kv.kvd,4);
-    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
-    float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
-         *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m->vocab*4);
-    uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
-
-    float*h4[4],*hn4[4],*q4[4],*k4[4],*vv4[4],*att4[4],*tmp4[4],*g4[4],*u4[4],*eout4[4],*logits4[4]; uint8_t*Abuf4arr[4];
-    for(int s=0;s<4;s++){
-        h4[s]=malloc(d*4); hn4[s]=malloc(d*4); q4[s]=malloc(qd*4); k4[s]=malloc(kv.kvd*4); vv4[s]=malloc(kv.kvd*4);
-        att4[s]=malloc(qd*4); tmp4[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
-        g4[s]=malloc(moe*4); u4[s]=malloc(moe*4); eout4[s]=malloc(d*4); logits4[s]=malloc((size_t)m->vocab*4);
-        Abuf4arr[s]=malloc((size_t)(maxk/256)*AREC);
-    }
-    int maxk4=qd>d?qd:d;
-    uint8_t*Abuf4buf=malloc((size_t)(maxk4/256)*AREC_M4);
-    uint8_t*Abuf2_4=malloc((size_t)4*3000);
-
-    printf("\n=== prefill quality harness: phase 1 -- production reference (int8 router + rational-Pade SwiGLU + sequential prefill) ===\n");
-    static int ref_toks[HARNESS_NP][HARNESS_GEN_MAX];
-    static float self_nll[HARNESS_NP][HARNESS_GEN_MAX];
-    for(int i=0;i<HARNESS_NP;i++){
-        harness_run_prod_reference(m,&g_hprompts[i],ref_toks[i],self_nll[i],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        printf("  [%2d/%d] %-24s prefill=%3d gen=%2d done\n",i+1,HARNESS_NP,g_hprompts[i].name,g_hprompts[i].n,g_hprompts[i].gen);
-    }
-
-    printf("\n=== prefill quality harness: phase 2 -- chunked-M4 prefill candidate, teacher-forced ===\n");
-    typedef struct { const char*name; int gen,divergent; float nll_chunk,nll_prod; } PRes;
-    PRes pres[HARNESS_NP];
-    for(int i=0;i<HARNESS_NP;i++){
-        int div[HARNESS_GEN_MAX]; float nll[HARNESS_GEN_MAX];
-        harness_run_prefill_teacherforced(m,&g_hprompts[i],ref_toks[i],div,nll,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits,
-            h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,logits4,Abuf4arr,Abuf4buf,Abuf2_4);
-        PRes*r=&pres[i]; r->name=g_hprompts[i].name; r->gen=g_hprompts[i].gen; r->divergent=0; r->nll_chunk=0; r->nll_prod=0;
-        for(int s=0;s<r->gen;s++){ r->divergent+=div[s]; r->nll_chunk+=nll[s]; r->nll_prod+=self_nll[i][s]; }
-        printf("  [%2d/%d] %-24s prefill=%3d (%d chunks+%d rem) divergent=%2d/%-2d  nll_delta=%+.4f\n",
-            i+1,HARNESS_NP,r->name,g_hprompts[i].n,g_hprompts[i].n/4,g_hprompts[i].n%4,r->divergent,r->gen,(r->nll_chunk-r->nll_prod)/r->gen);
-    }
-    int total_gen=0,total_div=0; double total_nll_chunk=0,total_nll_prod=0;
-    for(int i=0;i<HARNESS_NP;i++){ total_gen+=pres[i].gen; total_div+=pres[i].divergent; total_nll_chunk+=pres[i].nll_chunk; total_nll_prod+=pres[i].nll_prod; }
-    double div_rate=100.0*total_div/total_gen, nll_delta=(total_nll_chunk-total_nll_prod)/total_gen, ppl_mult=exp(nll_delta);
-
-    printf("\n=== prefill quality harness: phase 3 -- real-text perplexity (%d independently-authored texts) ===\n",PPL_NTEXTS);
-    double sum_prod=0,sum_chunk=0; int total_toks=0;
-    double by_text_prod[PPL_NTEXTS], by_text_chunk[PPL_NTEXTS];
+    printf("\n=== Q3_K quality harness: phase 2 -- real-text perplexity (%d texts) ===\n",PPL_NTEXTS);
+    double sum_q3k=0,sum_w4=0; int total_toks=0; double worst_mult=0;
     for(int t=0;t<PPL_NTEXTS;t++){
-        double nll_prod=harness_eval_ppl(m,&g_ppltexts[t],2,2,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        double nll_chunk=harness_eval_ppl_prefill(m,&g_ppltexts[t],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits,
-            h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,logits4,Abuf4arr,Abuf4buf,Abuf2_4);
-        by_text_prod[t]=nll_prod; by_text_chunk[t]=nll_chunk;
-        printf("  %-28s production NLL=%.4f  chunked-M4 NLL=%.4f  per-text multiplier x%.4f (%.1f%%)\n",
-            g_ppltexts[t].name,nll_prod,nll_chunk,exp(nll_chunk-nll_prod),100.0*(exp(nll_chunk-nll_prod)-1.0));
-        sum_prod+=nll_prod*(g_ppltexts[t].n-1); sum_chunk+=nll_chunk*(g_ppltexts[t].n-1); total_toks+=g_ppltexts[t].n-1;
+        double nll_q3k=harness_eval_ppl_q3k(m,&g_ppltexts[t],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        double mult=exp(nll_q3k-w4_ppl_nll[t]); if(mult>worst_mult) worst_mult=mult;
+        printf("  %-28s q3k NLL=%.4f  w4 NLL=%.4f  per-text multiplier x%.4f (%.2f%%)\n",
+            g_ppltexts[t].name,nll_q3k,w4_ppl_nll[t],mult,100.0*(mult-1.0));
+        sum_q3k+=nll_q3k*(g_ppltexts[t].n-1); sum_w4+=w4_ppl_nll[t]*(g_ppltexts[t].n-1); total_toks+=g_ppltexts[t].n-1;
     }
-    double agg_prod=sum_prod/total_toks, agg_chunk=sum_chunk/total_toks, ppl_mult_real=exp(agg_chunk-agg_prod);
-    double worst_text_mult=0; for(int t=0;t<PPL_NTEXTS;t++){ double mt=exp(by_text_chunk[t]-by_text_prod[t]); if(mt>worst_text_mult)worst_text_mult=mt; }
-    printf("  aggregate: production NLL=%.4f  chunked-M4 NLL=%.4f  aggregate multiplier x%.4f (%.1f%%), worst individual corpus x%.4f (%.1f%%)\n",
-        agg_prod,agg_chunk,ppl_mult_real,100.0*(ppl_mult_real-1.0),worst_text_mult,100.0*(worst_text_mult-1.0));
+    double agg_q3k=sum_q3k/total_toks, agg_w4=sum_w4/total_toks, ppl_mult_real=exp(agg_q3k-agg_w4);
+    printf("\naggregate: q3k NLL=%.4f  w4 NLL=%.4f  aggregate multiplier x%.4f (%.2f%%), worst individual corpus x%.4f (%.2f%%)\n",
+        agg_q3k,agg_w4,ppl_mult_real,100.0*(ppl_mult_real-1.0),worst_mult,100.0*(worst_mult-1.0));
 
-    /* Predeclared thresholds (fixed here, before this run, consistent with the router (§22.15) and
-     * SwiGLU (§22.20-21) promotions' own bars): teacher-forced perplexity multiplier < 1.05 (the
-     * exact bar rational-Pade had to clear, the most relevant recent precedent for a candidate
-     * touching quality broadly); token divergence < 15% (matches router/SwiGLU); real-text
-     * aggregate multiplier < 1.05 AND no individual corpus > 1.10 (matches SwiGLU's real-text
-     * gates, and the lesson from §22.19 that real-text alone can wrongly clear a bad candidate --
-     * teacher-forced remains decisive); speed >=10% faster prefill bucket (matches router's own
-     * floor -- already independently measured at 1.10-1.14x in §22.38, restated not re-run here). */
-    printf("\n=== BATCHED PREFILL PROMOTION GATES (predeclared before this run, codex_recs_1.md §22.39) ===\n");
-    int gate1=ppl_mult<1.05, gate2=div_rate<15.0, gate3=ppl_mult_real<1.05, gate4=worst_text_mult<1.10, gate5=1; /* speed gate: 1.10-1.14x >=10%, already measured in §22.38 */
-    printf("  [%s] teacher-forced perplexity multiplier < 1.05 (vs production)   (got x%.4f, %.1f%%)\n",gate1?"PASS":"FAIL",ppl_mult,100.0*(ppl_mult-1.0));
-    printf("  [%s] token divergence < 15%% (vs production)                       (got %.1f%%, %d/%d)\n",gate2?"PASS":"FAIL",div_rate,total_div,total_gen);
-    printf("  [%s] real-text aggregate perplexity multiplier < 1.05             (got x%.4f, %.1f%%)\n",gate3?"PASS":"FAIL",ppl_mult_real,100.0*(ppl_mult_real-1.0));
-    printf("  [%s] every individual real-text corpus < 1.10                    (got worst x%.4f, %.1f%%)\n",gate4?"PASS":"FAIL",worst_text_mult,100.0*(worst_text_mult-1.0));
-    printf("  [%s] prefill bucket >=10%% faster than sequential                  (already measured 1.10-1.14x, codex_recs_1.md §22.38)\n",gate5?"PASS":"FAIL");
-    printf("VERDICT: batched prefill (chunked-M4) %s promotion to the production default.\n",
-        (gate1&&gate2&&gate3&&gate4&&gate5)?"PASSES all thresholds -- ELIGIBLE FOR":"FAILS at least one threshold -- NOT ELIGIBLE FOR");
-
-    for(int s=0;s<4;s++){ free(h4[s]);free(hn4[s]);free(q4[s]);free(k4[s]);free(vv4[s]);free(att4[s]);free(tmp4[s]);free(g4[s]);free(u4[s]);free(eout4[s]);free(logits4[s]);free(Abuf4arr[s]); }
-    free(Abuf4buf); free(Abuf2_4);
-    free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
-    free(kv.Kc);free(kv.Vc);
-}
-
-/* M-batch track milestone 1 (codex_recs_1.md §22.35), QWEN_MBATCH_TEST=1: real 4-sequence batched
- * decode test using genuinely independent prompts (4 of the harness's own real, distinct prompts,
- * not synthetic data), sharing weight-stream reads at QKV/O/router/lm_head via forward4_dense_batch
- * while attention and MoE-FFN stay per-sequence. Validates every batched sequence against a
- * SEPARATE run of the same prompt through the existing, already-proven M=1 forward() path (own KV
- * cache, own decode loop, identical prefill), then reports the required real metrics: aggregate
- * tok/s, per-sequence tok/s, latency, memory, and M=1 regression -- never a synthetic GEMM number
- * described as model tok/s, per the explicit instruction. */
-static void run_mbatch_test(Model*m){
-    const int NSEQ=4, NGEN=16;
-    static const int seq_idx[4]={0,1,2,3}; /* hp1..hp4: factual/capitals, factual/chemistry,
-        reasoning/syllogism, reasoning/sequence -- 4 real, distinct prompts, genuinely different
-        content/length, not 4 copies of one prompt. */
-    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
-    int ctx=256;
-
-    /* --- Path 1: 4 SEPARATE M=1 decodes, own Kv/buffers each, the already-proven serial path --- */
-    Kv kv1[4]; float*h1[4],*hn1[4],*q1[4],*k1[4],*vv1[4],*att1[4],*tmp1[4],*g1[4],*u1[4],*eout1[4],*logits1[4]; uint8_t*Abuf1[4],*Abuf1b[4];
-    for(int s=0;s<4;s++){
-        kv1[s].kvd=m->nkv*m->hd; kv1[s].ctx=ctx;
-        kv1[s].Kc=calloc((size_t)m->nl*ctx*kv1[s].kvd,4); kv1[s].Vc=calloc((size_t)m->nl*ctx*kv1[s].kvd,4);
-        h1[s]=malloc(d*4); hn1[s]=malloc(d*4); q1[s]=malloc(qd*4); k1[s]=malloc(kv1[s].kvd*4); vv1[s]=malloc(kv1[s].kvd*4);
-        att1[s]=malloc(qd*4); tmp1[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
-        g1[s]=malloc(moe*4); u1[s]=malloc(moe*4); eout1[s]=malloc(d*4); logits1[s]=malloc((size_t)m->vocab*4);
-        Abuf1[s]=malloc((size_t)(maxk/256)*AREC); Abuf1b[s]=malloc((size_t)(maxk/256)*AREC);
-    }
-    int toks1[4][256]; int ntoks1[4];
-    static float step1_logits_m1[4][160000];
-    /* prefill and decode timed SEPARATELY -- both paths pay the SAME (per-sequence, unbatched;
-     * this milestone explicitly scopes batching to the DECODE phase, see this function's own top
-     * comment) prefill cost, which dilutes an aggregate "total wall time" comparison for these
-     * short test prompts where prefill is a substantial fraction of total time. Decode-only timing
-     * isolates what M-batching itself actually contributes. */
-    double t_m1_prefill=0, t_m1_decode_0;
-    for(int s=0;s<4;s++){
-        const HarnessPrompt*hp=&g_hprompts[seq_idx[s]];
-        double tp0=now();
-        for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,&kv1[s],logits1[s],hn1[s],q1[s],k1[s],vv1[s],att1[s],tmp1[s],g1[s],u1[s],eout1[s],Abuf1[s],Abuf1b[s]);
-        t_m1_prefill += now()-tp0;
-    }
-    t_m1_decode_0=now();
-    for(int s=0;s<4;s++){
-        const HarnessPrompt*hp=&g_hprompts[seq_idx[s]];
-        ntoks1[s]=0;
-        int cur=argmax(logits1[s],m->vocab); toks1[s][ntoks1[s]++]=cur;
-        for(int step=1;step<NGEN;step++){
-            forward(m,cur,hp->n+step-1,&kv1[s],logits1[s],hn1[s],q1[s],k1[s],vv1[s],att1[s],tmp1[s],g1[s],u1[s],eout1[s],Abuf1[s],Abuf1b[s]);
-            if(step==1) memcpy(step1_logits_m1[s],logits1[s],(size_t)m->vocab*4); /* first post-prefill
-                decode step, BEFORE any compounding from a possibly-different chosen token -- prefill
-                itself is identical M=1 in both paths, so this isolates ONE 48-layer M4-batched pass's
-                own divergence from a SAME-input M1 pass, separate from later steps' extra divergence
-                from potentially different tokens/KV entries feeding back in. */
-            cur=argmax(logits1[s],m->vocab); toks1[s][ntoks1[s]++]=cur;
-        }
-    }
-    double t_m1_decode=now()-t_m1_decode_0;
-    double t_m1=t_m1_prefill+t_m1_decode;
-
-    /* --- Path 2: 1 BATCHED M=4 decode, all 4 sequences advance in lockstep --- */
-    Kv kv4[4]; float*h4[4],*hn4[4],*q4[4],*k4[4],*vv4[4],*att4[4],*tmp4[4],*g4[4],*u4[4],*eout4[4],*logits4[4]; uint8_t*Abuf4arr[4];
-    for(int s=0;s<4;s++){
-        kv4[s].kvd=m->nkv*m->hd; kv4[s].ctx=ctx;
-        kv4[s].Kc=calloc((size_t)m->nl*ctx*kv4[s].kvd,4); kv4[s].Vc=calloc((size_t)m->nl*ctx*kv4[s].kvd,4);
-        h4[s]=malloc(d*4); hn4[s]=malloc(d*4); q4[s]=malloc(qd*4); k4[s]=malloc(kv4[s].kvd*4); vv4[s]=malloc(kv4[s].kvd*4);
-        att4[s]=malloc(qd*4); tmp4[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
-        g4[s]=malloc(moe*4); u4[s]=malloc(moe*4); eout4[s]=malloc(d*4); logits4[s]=malloc((size_t)m->vocab*4);
-        Abuf4arr[s]=malloc((size_t)(maxk/256)*AREC);
-    }
-    int maxk4=qd>d?qd:d; /* forward4_dense_batch's Abuf4 must cover the widest K it ever packs --
-        att is qd-wide (O-projection input), hn is d-wide (QKV/router/lm_head input) */
-    uint8_t*Abuf4buf=malloc((size_t)(maxk4/256)*AREC_M4);
-    uint8_t*Abuf2_4=malloc((size_t)4*3000);
-    int toks4[4][256]; int ntoks4[4]; for(int s=0;s<4;s++) ntoks4[s]=0;
-
-    /* prefill: still per-sequence (this milestone scopes batching to DECODE steps, matching the
-     * "M-batch is a decode-phase lever" framing throughout this whole track -- prefill is its own
-     * separate, not-yet-attempted track per the ladder's own next item). Timed separately from
-     * decode for the SAME reason as path 1 above. */
-    double t_m4_prefill=0;
-    for(int s=0;s<4;s++){
-        const HarnessPrompt*hp=&g_hprompts[seq_idx[s]];
-        double tp0=now();
-        for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,&kv4[s],logits4[s],hn4[s],q4[s],k4[s],vv4[s],att4[s],tmp4[s],g4[s],u4[s],eout4[s],Abuf4arr[s],Abuf2_4);
-        t_m4_prefill += now()-tp0;
-    }
-    int cur4[4], pos4[4];
-    for(int s=0;s<4;s++){ cur4[s]=argmax(logits4[s],m->vocab); toks4[s][ntoks4[s]++]=cur4[s]; pos4[s]=g_hprompts[seq_idx[s]].n; }
-    Kv*kvp[4]={&kv4[0],&kv4[1],&kv4[2],&kv4[3]};
-    static float step1_logits_m4[4][160000];
-    double t_m4_decode_0=now();
-    for(int step=1;step<NGEN;step++){
-        int tokv[4]; for(int s=0;s<4;s++) tokv[s]=cur4[s];
-        forward4_dense_batch(m,tokv,pos4,kvp,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
-        if(step==1) for(int s=0;s<4;s++) memcpy(step1_logits_m4[s],logits4[s],(size_t)m->vocab*4);
-        for(int s=0;s<4;s++){ cur4[s]=argmax(logits4[s],m->vocab); toks4[s][ntoks4[s]++]=cur4[s]; pos4[s]++; }
-    }
-    double t_m4_decode=now()-t_m4_decode_0;
-    double t_m4=t_m4_prefill+t_m4_decode;
-
-    /* first-decode-step-only comparison: isolates ONE 48-layer M4-batched forward pass's own
-     * numerical divergence from a same-input M1 pass, separate from later steps' extra divergence
-     * once a possibly-different chosen token starts feeding back into subsequent steps. */
-    double step1_max_abs=0, step1_sum_abs=0; long step1_cmp=0; long step1_tok_match=0;
-    for(int s=0;s<4;s++){
-        for(int e=0;e<m->vocab;e++){ double ad=fabs((double)step1_logits_m1[s][e]-(double)step1_logits_m4[s][e]);
-            if(ad>step1_max_abs) step1_max_abs=ad; step1_sum_abs+=ad; step1_cmp++; }
-        if(argmax(step1_logits_m1[s],m->vocab)==argmax(step1_logits_m4[s],m->vocab)) step1_tok_match++;
-    }
-    printf("first-decode-step-only (isolates one 48-layer M4 pass, no compounding yet): max_abs_diff=%e mean_abs_diff=%e, argmax match %ld/4 sequences\n",
-        step1_max_abs, step1_sum_abs/step1_cmp, step1_tok_match);
-
-    /* --- validation: token agreement + logit closeness, M=4 vs the separate M=1 run --- */
-    long tok_match=0, tok_total=0; double max_logit_abs=0, sum_logit_abs=0; long logit_cmp=0;
-    printf("per-step token match (1=agree, 0=diverge), one row per sequence:\n");
-    for(int s=0;s<4;s++){
-        printf("  seq%d: ",s);
-        for(int i=0;i<NGEN;i++){ tok_total++; int match=(toks1[s][i]==toks4[s][i]); if(match) tok_match++; printf("%d",match); }
-        printf("\n");
-    }
-    /* one more logits comparison at the FINAL step, on the buffers already in hand */
-    for(int s=0;s<4;s++) for(int e=0;e<m->vocab;e++){
-        double ad=fabs((double)logits1[s][e]-(double)logits4[s][e]);
-        if(ad>max_logit_abs) max_logit_abs=ad; sum_logit_abs+=ad; logit_cmp++;
-    }
-
-    printf("\n=== M-batch test: 4 real, independent sequences, M=1 (separate) vs M=4 (batched dense layers) ===\n");
-    printf("sequences: ");
-    for(int s=0;s<4;s++) printf("%s%s", g_hprompts[seq_idx[s]].name, s<3?", ":"\n");
-    printf("token agreement (batched vs separate M=1, argmax): %ld/%ld (%.2f%%)\n", tok_match, tok_total, 100.0*tok_match/tok_total);
-    printf("final-step logits: max_abs_diff=%e mean_abs_diff=%e (%ld comparisons) -- expected small, nonzero (M4's shared-scale quantization, not a bug, see codex_recs_1.md %s22.35)\n",
-        max_logit_abs, sum_logit_abs/logit_cmp, logit_cmp, "§");
-    printf("--- prefill (NOT batched this milestone -- same per-sequence M1 cost paid by both paths, shown for transparency) ---\n");
-    printf("M=1 path prefill: %.3fs total (4 sequences) | M=4 path prefill: %.3fs total (4 sequences)\n", t_m1_prefill, t_m4_prefill);
-    printf("--- decode (the actual M-batching lever this milestone claims) ---\n");
-    printf("M=1 (4 separate decodes) wall: %.3fs for %d total tokens (%d seq x %d gen) -> aggregate %.2f tok/s, %.2f tok/s/sequence\n",
-        t_m1_decode, NSEQ*NGEN, NSEQ, NGEN, (NSEQ*NGEN)/t_m1_decode, NGEN/t_m1_decode);
-    printf("M=4 (1 batched decode)   wall: %.3fs for %d total tokens (%d seq x %d gen) -> aggregate %.2f tok/s, %.2f tok/s/sequence\n",
-        t_m4_decode, NSEQ*NGEN, NSEQ, NGEN, (NSEQ*NGEN)/t_m4_decode, NGEN/t_m4_decode);
-    printf("DECODE-ONLY aggregate speedup: %.3fx | per-sequence decode latency: M=1 %.2fms/tok/seq vs M=4 %.2fms/tok(shared across the batch)\n",
-        t_m1_decode/t_m4_decode, 1000.0*t_m1_decode/(NSEQ*NGEN), 1000.0*t_m4_decode/NGEN);
-    printf("--- totals (prefill+decode combined, included for completeness -- NOT the primary metric since prefill dilutes it) ---\n");
-    printf("M=1 total: %.3fs -> %.2f tok/s aggregate | M=4 total: %.3fs -> %.2f tok/s aggregate | total speedup: %.3fx\n",
-        t_m1, (NSEQ*NGEN)/t_m1, t_m4, (NSEQ*NGEN)/t_m4, t_m1/t_m4);
-    size_t extra_mem = (size_t)(maxk4/256)*AREC_M4 + 4*3000 + 4*(size_t)qd*4*3; /* Abuf4buf + Abuf2_4 + y4q/y4k/y4v, the main new allocations vs the M=1 path */
-    printf("additional memory for the batched path (beyond 4x the existing per-sequence buffers): ~%.1f KB\n", extra_mem/1024.0);
-    printf("MoE expert-FFN batching (milestone 3): %ld of %ld (expert, layer, decode-step) slots with >=1 selecting sequence had all 4 sequences select the SAME expert (%.2f%%) -- only this case is M4-batched, the rest fall back to per-sequence M1\n",
-        g_moe4_hits, g_moe4_total_expert_slots, g_moe4_total_expert_slots>0 ? 100.0*g_moe4_hits/g_moe4_total_expert_slots : 0.0);
-    { long tot4=g_moe_ecount_hist[1]+g_moe_ecount_hist[2]+g_moe_ecount_hist[3]+g_moe_ecount_hist[4];
-      printf("full selecting-sequence-count histogram (diagnostic, answers whether PARTIAL overlap is common enough to matter for a future padded-batching strategy):\n");
-      printf("  count=1 (no overlap): %ld (%.2f%%) | count=2: %ld (%.2f%%) | count=3: %ld (%.2f%%) | count=4 (batched): %ld (%.2f%%)\n",
-        g_moe_ecount_hist[1], 100.0*g_moe_ecount_hist[1]/tot4, g_moe_ecount_hist[2], 100.0*g_moe_ecount_hist[2]/tot4,
-        g_moe_ecount_hist[3], 100.0*g_moe_ecount_hist[3]/tot4, g_moe_ecount_hist[4], 100.0*g_moe_ecount_hist[4]/tot4);
-    }
-
-    for(int s=0;s<4;s++){
-        free(h1[s]);free(hn1[s]);free(q1[s]);free(k1[s]);free(vv1[s]);free(att1[s]);free(tmp1[s]);free(g1[s]);free(u1[s]);free(eout1[s]);free(logits1[s]);free(Abuf1[s]);free(Abuf1b[s]);
-        free(kv1[s].Kc);free(kv1[s].Vc);
-        free(h4[s]);free(hn4[s]);free(q4[s]);free(k4[s]);free(vv4[s]);free(att4[s]);free(tmp4[s]);free(g4[s]);free(u4[s]);free(eout4[s]);free(logits4[s]);free(Abuf4arr[s]);
-        free(kv4[s].Kc);free(kv4[s].Vc);
-    }
-    free(Abuf4buf); free(Abuf2_4);
-}
-
-/* Batched prefill (codex_recs_1.md §22.38), QWEN_PREFILL_TEST=1: validates and benchmarks
- * prefill_chunk4 (4-consecutive-position dense-layer M4 batching within ONE sequence) against the
- * existing token-at-a-time sequential prefill (repeated forward() calls), per the ladder's own
- * explicit requirement: "Benchmark prompt lengths 128/512/1024. Preserve exact causal masking and
- * compare logits against sequential prefill." Test lengths: 16 (short, matches this whole session's
- * own short/128/512/1024 A/B convention), 128/512/1024 (the explicitly required lengths), and 19 --
- * deliberately NOT a multiple of 4, included specifically to exercise and validate the N-mod-4
- * remainder fallback path (the other four lengths are all exact multiples of 4, so alone they'd
- * never touch that code path). Prompts synthesized via the same hp9-tiling convention already
- * established for QWEN_CTXLEN benchmarks (prompt[i]=hp9[i%113]).
- *
- * Unlike the decode M-batch milestones (codex_recs_1.md §22.35-37), prefill has NO argmax-choice
- * compounding: every position's input token is fixed by the prompt itself, not fed back from a
- * possibly-different model prediction, so the divergence source here is purely M4's own per-chunk
- * shared-scale quantization noise (plus its ordinary propagation through the KV cache into later
- * positions' attention) -- expected to be much smaller than milestone 2's 70.31% figure, and this
- * harness reports the real number rather than assuming it. */
-static void run_prefill_test(Model*m){
-    const int TESTLENS[]={16,19,128,512,1024}; int NLEN=5;
-    /* QWEN_PREFILL_SANITIZE=1: caps the length sweep at N=512 -- sanitizer runs are slow (ASan
-     * especially), and N=1024 exercises the exact same code paths as N=512 (same chunked/remainder
-     * structure, just more repetitions), so it adds runtime without adding memory-safety coverage.
-     * Not used for the real speed benchmark, only to bound sanitizer wall-clock time. */
-    { const char*sz=getenv("QWEN_PREFILL_SANITIZE"); if(sz && atoi(sz)) NLEN=4; }
-    { const char*pm=getenv("QWEN_PREFILL_MOE4"); if(pm) g_prefill_moe4=atoi(pm); }
-    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
-    int maxk4=qd>d?qd:d;
-    static int prompt[1536];
-    for(int L=0;L<NLEN;L++){
-        int np=TESTLENS[L]; for(int i=0;i<np;i++) prompt[i]=hp9[i%113];
-        int ctx=np+4;
-
-        /* --- Path 1: sequential exact prefill, own Kv/buffers, the already-proven forward() path --- */
-        Kv kv1; kv1.kvd=m->nkv*m->hd; kv1.ctx=ctx; kv1.Kc=calloc((size_t)m->nl*ctx*kv1.kvd,4); kv1.Vc=calloc((size_t)m->nl*ctx*kv1.kvd,4);
-        float*hn1=malloc(d*4),*q1=malloc(qd*4),*k1=malloc(kv1.kvd*4),*vv1=malloc(kv1.kvd*4),*att1=malloc(qd*4),
-             *tmp1=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*g1=malloc(moe*4),*u1=malloc(moe*4),*eout1=malloc(d*4),*logits1=malloc((size_t)m->vocab*4);
-        uint8_t*Abuf1=malloc((size_t)(maxk/256)*AREC),*Abuf1b=malloc((size_t)(maxk/256)*AREC);
-        static int argmax1[1536];
-        double t1_0=now();
-        for(int p=0;p<np;p++){ forward(m,prompt[p],p,&kv1,logits1,hn1,q1,k1,vv1,att1,tmp1,g1,u1,eout1,Abuf1,Abuf1b); argmax1[p]=argmax(logits1,m->vocab); }
-        double t1=now()-t1_0;
-        static float flogits1[160000]; memcpy(flogits1,logits1,(size_t)m->vocab*4);
-
-        /* --- Path 2: chunked M4 prefill (4 consecutive positions at a time) + remainder fallback --- */
-        Kv kv2; kv2.kvd=m->nkv*m->hd; kv2.ctx=ctx; kv2.Kc=calloc((size_t)m->nl*ctx*kv2.kvd,4); kv2.Vc=calloc((size_t)m->nl*ctx*kv2.kvd,4);
-        float*h2[4],*hn2[4],*q2[4],*k2[4],*vv2[4],*att2[4],*tmp2[4],*g2[4],*u2[4],*eout2[4],*logits2[4]; uint8_t*Abuf2arr[4];
-        for(int s=0;s<4;s++){
-            h2[s]=malloc(d*4); hn2[s]=malloc(d*4); q2[s]=malloc(qd*4); k2[s]=malloc(kv2.kvd*4); vv2[s]=malloc(kv2.kvd*4);
-            att2[s]=malloc(qd*4); tmp2[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
-            g2[s]=malloc(moe*4); u2[s]=malloc(moe*4); eout2[s]=malloc(d*4); logits2[s]=malloc((size_t)m->vocab*4);
-            Abuf2arr[s]=malloc((size_t)(maxk/256)*AREC);
-        }
-        uint8_t*Abuf4buf=malloc((size_t)(maxk4/256)*AREC_M4);
-        uint8_t*Abuf2_4=malloc((size_t)4*3000);
-        static int argmax2[1536];
-        long moe4_hits0=g_moe4_hits, moe4_slots0=g_moe4_total_expert_slots;
-        long hist0[5]; for(int i=0;i<5;i++) hist0[i]=g_moe_ecount_hist[i];
-        int nchunks=np/4, rem=np%4;
-        double t2_0=now();
-        for(int c=0;c<nchunks;c++){
-            int toks4[4]; for(int i=0;i<4;i++) toks4[i]=prompt[c*4+i];
-            prefill_chunk4(m,toks4,c*4,&kv2,logits2,h2,hn2,q2,k2,vv2,att2,tmp2,g2,u2,eout2,Abuf2arr,Abuf4buf,Abuf2_4);
-            for(int i=0;i<4;i++) argmax2[c*4+i]=argmax(logits2[i],m->vocab);
-        }
-        for(int r=0;r<rem;r++){
-            int p=nchunks*4+r;
-            forward(m,prompt[p],p,&kv2,logits2[0],hn2[0],q2[0],k2[0],vv2[0],att2[0],tmp2[0],g2[0],u2[0],eout2[0],Abuf2arr[0],Abuf2_4);
-            argmax2[p]=argmax(logits2[0],m->vocab);
-        }
-        double t2=now()-t2_0;
-        static float flogits2[160000];
-        if(rem>0) memcpy(flogits2,logits2[0],(size_t)m->vocab*4); else memcpy(flogits2,logits2[3],(size_t)m->vocab*4);
-
-        long match=0; for(int p=0;p<np;p++) if(argmax1[p]==argmax2[p]) match++;
-        double fmax=0,fsum=0; for(int e=0;e<m->vocab;e++){ double ad=fabs((double)flogits1[e]-(double)flogits2[e]); if(ad>fmax)fmax=ad; fsum+=ad; }
-
-        printf("\n=== batched prefill test: N=%d (%d M4 chunks + %d remainder tokens) ===\n", np, nchunks, rem);
-        printf("token agreement (chunked-M4 vs sequential, argmax over all %d positions): %ld/%d (%.2f%%)\n", np, match, np, 100.0*match/np);
-        printf("final-position logits: max_abs_diff=%e mean_abs_diff=%e (%d comparisons) -- expected small, nonzero (M4's shared-scale quantization, not a bug)\n",
-            fmax, fsum/m->vocab, m->vocab);
-        printf("sequential prefill: %.3fs (%.1f tok/s) | chunked-M4 prefill: %.3fs (%.1f tok/s) | speedup: %.3fx\n",
-            t1, np/t1, t2, np/t2, t1/t2);
-        if(nchunks>0){
-            long h1=g_moe_ecount_hist[1]-hist0[1],h2c=g_moe_ecount_hist[2]-hist0[2],h3=g_moe_ecount_hist[3]-hist0[3],h4=g_moe_ecount_hist[4]-hist0[4];
-            long tot=h1+h2c+h3+h4;
-            printf("MoE expert-FFN 4-way overlap WITHIN this prefill chunk sequence: %ld/%ld expert-slots (%.2f%%) -- count=1:%ld(%.2f%%) count=2:%ld(%.2f%%) count=3:%ld(%.2f%%) count=4:%ld(%.2f%%)\n",
-                g_moe4_hits-moe4_hits0, g_moe4_total_expert_slots-moe4_slots0,
-                (g_moe4_total_expert_slots-moe4_slots0)>0?100.0*(g_moe4_hits-moe4_hits0)/(g_moe4_total_expert_slots-moe4_slots0):0.0,
-                h1,tot>0?100.0*h1/tot:0.0, h2c,tot>0?100.0*h2c/tot:0.0, h3,tot>0?100.0*h3/tot:0.0, h4,tot>0?100.0*h4/tot:0.0);
-        }
-        fflush(stdout); /* under ASan, LeakSanitizer's atexit-time report can call a raw _exit()
-            that skips normal stdio flushing -- without this, a real crash or a leak-detector exit
-            partway through the length sweep would silently discard every printf above it, exactly
-            the failure mode that hid this harness's own real output on its first sanitizer run. */
-
-        for(int s=0;s<4;s++){ free(h2[s]);free(hn2[s]);free(q2[s]);free(k2[s]);free(vv2[s]);free(att2[s]);free(tmp2[s]);free(g2[s]);free(u2[s]);free(eout2[s]);free(logits2[s]);free(Abuf2arr[s]); }
-        free(Abuf4buf); free(Abuf2_4); free(kv2.Kc); free(kv2.Vc);
-        free(hn1);free(q1);free(k1);free(vv1);free(att1);free(tmp1);free(g1);free(u1);free(eout1);free(logits1);free(Abuf1);free(Abuf1b);
-        free(kv1.Kc); free(kv1.Vc);
-    }
-}
-
-/* Speculative/n-gram verification track (codex_recs_1.md §22.40), QWEN_SPEC_ORACLE=1. Explicit
- * direction: "begin with instrumentation and an acceptance-rate oracle before integrating a draft
- * mechanism." This measures, on REAL greedy-generated trajectories (the unmodified, already-
- * validated production decode path -- no new numerics), what accept rate a simple n-gram/"prompt
- * lookup" drafter would achieve: at each generated position, look up the most recent PRIOR
- * occurrence (earlier in the same prompt+generation) of the last `n` tokens, and propose the K
- * tokens that followed it as a guess for what comes next -- no separate draft model needed, the
- * standard approach for CPU/edge speculative decoding. Verification here is pure token-array
- * comparison against the trajectory the model ACTUALLY produced (already known, since the
- * trajectory is real and already generated) -- deliberately NOT yet building the batched-verify
- * mechanism a real integrated draft+verify decode loop would need (a natural fit for the already-
- * validated M4 kernel: K=3 draft tokens + 1 anchor position = 4-wide, matching M4's native width
- * exactly -- noted for the next step, not built here). */
-
-/* Returns the number of tokens proposed (0..K) into draft[]: finds the most recent PRIOR
- * occurrence of hist[t-n..t-1] within hist[0..t-n-1] and copies what followed it, bounded by K and
- * by how many tokens are actually known to have followed that occurrence (must be < t, since only
- * hist[0..t-1] is known at generation time -- the proposal cannot reference not-yet-generated
- * tokens). Returns 0 if no prior occurrence exists. */
-static int ngram_propose(const int*hist,int t,int n,int K,int*draft){
-    if(t<n) return 0;
-    for(int j=t-n-1;j>=0;j--){
-        int match=1;
-        for(int i=0;i<n;i++) if(hist[j+i]!=hist[t-n+i]){ match=0; break; }
-        if(!match) continue;
-        int navail=t-(j+n); if(navail>K) navail=K;
-        if(navail<=0) continue;
-        for(int i=0;i<navail;i++) draft[i]=hist[j+n+i];
-        return navail;
-    }
-    return 0;
-}
-
-#define SPEC_NGEN 384
-#define SPEC_NCFG 12
-static const int SPEC_N[SPEC_NCFG]={2,2,2,2,2,2,3,3,3,3,3,3};
-static const int SPEC_K[SPEC_NCFG]={1,2,3,4,6,8,1,2,3,4,6,8};
-
-/* One real free-running greedy trajectory (prompt + SPEC_NGEN generated tokens), reusing forward()
- * unchanged -- exactly what harness_generate_generic already does, just longer than the harness's
- * own 60-80 token cap (need enough generated length for the n-gram oracle's stats to be
- * meaningful). Router/SwiGLU pinned to production (2/2), matching every other harness. */
-static void spec_generate_trajectory(Model*m,const int*prompt,int np,int*out_hist,int*out_n){
-    int ctx=np+SPEC_NGEN+4;
-    Kv kv; kv.kvd=m->nkv*m->hd; kv.ctx=ctx; kv.Kc=calloc((size_t)m->nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m->nl*ctx*kv.kvd,4);
-    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
-    float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
-         *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m->vocab*4);
-    uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
-    g_router_mode=2; g_router_validate=0; g_swiglu_fast=2;
-    for(int i=0;i<np;i++) out_hist[i]=prompt[i];
-    for(int p=0;p<np;p++) forward(m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-    int cur=argmax(logits,m->vocab); out_hist[np]=cur;
-    for(int s=1;s<SPEC_NGEN;s++){
-        forward(m,cur,np+s-1,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-        cur=argmax(logits,m->vocab); out_hist[np+s]=cur;
-    }
-    g_swiglu_fast=0;
-    *out_n=np+SPEC_NGEN;
-    free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
-    free(kv.Kc);free(kv.Vc);
-}
-
-static void run_speculative_oracle(Model*m){
-    /* Test set spans the ladder's own explicit concern -- "keep only if useful-token throughput
-     * improves outside copy-heavy prompts" -- so this measures BOTH extremes honestly rather than
-     * only the favorable case. "Repetitive": hp9 (the 113-token narrative already used for
-     * QWEN_CTXLEN benchmarks) tiled 4x back-to-back as the PROMPT itself, real tokenized content,
-     * inducing genuine in-context repetition (a well-known LLM behavior: seeing a block repeated
-     * in-context makes continuing the pattern likely). "General/novel": four of the harness's own
-     * real, distinct prompts spanning factual/reasoning/code/multilingual content, each given a
-     * long free-running continuation well past the quality harness's own short gen cap. */
-    static int prompt_rep[512]; int np_rep=113*4; for(int i=0;i<np_rep;i++) prompt_rep[i]=hp9[i%113];
-    struct { const int*toks; int n; const char*name; } seeds[5] = {
-        {hp1,12,"factual/capitals"}, {hp4,24,"reasoning/sequence"}, {hp5,23,"code/fibonacci"},
-        {hp7,7,"multilingual/french"}, {prompt_rep,np_rep,"REPETITIVE(tiled hp9 x4)"},
-    };
-    int NT=5;
-    static int hist[5][512+SPEC_NGEN]; int hn_[5];
-
-    printf("\n=== speculative/n-gram oracle: generating %d real free-running trajectories (%d gen tokens each) ===\n",NT,SPEC_NGEN);
-    for(int i=0;i<NT;i++){
-        double t0=now();
-        spec_generate_trajectory(m,seeds[i].toks,seeds[i].n,hist[i],&hn_[i]);
-        printf("  [%d/%d] %-28s prompt=%3d total=%3d done (%.1fs)\n",i+1,NT,seeds[i].name,seeds[i].n,hn_[i],now()-t0);
-    }
-
-    printf("\n=== per-config acceptance stats (n=n-gram match length, K=max draft length) ===\n");
-    printf("%-28s","prompt");
-    for(int c=0;c<SPEC_NCFG;c++) printf(" n%dK%d ",SPEC_N[c],SPEC_K[c]);
-    printf("\n");
-    double agg_mean[SPEC_NCFG]={0}; long agg_rounds[SPEC_NCFG]={0}, agg_accepted[SPEC_NCFG]={0};
-    long agg_hist[SPEC_NCFG][9]={{0}}; /* accepted-length histogram, 0..8 (SPEC_K max is 8) */
-    for(int i=0;i<NT;i++){
-        printf("%-28s",seeds[i].name);
-        for(int c=0;c<SPEC_NCFG;c++){
-            int n=SPEC_N[c],K=SPEC_K[c]; int draft[8];
-            long rounds=0, accepted_sum=0;
-            int t=seeds[i].n; /* start of generation; positions before this are the prompt itself */
-            while(t<hn_[i]-1){
-                int nd=ngram_propose(hist[i],t,n,K,draft);
-                int accepted=0;
-                for(int a=0;a<nd && t+a<hn_[i]-1;a++){ if(hist[i][t+a]==draft[a]) accepted++; else break; }
-                rounds++; accepted_sum+=accepted;
-                if(accepted>8)accepted=8; agg_hist[c][accepted]++;
-                t += accepted+1;
-            }
-            double mean=rounds?(double)accepted_sum/rounds:0;
-            printf(" %.2f",mean);
-            agg_mean[c]+=mean; agg_rounds[c]+=rounds; agg_accepted[c]+=accepted_sum;
-        }
-        printf("\n");
-    }
-    printf("\n=== aggregate (mean accepted tokens/round, across all %d trajectories) ===\n",NT);
-    for(int c=0;c<SPEC_NCFG;c++){
-        double macc = agg_rounds[c]? (double)agg_accepted[c]/agg_rounds[c] : 0;
-        printf("  n=%d K=%d: mean accepted/round=%.3f (%ld rounds total)  histogram[0..%d]=",SPEC_N[c],SPEC_K[c],macc,agg_rounds[c],SPEC_K[c]);
-        for(int h=0;h<=SPEC_K[c] && h<=8;h++) printf("%ld ",agg_hist[c][h]);
-        printf("\n");
-    }
-    /* K=3 highlighted specifically: 3 draft tokens + 1 anchor position = 4-wide, the already-
-     * validated M4 kernel's native batch width -- the natural target for the next step's batched-
-     * verify mechanism, not an arbitrary choice. */
-    printf("\n--- K=3 (natural M4-width fit: 3 draft + 1 anchor = 4-wide verify) breakdown by content type ---\n");
-    for(int c=0;c<SPEC_NCFG;c++) if(SPEC_K[c]==3){
-        printf("  n=%d: ", SPEC_N[c]);
-        for(int i=0;i<NT;i++){
-            int n=SPEC_N[c],K=SPEC_K[c]; int draft[8]; long rounds=0, accepted_sum=0;
-            int t=seeds[i].n;
-            while(t<hn_[i]-1){
-                int nd=ngram_propose(hist[i],t,n,K,draft); int accepted=0;
-                for(int a=0;a<nd && t+a<hn_[i]-1;a++){ if(hist[i][t+a]==draft[a]) accepted++; else break; }
-                rounds++; accepted_sum+=accepted; t+=accepted+1;
-            }
-            printf("%s=%.2f ", seeds[i].name, rounds?(double)accepted_sum/rounds:0);
-        }
-        printf("\n");
-    }
-    printf("\nNOTE: this is real, measured acceptance-rate data from real greedy trajectories -- NOT\n"
-           "yet a tok/s projection. Translating mean-accepted/round into real speedup needs the actual\n"
-           "batched-verify mechanism's own cost (an M4-batched K+1-wide verify pass costs MORE than one\n"
-           "ordinary decode step -- M4 arithmetic scales with M per codex_recs_1.md §22.36 -- so a\n"
-           "config with mean accepted <1 could plausibly be a NET LOSS even though it 'accepts\n"
-           "something'). That cost model is the next step's own job, not this oracle's.\n");
-}
-
-/* Q3_K engine branch (codex_recs_1.md §22.44), QWEN_Q3K_REFGEN=1: PURELY ADDITIVE reference-token
- * dump for cross-binary teacher-forcing. The Q3_K engine (qwen_moe_q3k.c, a separate file/binary)
- * cannot load this file's own W4 weights in the same process to compare directly (both models
- * resident would risk OOM on this board -- ~30GB combined vs ~31GB RAM) so it needs W4's reference
- * token sequences captured from a SEPARATE run and hardcoded, the same cross-process pattern this
- * whole session's teacher-forcing methodology already relies on, just spanning two binaries instead
- * of two in-process configs. Calls ONLY existing, unmodified functions (harness_run_prod_reference,
- * harness_eval_ppl at today's actual production config) and prints their own already-computed
- * results as C array literals -- does not change what either function computes, does not touch the
- * production decode path, and is itself gated behind a new opt-in env var, matching the
- * QWEN_HARNESS/QWEN_MBATCH_TEST/etc. convention every other harness hook in this file already
- * uses. */
-static void run_q3k_refgen(Model*m){
-    int ctx=HARNESS_MAXCTX; Kv kv; kv.kvd=m->nkv*m->hd; kv.ctx=ctx;
-    kv.Kc=calloc((size_t)m->nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m->nl*ctx*kv.kvd,4);
-    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
-    float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
-         *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m->vocab*4);
-    uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
-
-    printf("/* Captured from qwen_moe_hp.c (W4 production, int8-M1 router + rational-Pade SwiGLU),\n");
-    printf(" * QWEN_Q3K_REFGEN=1 -- codex_recs_1.md §22.44. Paste directly into qwen_moe_q3k.c. */\n\n");
-    for(int i=0;i<HARNESS_NP;i++){
-        int toks[HARNESS_GEN_MAX]; float selfnll[HARNESS_GEN_MAX];
-        harness_run_prod_reference(m,&g_hprompts[i],toks,selfnll,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        double sumnll=0; for(int s=0;s<g_hprompts[i].gen;s++) sumnll+=selfnll[s];
-        printf("static const int w4_ref%d[]={",i);
-        for(int s=0;s<g_hprompts[i].gen;s++) printf("%d%s",toks[s],s+1<g_hprompts[i].gen?",":"");
-        printf("}; /* %s, self-NLL sum=%.6f */\n",g_hprompts[i].name,sumnll);
-    }
-    printf("static const double w4_ref_selfnll_sum[%d]={",HARNESS_NP);
-    /* recompute in one pass so the two arrays are printed from the same run (avoid re-running twice
-     * with potentially different RNG-free-but-still-worth-being-careful floating point state) */
-    for(int i=0;i<HARNESS_NP;i++){
-        int toks[HARNESS_GEN_MAX]; float selfnll[HARNESS_GEN_MAX];
-        harness_run_prod_reference(m,&g_hprompts[i],toks,selfnll,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        double sumnll=0; for(int s=0;s<g_hprompts[i].gen;s++) sumnll+=selfnll[s];
-        printf("%.8f%s",sumnll,i+1<HARNESS_NP?",":"");
-    }
-    printf("};\n\n");
-    printf("static const double w4_ppl_nll[%d]={",PPL_NTEXTS);
-    for(int t=0;t<PPL_NTEXTS;t++){
-        double nll=harness_eval_ppl(m,&g_ppltexts[t],2,2,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
-        printf("%.8f%s",nll,t+1<PPL_NTEXTS?",":"");
-    }
-    printf("}; /* nats/token, one per g_ppltexts entry, same order */\n");
+    /* Predeclared keep criteria, verbatim per explicit direction: "Keep Q3_K only if short decode
+     * improves at least 10%, real-text perplexity is below 1.05x W4, worst corpus below 1.10x, and
+     * token divergence below 15%." The speed criterion is measured separately (production A/B, not
+     * this harness); the other three are exactly what this harness computes. */
+    printf("\n=== Q3_K PROMOTION GATES (predeclared, codex_recs_1.md §22.44) ===\n");
+    int g1=ppl_mult_real<1.05, g2=worst_mult<1.10, g3=div_rate<15.0;
+    printf("  [%s] real-text aggregate perplexity < 1.05x W4      (got x%.4f, %.2f%%)\n",g1?"PASS":"FAIL",ppl_mult_real,100.0*(ppl_mult_real-1.0));
+    printf("  [%s] worst individual real-text corpus < 1.10x W4   (got x%.4f, %.2f%%)\n",g2?"PASS":"FAIL",worst_mult,100.0*(worst_mult-1.0));
+    printf("  [%s] token divergence < 15%%                         (got %.2f%%, %ld/%ld)\n",g3?"PASS":"FAIL",div_rate,total_div,total_gen);
+    printf("  [pending] short decode >=10%% faster than W4         (measured separately via production A/B)\n");
+    printf("VERDICT (quality gates only, speed measured separately): %s\n",(g1&&g2&&g3)?"PASSES all quality gates":"FAILS at least one quality gate");
 
     free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
     free(kv.Kc);free(kv.Vc);
@@ -2936,10 +2175,10 @@ int main(int c,char**v){
     int ngen=(c>2)?atoi(v[2]):16, nt=(c>3)?atoi(v[3]):4;
     bind_ai(); { cpu_set_t s;CPU_ZERO(&s);CPU_SET(8,&s);sched_setaffinity(0,sizeof(s),&s);} for(int i=0;i<5;i++)sched_yield();
     Gguf g; double t0=now(); gguf_open(&g,v[1]);
-    fprintf(stderr,"qwen3moe (HP kernel): %d layers d=%d experts=%d/%d moe_ffn=%d heads=%d/%d hd=%d vocab=%d (parse %.1fs)\n",
+    fprintf(stderr,"qwen3moe (Q3_K engine branch, codex_recs_1.md §22.43-44): %d layers d=%d experts=%d/%d moe_ffn=%d heads=%d/%d hd=%d vocab=%d (parse %.1fs)\n",
         g.block_count,g.embd,g.n_exp,g.n_act,g.moe_ffn,g.nh,g.nkv,g.hd,g.vocab,now()-t0);
     fflush(stderr);
-    const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.hp.imecache";
+    const char*cpath=(c>4)?v[4]:"/root/models/qwen3-30b-a3b.q3k.imecache";
     g_router_validate=(c>5)?atoi(v[5]):0; /* router HP-Lin/int8-vs-fp32 expert-selection validation, off by default (extra compute) */
     g_router_mode=(c>6)?atoi(v[6]):2; /* 0=fp32(exact, revert flag) 1=int4-HP(rejected, see §22.7) 2=int8-M1(DEFAULT since 2026-07-26 -- passed the multi-prompt quality harness, codex_recs_1.md §22.15: 6.1% router mismatch, -0.0034 nats/tok NLL delta, 2.1% token divergence, 13.7% faster, all four pre-registered thresholds PASS) */
     g_swiglu_fast=(c>7)?atoi(v[7]):2; /* 0=exact(revert flag) 1=hard-swish(REJECTED §22.19-20 -- 11.0% perplexity inflation vs production on the expanded 1063-token/4-methodology eval, fails the 5% gate) 2=rational-Pade(DEFAULT since 2026-07-26, §22.21 -- passed the harness §22.20 AND a bounded production A/B: 2 paired trials, 9.7->11.4 tok/s, swiglu bucket 15.85ms->1.25ms (-92.1%), identical generated tokens both trials, no regression in any other bucket) */
@@ -3032,80 +2271,18 @@ int main(int c,char**v){
         byte-identical resource footprint to before -- extra threads for harts 9/11/13/15 are only
         created when an attention worker count above `nt` is explicitly requested. */
 
-    /* QWEN_HARNESS=1 (env var, not an 8th CLI arg) triggers the multi-prompt quality harness --
-     * see codex_recs_1.md §22.15. NOTE: an 8th positional CLI arg was tried first and reproducibly
-     * read back as a corrupted/wild pointer by the time execution reached here (valid at main()
-     * entry, clobbered somewhere during cache_load/model setup) -- a real, pre-existing memory
-     * bug this exposed, not a bug in the harness itself; never manifested before because nothing
-     * previously read past argv[6]. Root-caused in §22.16 to the unsafe tree-vectorized build;
-     * the mandatory -fno-tree-vectorize flag fixes it.  The env trigger remains the stable harness
-     * interface and avoids adding another positional production argument. */
-    { const char*hv=getenv("QWEN_HARNESS"); if(hv && atoi(hv)){ run_quality_harness(&m,&g); return 0; } }
-    /* QWEN_PREFILL_HARNESS=1: batched prefill quality harness (codex_recs_1.md §22.39) -- decides
-     * whether chunked-M4 prefill is eligible for promotion to the production default. */
-    { const char*ph=getenv("QWEN_PREFILL_HARNESS"); if(ph && atoi(ph)){ run_prefill_quality_harness(&m); return 0; } }
-    /* QWEN_SPEC_ORACLE=1: speculative/n-gram acceptance-rate oracle (codex_recs_1.md §22.40) --
-     * measures real n-gram drafting accept rate before any draft mechanism is integrated. */
-    { const char*so=getenv("QWEN_SPEC_ORACLE"); if(so && atoi(so)){ run_speculative_oracle(&m); return 0; } }
-    /* QWEN_Q3K_REFGEN=1: purely additive reference-token dump for the Q3_K engine branch's own
-     * cross-binary teacher-forcing harness (codex_recs_1.md §22.44) -- see run_q3k_refgen's own
-     * comment. Does not touch the production decode path. */
-    { const char*qr=getenv("QWEN_Q3K_REFGEN"); if(qr && atoi(qr)){ run_q3k_refgen(&m); return 0; } }
-    /* QWEN_MBATCH_TEST=1: M-batch track milestone 1 test (codex_recs_1.md §22.35) -- real 4-
-     * sequence batched decode vs 4 separate M=1 decodes, see run_mbatch_test's own comment. */
-    { const char*mv=getenv("QWEN_MBATCH_TEST"); if(mv && atoi(mv)){ run_mbatch_test(&m); return 0; } }
-    /* QWEN_PREFILL_TEST=1: batched prefill test (codex_recs_1.md §22.38) -- chunked-M4 prefill
-     * (prefill_chunk4) vs sequential per-token prefill, see run_prefill_test's own comment. */
-    { const char*pv=getenv("QWEN_PREFILL_TEST"); if(pv && atoi(pv)){ run_prefill_test(&m); return 0; } }
-    /* QWEN_PREFILL_CHUNK (env var, same convention): batched prefill (codex_recs_1.md §22.38-39) --
-     * chunked-M4 prefill (prefill_chunk4, 4 consecutive positions batched via the M-batch track's
-     * already-validated dense-layer M4 kernel) vs the sequential token-at-a-time baseline. §22.38
-     * validated (QWEN_PREFILL_TEST=1): 96-100% per-position token agreement (no argmax-feedback
-     * compounding during prefill, unlike decode M-batch -- every position's input token is fixed by
-     * the prompt, not fed back from a possibly-different prediction, so the only divergence source
-     * is M4's own shared-scale quantization noise propagating through the KV cache), ~1.11-1.12x
-     * prefill speedup at N=16/19/128/512/1024, reproducible, no length-dependent degradation. §22.39
-     * then ran the full multi-prompt NLL/perplexity quality harness (QWEN_PREFILL_HARNESS=1),
-     * thresholds matching the router/SwiGLU promotions (§22.15/22.20-21): teacher-forced perplexity
-     * multiplier x1.0156 (<1.05 gate -- PASS), token divergence 3.3% (<15% -- PASS), real-text
-     * aggregate multiplier x0.9968 (<1.05 -- PASS), worst individual corpus x1.0130 (<1.10 -- PASS).
-     * A clean production A/B (2 paired trials/length, real CLI invocation, QWEN_CTXLEN=128/512/1024)
-     * confirmed ~10-12% real prefill speedup, decode bucket completely unaffected, and the actual
-     * first generated token bit-identical between configs at every length. **PROMOTED to default 1**
-     * (2026-07-28) -- `QWEN_PREFILL_CHUNK=0` remains the explicit sequential revert flag. */
-    int g_prefill_chunk=1; { const char*pc=getenv("QWEN_PREFILL_CHUNK"); if(pc) g_prefill_chunk=atoi(pc); }
+    /* QWEN_Q3K_HARNESS=1: Q3_K-vs-W4 quality harness (codex_recs_1.md §22.44) -- teacher-forces
+     * against reference tokens captured from a separate run of the unmodified W4 binary
+     * (qwen_moe_hp.c), matching this whole session's established teacher-forcing methodology
+     * (router/SwiGLU/prefill harnesses) applied cross-binary instead of cross-mode, since loading
+     * both models in one process would risk OOM (~30GB combined vs ~31GB board RAM). */
+    { const char*qh=getenv("QWEN_Q3K_HARNESS"); if(qh && atoi(qh)){ run_q3k_quality_harness(&m); return 0; } }
 
     static int prompt[1536]; int np;
     if(ctxlen_req>0){ np=ctxlen_req; for(int i=0;i<np;i++) prompt[i]=hp9[i%113]; }
     else { int base[]={785,6722,315,9625,374,12095,13,576,6722,315,6323,374}; np=12; memcpy(prompt,base,sizeof(base)); }
     double tp=now(); int first=0;
-    if(g_prefill_chunk){
-        float*h4[4],*hn4[4],*q4[4],*k4[4],*vv4[4],*att4[4],*tmp4[4],*g4[4],*u4[4],*eout4[4],*logits4[4]; uint8_t*Abuf4arr[4];
-        for(int s=0;s<4;s++){
-            h4[s]=malloc(d*4); hn4[s]=malloc(d*4); q4[s]=malloc(qd*4); k4[s]=malloc(kv.kvd*4); vv4[s]=malloc(kv.kvd*4);
-            att4[s]=malloc(qd*4); tmp4[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
-            g4[s]=malloc(moe*4); u4[s]=malloc(moe*4); eout4[s]=malloc(d*4); logits4[s]=malloc((size_t)m.vocab*4);
-            Abuf4arr[s]=malloc((size_t)(maxk/256)*AREC);
-        }
-        int maxk4b=qd>d?qd:d;
-        uint8_t*Abuf4buf=malloc((size_t)(maxk4b/256)*AREC_M4);
-        uint8_t*Abuf2_4=malloc((size_t)4*3000);
-        int nchunks=np/4, rem=np%4;
-        for(int c=0;c<nchunks;c++){
-            int toks4[4]; for(int i=0;i<4;i++) toks4[i]=prompt[c*4+i];
-            prefill_chunk4(&m,toks4,c*4,&kv,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
-            if(c==nchunks-1 && rem==0){ memcpy(logits,logits4[3],(size_t)m.vocab*4); first=argmax(logits,m.vocab); }
-        }
-        for(int r=0;r<rem;r++){
-            int p=nchunks*4+r;
-            forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
-            if(p==np-1) first=argmax(logits,m.vocab);
-        }
-        for(int s=0;s<4;s++){ free(h4[s]);free(hn4[s]);free(q4[s]);free(k4[s]);free(vv4[s]);free(att4[s]);free(tmp4[s]);free(g4[s]);free(u4[s]);free(eout4[s]);free(logits4[s]);free(Abuf4arr[s]); }
-        free(Abuf4buf); free(Abuf2_4);
-    } else {
-        for(int p=0;p<np;p++){ forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); if(p==np-1)first=argmax(logits,m.vocab); }
-    }
+    for(int p=0;p<np;p++){ forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); if(p==np-1)first=argmax(logits,m.vocab); }
     int echo_np=np<=64?np:64; /* QWEN_CTXLEN can make np huge (1024+); don't spam the log */
     printf("\nprompt      : "); for(int i=0;i<echo_np;i++)tok_print(&g,prompt[i]); if(np>echo_np)printf(" ...(%d more)",np-echo_np);
     printf("\nfirst argmax: %d ('",first); tok_print(&g,first); printf("')  expect 26194 (' Tokyo') -> %s%s\n", first==26194?"PASS":"FAIL", ctxlen_req>0?" (ctxlen test: mismatch expected, prompt isn't the capitals prompt)":"");
@@ -3115,7 +2292,7 @@ int main(int c,char**v){
     for(int s=0;s<ngen;s++){ int pos=np+s; forward(&m,cur,pos,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); cur=argmax(logits,m.vocab); tok_print(&g,cur); }
     double dt=now()-tg; gT_on=0;
     const char*router_names[]={"fp32(exact,revert-flag)","int4-HP(rejected)","int8-M1(default)"};
-    printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, vendor IME-2-HP int4 W4A8, nt=%d, router=%s)\n", ngen/dt, nt, router_names[g_router_mode]);
+    printf("\ndecode: %.2f tok/s (Qwen3-30B-A3B, Q3_K engine branch -- attn_q/attn_v/expert-FFN=Q3_K, attn_k=Q8_0, attn_output/lm_head=Q5_K/Q6_K->int8 fallback, nt=%d, router=%s)\n", ngen/dt, nt, router_names[g_router_mode]);
     if(gT_tok){
         printf("  per-token buckets (avg/%ld tok, ms): act-pack %.1f | linear(kernel) %.1f | attention %.1f | rope+qknorm %.1f | router %.1f | swiglu %.1f | rest(other) %.1f | sum %.1f | wall %.1f\n",
             gT_tok, gT_actpack/gT_tok*1e3, gT_lin/gT_tok*1e3, gT_attn/gT_tok*1e3, gT_rope/gT_tok*1e3, gT_router/gT_tok*1e3, gT_swiglu/gT_tok*1e3, gT_rest/gT_tok*1e3,

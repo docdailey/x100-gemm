@@ -374,6 +374,33 @@ hot, 5.3-8.3us/call cold, no meaningful cold-start penalty. Next: fp32→Q3_K qu
 integration with a new cache version — waiting on the Q3_K_S checkpoint download
 (`bartowski/Qwen_Qwen3-30B-A3B-GGUF`, 13.4GB, same base checkpoint already in use) to complete.
 
+**Q3_K engine branch, step 2: full-engine integration, quality harness, production A/B — quality
+PASSES, speed decisively FAILS, NOT KEPT (2026-07-29, `codex_recs_1.md` §22.44).** New file
+`qwen_moe_q3k.c` (copied from `qwen_moe_hp.c`, W4 production path untouched except one purely
+additive harness-only hook, `run_q3k_refgen`). Real checkpoint (`gguf_dump`-confirmed) is genuinely
+mixed-precision: `attn_q`/`attn_v`/all expert-FFN weights/`token_embd` are Q3_K (the dominant
+compute); `attn_k` is Q8_0 (reuses the existing int8 path unchanged, provably lossless round trip);
+`attn_output` is Q5_K, `output`/lm_head is Q6_K (both dequantized via new scalar algorithms then
+routed through the same existing int8 path as a deliberately unoptimized fallback). New cache
+version 3. Coherence check: `' Tokyo'` PASS, fluent/correct free-running generation. ASan/UBSan
+clean on the full engine. **Quality harness (teacher-forced against W4's own captured reference
+tokens, router/SwiGLU pinned identical to the W4 reference run): all 3 quality gates PASS** —
+real-text aggregate perplexity x0.9930 (essentially at parity, even slightly BETTER than W4), worst
+individual corpus x1.0761 (<1.10 required), token divergence 8.82% (<15% required). **Production
+A/B: Q3_K is 38-48% SLOWER than W4 at every tested context length** (short 6.5 vs ~12.4 tok/s,
+ctx512 5.95 vs ~10.2, ctx1024 5.39 vs ~8.7) — the opposite of the required ≥10% faster, reproducible
+across paired trials. Root cause, honestly separated: (1) Q3_K's own kernel is ~1.6-1.7x slower
+per-element than int4-HP's on this hardware — a genuine property of the format (more bit-unpacking
+work per element than it saves in memory traffic, meaning these harts are not purely bandwidth-bound
+at this precision), not an integration artifact; (2) the deliberately-unoptimized int8 fallback path
+is itself ~2x slower per-element than int4-HP, expected and accepted per "do not optimize anything
+else concurrently"; (3) genuine extra activation-packing overhead from needing two incompatible
+packed formats, partially structural and partially attributable to this pass's own scope (a
+plausible target for a future, more careful integration, unlike findings 1-2). **Verdict: Q3_K NOT
+KEPT**, per the predeclared rule — quality held up remarkably well but the primary practical
+criterion (speed) failed decisively. Per explicit instruction, Q2_K is not attempted following this
+result.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

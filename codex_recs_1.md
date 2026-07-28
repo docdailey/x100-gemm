@@ -3889,3 +3889,126 @@ real checkpoint), full-engine integration with a new cache version, and the chec
 (downloading `bartowski/Qwen_Qwen3-30B-A3B-GGUF`'s `Q3_K_S` variant, 13.4GB, from the exact same
 base checkpoint already in use — confirmed via its Q4_0 sibling matching the board's existing file
 size — in progress in parallel with this step, not yet complete at time of writing).
+
+### 22.44 Q3_K engine branch, step 2: full-engine integration, quality harness, production A/B — quality PASSES, speed decisively FAILS, NOT KEPT
+
+Explicit direction (continuing §22.43's ladder): "full-engine integration with a new cache version...
+run the existing multi-prompt quality harness and production A/B at short, ctx512 and ctx1024. Keep
+Q3_K only if short decode improves at least 10%, real-text perplexity is below 1.05× W4, worst
+corpus below 1.10×, and token divergence below 15%."
+
+**Checkpoint.** `bartowski/Qwen_Qwen3-30B-A3B-GGUF`'s `Q3_K_S` variant (13.4GB, confirmed same base
+checkpoint as the board's existing Q4_0 file). `gguf_dump` against the real downloaded file (not
+assumed) showed a genuinely mixed-precision checkpoint: `attn_q`/`attn_v`/all three expert-FFN
+weights/`token_embd` are Q3_K (the tensors this track tests — the dominant compute, per earlier
+session profiling "expert FFN ~61% of the linear bucket"); `attn_k` is Q8_0; `attn_output` is Q5_K;
+`output`/lm_head is Q6_K; norms/router are F32.
+
+**New file: `qwen_moe_q3k.c`** (copied from `qwen_moe_hp.c` then surgically modified — `qwen_moe_hp.c`
+itself untouched except one purely additive hook, see below). Kept: tokenizer, GGUF reader (already
+generically dispatches by ggml type — extended with Q3_K/Q5_K cases, matching the Q6_K/Q8_0 cases it
+already had), attention (8-worker pool, RVV softmax, fused QK/AV — all quant-independent), rope,
+router, SwiGLU, the persistent worker-pool dispatch mechanism (extended with a `kind==4` Q3_K M1
+branch, reusing the exact same N-tile-of-32 pattern `kind==0`'s int4-HP dispatch already used, since
+Q3_K's own NB_COLS=32 matches exactly). Stripped entirely (W4-M4-specific, out of scope per "do not
+optimize anything else concurrently"): `forward4_dense_batch`, `prefill_chunk4`, the router/SwiGLU
+multi-mode comparison harness (`run_quality_harness` and its `harness_run_*` helpers),
+`run_mbatch_test`, `run_prefill_test`/`run_prefill_quality_harness`, the speculative/n-gram oracle.
+Per-tensor handling: Q3_K tensors read raw `block_q3_K` bytes directly from the mmap'd GGUF (NOT
+via dequant-then-requantize, which would defeat the purpose) and repack via `pack_B_q3k32`
+(validated in §22.43); Q8_0 (`attn_k`) dequantizes via the GGUF reader's existing type-8 case then
+reuses the existing, already-validated `lin_new_i8`/`run_i8_m1` int8 path unchanged (provably
+lossless round trip for well-formed Q8_0 data — the encoder already chose `d` such that
+`max(|q|)=127`, so recomputing `d` from the dequantized floats recovers the identical `d` and int8
+values); Q5_K (`attn_output`) and Q6_K (`output`/lm_head) dequantize via new scalar (standard ggml
+algorithm) functions then ALSO reuse the existing int8 path as a deliberately unoptimized fallback —
+not a new kernel, the same int8 GEMM the router's own int8 mode already uses. New cache format,
+version 3 (distinct from W4's version 2) — `wlin_q3k`/`rlin_q3k` and `wlin_i8`/`rlin_i8` alongside
+the original `wlin`/`rlin` (still used for the router's own int4-HP mode, unchanged).
+
+**One purely additive hook added to `qwen_moe_hp.c`**: `run_q3k_refgen`
+(`QWEN_Q3K_REFGEN=1`) — calls ONLY existing, unmodified functions (`harness_run_prod_reference`,
+`harness_eval_ppl` at production config) and prints their own already-computed results as C array
+literals. Needed because loading both models in one process to compare directly would risk OOM
+(~30GB combined vs ~31GB board RAM), so the Q3_K engine's own quality harness teacher-forces against
+W4's reference tokens captured from a separate run and hardcoded — the same cross-process pattern
+this whole session's teacher-forcing methodology already relies on (router/SwiGLU/prefill harnesses
+all teacher-force against a captured reference), just spanning two binaries instead of two in-process
+configs. Does not change what either existing function computes and does not touch the production
+decode path — confirmed by a clean, unchanged rebuild of `qwen_moe_hp.c` before and after.
+
+**Coherence check.** `' Tokyo'` PASS (exact match, even at Q3_K precision); free-running generation
+fluent and factually correct: *"The capital of France is Paris. The capital of Japan is Tokyo. The
+capital of Brazil is Brasília. The capital of Egypt is Cairo."*
+
+**Sanitizers** (full engine, not just the standalone probe): ASan (`detect_leaks=0`) and UBSan, both
+clean, zero errors. Tokens and decode output identical across plain/ASan/UBSan builds.
+
+**Quality harness** (`QWEN_Q3K_HARNESS=1`), teacher-forced against W4's captured reference tokens,
+router/SwiGLU pinned at the same production config (int8-M1 + rational-Padé) that generated the W4
+reference, so the ONLY variable is the Q3_K weight quantization itself:
+
+| gate | threshold | result |
+|---|---|---|
+| real-text aggregate perplexity multiplier | < 1.05x W4 | **x0.9930 (-0.70%) — PASS** |
+| worst individual real-text corpus | < 1.10x W4 | **x1.0761 (+7.61%) — PASS** |
+| token divergence (teacher-forced) | < 15% | **8.82% (67/760) — PASS** |
+
+Real-text perplexity is essentially at parity with W4 — even very slightly BETTER on average across
+the 9 corpora (individual per-text multipliers range 0.90x-1.08x, no systematic one-sided inflation).
+Teacher-forced divergence (8.82%) is notably higher than router's own 2.1% at promotion (§22.15) —
+expected, since Q3_K replaces MUCH more of the model (every attn_q/attn_v/expert-FFN weight) than a
+routing decision, yet it still clears the predeclared 15% gate comfortably. Informational (not one
+of the 4 gated criteria): teacher-forced perplexity multiplier x1.0918
+(9.18% inflation), higher than the real-text number, consistent with teacher-forcing being the
+harder test (exposes positions deep into a specific trajectory the model wouldn't have chosen
+itself, the same pattern established throughout this session). **All three quality gates PASS** —
+genuinely strong result for 3-4 bit weights on the majority of the model's compute.
+
+**Production A/B** (real CLI binary, 2 paired trials/length):
+
+| context | Q3_K decode | W4 decode (established) | Q3_K vs W4 |
+|---|---|---|---|
+| short | 6.49 / 6.51 tok/s | ~12.37-12.43 tok/s | **-47.6% (SLOWER)** |
+| ctx512 | 5.97 / 5.93 tok/s | ~10.2 tok/s | **-41.7% (SLOWER)** |
+| ctx1024 | 5.41 / 5.37 tok/s | ~8.7 tok/s | **-38.0% (SLOWER)** |
+
+Tight trial-to-trial agreement (±0.3-0.4%) — a real, reproducible, decisive result, not noise.
+**Q3_K is 38-48% SLOWER than W4 at every tested context length — the opposite of the required ≥10%
+faster, not merely short of the bar.**
+
+**Root cause (bucket breakdown, short context: Q3_K linear=97-105ms vs W4's own established
+~59.7ms at nt=4, §22.42's own hart-scaling table)** — two compounding, genuine findings, honestly
+separated from a third integration-specific cost:
+
+1. **Q3_K's own kernel is ~1.6-1.7x slower per-element than int4-HP's**, isolated in the
+   expert(gate/up/down) bucket (now 100% Q3_K): 57.0-62.2ms vs W4's own ~36ms for the identical
+   work. This is a genuine property of the Q3_K format/kernel on this hardware, not an artifact of
+   this integration — the vendor's own `vmadot.hp`-based kernel does meaningfully more per-element
+   bit-unpacking work (2-bit `qs` + 1-bit `hmask` combine, more vector instructions per element than
+   int4-HP's simpler nibble unpack) than it saves in reduced memory traffic, meaning these harts are
+   evidently NOT purely memory-bandwidth-bound at this precision — contradicting the a-priori
+   assumption (implicit in choosing this track) that fewer bits/weight would mean faster decode.
+2. **The deliberately-unoptimized int8 fallback path is itself ~2x slower per-element than
+   int4-HP** for the same tensors: O-projection 15.0-15.7ms (was ~7.6ms int4-HP), lm_head
+   11.0-11.7ms (was ~5.7ms int4-HP). Expected and explicitly accepted per "do not optimize anything
+   else concurrently" — `run_i8_m1` dispatches over K/32-wide groups (8x more loop iterations for
+   the same K than int4-HP's K/256-wide superblocks), a known, real per-dispatch overhead, not a
+   surprise.
+3. **Genuine extra activation-packing overhead** from needing two incompatible packed formats
+   where W4 needed one: act-pack grew from W4's ~2.3ms to 26-35ms. Partially structural (Q3_K and
+   int8 need different byte layouts, unlike int4-HP which could share one pack across q/k/v/router/
+   experts) and partially attributable to this pass's own scope (a more careful shared-pack design
+   was possible but is exactly the kind of "optimize the integration" work explicitly out of scope
+   here) — flagged honestly as the one place a future, more careful integration could likely recover
+   real time, unlike findings 1-2 which are closer to fundamental to the format/hardware pairing.
+
+**Verdict, directly following the predeclared rule: Q3_K is NOT KEPT.** All three quality gates
+passed cleanly — a genuinely strong result establishing that 3-4 bit weights preserve this model's
+output quality well — but the primary practical criterion (decode speed) failed decisively, in the
+wrong direction, at every tested context length. Per explicit instruction, **Q2_K is not attempted**
+following this result (the ladder's own "only after that decision should Q2_K be attempted" gate is
+now closed on a NOT-KEPT outcome for Q3_K; proceeding to an even-lower-precision, likely-even-more
+compute-bound format without addressing findings 1-2 above would not be a reasonable next step
+without new information). `qwen_moe_hp.c`'s W4 production path is completely unaffected by this
+entire track — the one addition (`run_q3k_refgen`) is a harness-only, opt-in, purely additive hook.
