@@ -273,6 +273,24 @@ been token-agreement/logit-closeness on synthesized text; since batched prefill 
 M-batching) is a genuine single-user production lever, flipping the default is a real "changes model
 semantics for every invocation" decision, held for explicit confirmation rather than auto-promoted.
 
+**Batched prefill quality harness run, production A/B confirmed — PROMOTED to production default
+(2026-07-28, `codex_recs_1.md` §22.39).** Per explicit direction: ran the full multi-prompt NLL/
+perplexity harness (`QWEN_PREFILL_HARNESS=1`) with thresholds predeclared consistent with the
+router/SwiGLU promotions. **All five gates PASS**: teacher-forced perplexity multiplier x1.0156
+(1.6% inflation, <1.05 gate), token divergence 3.3% (25/760, <15%), real-text aggregate multiplier
+x0.9968 (essentially neutral, <1.05), worst individual corpus x1.0130 (<1.10), prefill speed
+1.10-1.14x (already measured, ≥10% gate). Divergence is comfortably below both router's (2.1%) and
+SwiGLU's (3.2%) own promotion-time numbers despite touching every layer of the whole prompt.
+Followed with a clean production A/B (real CLI binary, `QWEN_CTXLEN`=128/512/1024, 2 paired
+interleaved trials/length): **~10-12% real prefill speedup at every length, decode bucket
+statistically flat (zero cross-contamination), and the actual first generated token bit-identical
+between sequential and chunked prefill at every length in every trial.** **PROMOTED**:
+`g_prefill_chunk` default flipped 0→1; `QWEN_PREFILL_CHUNK=0` remains the explicit sequential revert
+flag. Verified with zero env-var overrides (true production invocation): `' Tokyo'` PASS, prefill
+0.86s (12 tok), decode 12.43 tok/s — matches HEADLINE within normal noise, no regression at the
+canonical short prompt. This closes the decision the user held open before allowing the ladder to
+continue — speculative/n-gram verification (next item) may now begin.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

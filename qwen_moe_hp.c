@@ -2318,6 +2318,157 @@ static void run_quality_harness(Model*m,Gguf*gguf){
     free(kv.Kc);free(kv.Vc);
 }
 
+/* Batched prefill quality harness (codex_recs_1.md §22.39), QWEN_PREFILL_HARNESS=1: per explicit
+ * user direction after §22.38's opt-in validation -- "run the full quality harness on
+ * QWEN_PREFILL_CHUNK=1, using predeclared acceptance thresholds consistent with the router/SwiGLU
+ * promotions." Reference is `harness_run_prod_reference` UNCHANGED (today's actual production
+ * config: int8-M1 router + rational-Pade SwiGLU + SEQUENTIAL prefill) -- this asks "does adding
+ * chunked-M4 prefill on top of what already ships cause a problem", the same framing established
+ * for SwiGLU's own evaluation, not a re-litigation of router/SwiGLU. The candidate differs from
+ * every prior teacher-forced harness only in HOW the prompt itself is ingested (chunked-M4 via
+ * `prefill_chunk4` in groups of 4 consecutive positions + per-token `forward()` for any N-mod-4
+ * remainder, exactly `run_prefill_test`/`main()`'s own already-validated QWEN_PREFILL_CHUNK=1
+ * mechanism) -- router/SwiGLU stay pinned at production (2/2) throughout, and decode after the
+ * prompt is the unchanged, untouched forward() loop either way. */
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void harness_run_prefill_teacherforced(Model*m,const HarnessPrompt*hp,const int*ref,int*out_div,float*out_nll,Kv*kv,
+        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits,
+        float*h4[4],float*hn4[4],float*q4[4],float*k4[4],float*vv4[4],float*att4[4],float*tmp4[4],
+        float*g4[4],float*u4[4],float*eout4[4],float*logits4[4],uint8_t*Abuf4arr[4],uint8_t*Abuf4buf,uint8_t*Abuf2_4){
+    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
+    g_router_mode=2; g_router_validate=0; g_swiglu_fast=2;
+    int nchunks=hp->n/4, rem=hp->n%4;
+    for(int c=0;c<nchunks;c++){
+        int toks4[4]; for(int i=0;i<4;i++) toks4[i]=hp->toks[c*4+i];
+        prefill_chunk4(m,toks4,c*4,kv,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
+        if(c==nchunks-1 && rem==0) memcpy(logits,logits4[3],(size_t)m->vocab*4);
+    }
+    for(int r=0;r<rem;r++){
+        int p=nchunks*4+r;
+        forward(m,hp->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    }
+    /* `logits` now holds the prediction for the token right after the prompt -- decode step 0,
+     * exactly like every other teacher-forced harness's post-prefill `logits` state. */
+    for(int s=0;s<hp->gen;s++){
+        out_div[s]=(argmax(logits,m->vocab)!=ref[s]); out_nll[s]=harness_nll(logits,m->vocab,ref[s]);
+        forward(m,ref[s],hp->n+s,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    }
+    g_swiglu_fast=0;
+}
+/* real-text perplexity under chunked-M4 prefill, same "reconstruct NLL of the REAL next token from
+ * REAL preceding context" methodology as `harness_eval_ppl`, batched across the text's own
+ * consecutive positions instead of one token at a time. Router/SwiGLU pinned to production (2/2),
+ * matching the teacher-forced candidate above -- this measures the prefill mechanism's own effect
+ * only. */
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static double harness_eval_ppl_prefill(Model*m,const PplText*txt,Kv*kv,
+        float*hn,float*q,float*k,float*vv,float*att,float*tmp,float*gg,float*u,float*eout,uint8_t*Abuf,uint8_t*Abuf2,float*logits,
+        float*h4[4],float*hn4[4],float*q4[4],float*k4[4],float*vv4[4],float*att4[4],float*tmp4[4],
+        float*g4[4],float*u4[4],float*eout4[4],float*logits4[4],uint8_t*Abuf4arr[4],uint8_t*Abuf4buf,uint8_t*Abuf2_4){
+    memset(kv->Kc,0,(size_t)m->nl*kv->ctx*kv->kvd*4); memset(kv->Vc,0,(size_t)m->nl*kv->ctx*kv->kvd*4);
+    g_router_mode=2; g_router_validate=0; g_swiglu_fast=2;
+    double total_nll=0; int count=0;
+    int n=txt->n-1; /* positions 0..n-1 each predict their own next token, matching
+        harness_eval_ppl's own `p<txt->n-1` bound -- the last token has no next-token target */
+    int nchunks=n/4, rem=n%4;
+    for(int c=0;c<nchunks;c++){
+        int toks4[4]; for(int i=0;i<4;i++) toks4[i]=txt->toks[c*4+i];
+        prefill_chunk4(m,toks4,c*4,kv,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
+        for(int i=0;i<4;i++){ int p=c*4+i; total_nll+=harness_nll(logits4[i],m->vocab,txt->toks[p+1]); count++; }
+    }
+    for(int r=0;r<rem;r++){
+        int p=nchunks*4+r;
+        forward(m,txt->toks[p],p,kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+        total_nll+=harness_nll(logits,m->vocab,txt->toks[p+1]); count++;
+    }
+    g_swiglu_fast=0;
+    return count?total_nll/count:0.0;
+}
+__attribute__((noinline,optimize("no-tree-vectorize")))
+static void run_prefill_quality_harness(Model*m){
+    int ctx=HARNESS_MAXCTX; Kv kv; kv.kvd=m->nkv*m->hd; kv.ctx=ctx;
+    kv.Kc=calloc((size_t)m->nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m->nl*ctx*kv.kvd,4);
+    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
+    float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
+         *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m->vocab*4);
+    uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
+
+    float*h4[4],*hn4[4],*q4[4],*k4[4],*vv4[4],*att4[4],*tmp4[4],*g4[4],*u4[4],*eout4[4],*logits4[4]; uint8_t*Abuf4arr[4];
+    for(int s=0;s<4;s++){
+        h4[s]=malloc(d*4); hn4[s]=malloc(d*4); q4[s]=malloc(qd*4); k4[s]=malloc(kv.kvd*4); vv4[s]=malloc(kv.kvd*4);
+        att4[s]=malloc(qd*4); tmp4[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
+        g4[s]=malloc(moe*4); u4[s]=malloc(moe*4); eout4[s]=malloc(d*4); logits4[s]=malloc((size_t)m->vocab*4);
+        Abuf4arr[s]=malloc((size_t)(maxk/256)*AREC);
+    }
+    int maxk4=qd>d?qd:d;
+    uint8_t*Abuf4buf=malloc((size_t)(maxk4/256)*AREC_M4);
+    uint8_t*Abuf2_4=malloc((size_t)4*3000);
+
+    printf("\n=== prefill quality harness: phase 1 -- production reference (int8 router + rational-Pade SwiGLU + sequential prefill) ===\n");
+    static int ref_toks[HARNESS_NP][HARNESS_GEN_MAX];
+    static float self_nll[HARNESS_NP][HARNESS_GEN_MAX];
+    for(int i=0;i<HARNESS_NP;i++){
+        harness_run_prod_reference(m,&g_hprompts[i],ref_toks[i],self_nll[i],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        printf("  [%2d/%d] %-24s prefill=%3d gen=%2d done\n",i+1,HARNESS_NP,g_hprompts[i].name,g_hprompts[i].n,g_hprompts[i].gen);
+    }
+
+    printf("\n=== prefill quality harness: phase 2 -- chunked-M4 prefill candidate, teacher-forced ===\n");
+    typedef struct { const char*name; int gen,divergent; float nll_chunk,nll_prod; } PRes;
+    PRes pres[HARNESS_NP];
+    for(int i=0;i<HARNESS_NP;i++){
+        int div[HARNESS_GEN_MAX]; float nll[HARNESS_GEN_MAX];
+        harness_run_prefill_teacherforced(m,&g_hprompts[i],ref_toks[i],div,nll,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits,
+            h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,logits4,Abuf4arr,Abuf4buf,Abuf2_4);
+        PRes*r=&pres[i]; r->name=g_hprompts[i].name; r->gen=g_hprompts[i].gen; r->divergent=0; r->nll_chunk=0; r->nll_prod=0;
+        for(int s=0;s<r->gen;s++){ r->divergent+=div[s]; r->nll_chunk+=nll[s]; r->nll_prod+=self_nll[i][s]; }
+        printf("  [%2d/%d] %-24s prefill=%3d (%d chunks+%d rem) divergent=%2d/%-2d  nll_delta=%+.4f\n",
+            i+1,HARNESS_NP,r->name,g_hprompts[i].n,g_hprompts[i].n/4,g_hprompts[i].n%4,r->divergent,r->gen,(r->nll_chunk-r->nll_prod)/r->gen);
+    }
+    int total_gen=0,total_div=0; double total_nll_chunk=0,total_nll_prod=0;
+    for(int i=0;i<HARNESS_NP;i++){ total_gen+=pres[i].gen; total_div+=pres[i].divergent; total_nll_chunk+=pres[i].nll_chunk; total_nll_prod+=pres[i].nll_prod; }
+    double div_rate=100.0*total_div/total_gen, nll_delta=(total_nll_chunk-total_nll_prod)/total_gen, ppl_mult=exp(nll_delta);
+
+    printf("\n=== prefill quality harness: phase 3 -- real-text perplexity (%d independently-authored texts) ===\n",PPL_NTEXTS);
+    double sum_prod=0,sum_chunk=0; int total_toks=0;
+    double by_text_prod[PPL_NTEXTS], by_text_chunk[PPL_NTEXTS];
+    for(int t=0;t<PPL_NTEXTS;t++){
+        double nll_prod=harness_eval_ppl(m,&g_ppltexts[t],2,2,&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits);
+        double nll_chunk=harness_eval_ppl_prefill(m,&g_ppltexts[t],&kv,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2,logits,
+            h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,logits4,Abuf4arr,Abuf4buf,Abuf2_4);
+        by_text_prod[t]=nll_prod; by_text_chunk[t]=nll_chunk;
+        printf("  %-28s production NLL=%.4f  chunked-M4 NLL=%.4f  per-text multiplier x%.4f (%.1f%%)\n",
+            g_ppltexts[t].name,nll_prod,nll_chunk,exp(nll_chunk-nll_prod),100.0*(exp(nll_chunk-nll_prod)-1.0));
+        sum_prod+=nll_prod*(g_ppltexts[t].n-1); sum_chunk+=nll_chunk*(g_ppltexts[t].n-1); total_toks+=g_ppltexts[t].n-1;
+    }
+    double agg_prod=sum_prod/total_toks, agg_chunk=sum_chunk/total_toks, ppl_mult_real=exp(agg_chunk-agg_prod);
+    double worst_text_mult=0; for(int t=0;t<PPL_NTEXTS;t++){ double mt=exp(by_text_chunk[t]-by_text_prod[t]); if(mt>worst_text_mult)worst_text_mult=mt; }
+    printf("  aggregate: production NLL=%.4f  chunked-M4 NLL=%.4f  aggregate multiplier x%.4f (%.1f%%), worst individual corpus x%.4f (%.1f%%)\n",
+        agg_prod,agg_chunk,ppl_mult_real,100.0*(ppl_mult_real-1.0),worst_text_mult,100.0*(worst_text_mult-1.0));
+
+    /* Predeclared thresholds (fixed here, before this run, consistent with the router (§22.15) and
+     * SwiGLU (§22.20-21) promotions' own bars): teacher-forced perplexity multiplier < 1.05 (the
+     * exact bar rational-Pade had to clear, the most relevant recent precedent for a candidate
+     * touching quality broadly); token divergence < 15% (matches router/SwiGLU); real-text
+     * aggregate multiplier < 1.05 AND no individual corpus > 1.10 (matches SwiGLU's real-text
+     * gates, and the lesson from §22.19 that real-text alone can wrongly clear a bad candidate --
+     * teacher-forced remains decisive); speed >=10% faster prefill bucket (matches router's own
+     * floor -- already independently measured at 1.10-1.14x in §22.38, restated not re-run here). */
+    printf("\n=== BATCHED PREFILL PROMOTION GATES (predeclared before this run, codex_recs_1.md §22.39) ===\n");
+    int gate1=ppl_mult<1.05, gate2=div_rate<15.0, gate3=ppl_mult_real<1.05, gate4=worst_text_mult<1.10, gate5=1; /* speed gate: 1.10-1.14x >=10%, already measured in §22.38 */
+    printf("  [%s] teacher-forced perplexity multiplier < 1.05 (vs production)   (got x%.4f, %.1f%%)\n",gate1?"PASS":"FAIL",ppl_mult,100.0*(ppl_mult-1.0));
+    printf("  [%s] token divergence < 15%% (vs production)                       (got %.1f%%, %d/%d)\n",gate2?"PASS":"FAIL",div_rate,total_div,total_gen);
+    printf("  [%s] real-text aggregate perplexity multiplier < 1.05             (got x%.4f, %.1f%%)\n",gate3?"PASS":"FAIL",ppl_mult_real,100.0*(ppl_mult_real-1.0));
+    printf("  [%s] every individual real-text corpus < 1.10                    (got worst x%.4f, %.1f%%)\n",gate4?"PASS":"FAIL",worst_text_mult,100.0*(worst_text_mult-1.0));
+    printf("  [%s] prefill bucket >=10%% faster than sequential                  (already measured 1.10-1.14x, codex_recs_1.md §22.38)\n",gate5?"PASS":"FAIL");
+    printf("VERDICT: batched prefill (chunked-M4) %s promotion to the production default.\n",
+        (gate1&&gate2&&gate3&&gate4&&gate5)?"PASSES all thresholds -- ELIGIBLE FOR":"FAILS at least one threshold -- NOT ELIGIBLE FOR");
+
+    for(int s=0;s<4;s++){ free(h4[s]);free(hn4[s]);free(q4[s]);free(k4[s]);free(vv4[s]);free(att4[s]);free(tmp4[s]);free(g4[s]);free(u4[s]);free(eout4[s]);free(logits4[s]);free(Abuf4arr[s]); }
+    free(Abuf4buf); free(Abuf2_4);
+    free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
+    free(kv.Kc);free(kv.Vc);
+}
+
 /* M-batch track milestone 1 (codex_recs_1.md §22.35), QWEN_MBATCH_TEST=1: real 4-sequence batched
  * decode test using genuinely independent prompts (4 of the harness's own real, distinct prompts,
  * not synthetic data), sharing weight-stream reads at QKV/O/router/lm_head via forward4_dense_batch
@@ -2693,25 +2844,32 @@ int main(int c,char**v){
      * the mandatory -fno-tree-vectorize flag fixes it.  The env trigger remains the stable harness
      * interface and avoids adding another positional production argument. */
     { const char*hv=getenv("QWEN_HARNESS"); if(hv && atoi(hv)){ run_quality_harness(&m,&g); return 0; } }
+    /* QWEN_PREFILL_HARNESS=1: batched prefill quality harness (codex_recs_1.md §22.39) -- decides
+     * whether chunked-M4 prefill is eligible for promotion to the production default. */
+    { const char*ph=getenv("QWEN_PREFILL_HARNESS"); if(ph && atoi(ph)){ run_prefill_quality_harness(&m); return 0; } }
     /* QWEN_MBATCH_TEST=1: M-batch track milestone 1 test (codex_recs_1.md §22.35) -- real 4-
      * sequence batched decode vs 4 separate M=1 decodes, see run_mbatch_test's own comment. */
     { const char*mv=getenv("QWEN_MBATCH_TEST"); if(mv && atoi(mv)){ run_mbatch_test(&m); return 0; } }
     /* QWEN_PREFILL_TEST=1: batched prefill test (codex_recs_1.md §22.38) -- chunked-M4 prefill
      * (prefill_chunk4) vs sequential per-token prefill, see run_prefill_test's own comment. */
     { const char*pv=getenv("QWEN_PREFILL_TEST"); if(pv && atoi(pv)){ run_prefill_test(&m); return 0; } }
-    /* QWEN_PREFILL_CHUNK (env var, same convention): batched prefill (codex_recs_1.md §22.38) --
+    /* QWEN_PREFILL_CHUNK (env var, same convention): batched prefill (codex_recs_1.md §22.38-39) --
      * chunked-M4 prefill (prefill_chunk4, 4 consecutive positions batched via the M-batch track's
-     * already-validated dense-layer M4 kernel) vs the sequential token-at-a-time baseline.
-     * Validated (QWEN_PREFILL_TEST=1, run_prefill_test): 96-100% per-position token agreement (no
-     * argmax-feedback compounding during prefill, unlike decode M-batch -- every position's input
-     * token is fixed by the prompt, not fed back from a possibly-different prediction, so the only
-     * divergence source is M4's own shared-scale quantization noise propagating through the KV
-     * cache), ~1.11-1.12x prefill speedup at N=16/19/128/512/1024, reproducible, no length-
-     * dependent degradation. Default 0 (sequential, byte-identical to every prior session) -- this
-     * has NOT yet been run through the full multi-prompt NLL/perplexity quality harness that gated
-     * router/swiglu's own promotion (codex_recs_1.md §22.15/22.20-21), so it stays an explicit
-     * opt-in pending that review rather than a promoted default. */
-    int g_prefill_chunk=0; { const char*pc=getenv("QWEN_PREFILL_CHUNK"); if(pc) g_prefill_chunk=atoi(pc); }
+     * already-validated dense-layer M4 kernel) vs the sequential token-at-a-time baseline. §22.38
+     * validated (QWEN_PREFILL_TEST=1): 96-100% per-position token agreement (no argmax-feedback
+     * compounding during prefill, unlike decode M-batch -- every position's input token is fixed by
+     * the prompt, not fed back from a possibly-different prediction, so the only divergence source
+     * is M4's own shared-scale quantization noise propagating through the KV cache), ~1.11-1.12x
+     * prefill speedup at N=16/19/128/512/1024, reproducible, no length-dependent degradation. §22.39
+     * then ran the full multi-prompt NLL/perplexity quality harness (QWEN_PREFILL_HARNESS=1),
+     * thresholds matching the router/SwiGLU promotions (§22.15/22.20-21): teacher-forced perplexity
+     * multiplier x1.0156 (<1.05 gate -- PASS), token divergence 3.3% (<15% -- PASS), real-text
+     * aggregate multiplier x0.9968 (<1.05 -- PASS), worst individual corpus x1.0130 (<1.10 -- PASS).
+     * A clean production A/B (2 paired trials/length, real CLI invocation, QWEN_CTXLEN=128/512/1024)
+     * confirmed ~10-12% real prefill speedup, decode bucket completely unaffected, and the actual
+     * first generated token bit-identical between configs at every length. **PROMOTED to default 1**
+     * (2026-07-28) -- `QWEN_PREFILL_CHUNK=0` remains the explicit sequential revert flag. */
+    int g_prefill_chunk=1; { const char*pc=getenv("QWEN_PREFILL_CHUNK"); if(pc) g_prefill_chunk=atoi(pc); }
 
     static int prompt[1536]; int np;
     if(ctxlen_req>0){ np=ctxlen_req; for(int i=0;i<np;i++) prompt[i]=hp9[i%113]; }

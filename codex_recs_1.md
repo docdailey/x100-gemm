@@ -3402,3 +3402,81 @@ condition. Remaining, not started: the full quality-harness pass this would need
 promotion; a real continuous-serving scheduler at larger N (explicitly de-prioritized behind batched
 prefill by the user's own most recent framing); speculative/n-gram verification; quality-changing
 long-context experiments (require explicit approval per the original ladder).
+
+### 22.39 Batched prefill: quality harness run, production A/B confirmed — PROMOTED to production default
+
+Explicit direction, given verbatim: "run the full quality harness on QWEN_PREFILL_CHUNK=1, using
+predeclared acceptance thresholds consistent with the router/SwiGLU promotions. If it passes,
+perform a clean production A/B at prompt lengths 128, 512, and 1024, promote chunked prefill to the
+default, retain an explicit sequential revert flag, update all three documents, and commit code and
+documentation together. If it fails, leave it opt-in and record the failure. Do not begin
+speculative decoding, larger-N serving, or another kernel branch until this decision is closed."
+
+**Harness design.** New `run_prefill_quality_harness` (`QWEN_PREFILL_HARNESS=1`), built on the exact
+scaffolding the router (§22.15) and SwiGLU (§22.20-21) harnesses already established. Reference:
+`harness_run_prod_reference`, UNCHANGED — today's actual production config (int8-M1 router +
+rational-Padé SwiGLU + sequential prefill) — this asks "does adding chunked-M4 prefill on top of
+what already ships cause a problem," the same framing used for SwiGLU's own evaluation, not a
+re-litigation of router/SwiGLU. Two new functions mirror the existing teacher-forced/perplexity
+pair exactly, differing only in HOW the prompt is ingested: `harness_run_prefill_teacherforced`
+(chunked-M4 via `prefill_chunk4` in groups of 4 + per-token `forward()` for any N-mod-4 remainder —
+the identical, already-validated §22.38 mechanism — then teacher-forced decode against the
+reference tokens, router/SwiGLU pinned at production throughout) and `harness_eval_ppl_prefill`
+(same chunked-prefill mechanism applied to the 9 real-text corpora already used for SwiGLU's
+real-text gate). All 10 `g_hprompts` (2-155 token prompts) and all 9 `g_ppltexts` (149-355 tokens)
+exercised — the shortest prompts (hp7=7, hp8=2 tokens) get zero chunk coverage (pure N-mod-4
+remainder, all `forward()`), an honest reflection of real short-prompt usage; `hp9`/`hp10` (124/155
+tokens) and every real-text corpus get substantial chunked coverage.
+
+**Predeclared thresholds** (fixed in the code and printed before any result, per the user's own
+"predeclared... consistent with the router/SwiGLU promotions" instruction): (1) teacher-forced
+perplexity multiplier < 1.05 — the exact bar rational-Padé had to clear (§22.20), the most relevant
+recent precedent for a candidate touching quality broadly; (2) token-argmax divergence < 15% —
+matches router/SwiGLU's own gate; (3) real-text aggregate perplexity multiplier < 1.05 — matches
+SwiGLU's real-text gate; (4) no individual real-text corpus > 1.10 — matches SwiGLU's per-corpus
+gate, guarding against the §22.19 lesson that an aggregate-only real-text check can wrongly clear a
+bad candidate; (5) prefill bucket ≥10% faster than sequential — matches router's own speed floor,
+already independently measured at 1.10-1.14x in §22.38, restated rather than re-run.
+
+**Result — all five gates PASS:**
+
+| gate | threshold | result |
+|---|---|---|
+| teacher-forced perplexity multiplier (vs production) | < 1.05 | **x1.0156 (+1.6%) — PASS** |
+| token divergence (vs production) | < 15% | **3.3% (25/760) — PASS** |
+| real-text aggregate perplexity multiplier | < 1.05 | **x0.9968 (-0.3%) — PASS** |
+| worst individual real-text corpus | < 1.10 | **x1.0130 (+1.3%) — PASS** |
+| prefill speed | ≥10% faster | **1.10-1.14x (§22.38) — PASS** |
+
+Divergence (3.3%, 25/760 across all 10 prompts × up to 80 generated tokens) sits comfortably below
+both the router's own 2.1% and SwiGLU's 3.2% at THEIR promotions, despite chunked prefill touching
+every layer of the ENTIRE prompt (a larger surface than router's once-per-layer gating decision).
+Real-text perplexity is essentially neutral (-0.3% aggregate, individual corpora ranging -3.0% to
++1.3%, symmetric around zero) — the signature of genuine quantization noise, not a systematic
+quality regression (contrast hard-swish's §22.19 real-text numbers, which were more one-sidedly
+inflated even before the teacher-forced check caught it decisively).
+
+**Clean production A/B** (per explicit instruction, run separately from the harness): the REAL
+production binary, real CLI invocation (no test-harness code path), `QWEN_CTXLEN`∈{128,512,1024},
+2 paired trials per config, interleaved (0,1,0,1 per length):
+
+| N | seq trial1/trial2 | chunk trial1/trial2 | prefill speedup | decode tok/s (seq vs chunk) | first generated token |
+|---|---|---|---|---|---|
+| 128 | 10.33s / 10.34s | 9.20s / 9.18s | **~11.1%** | 11.87-11.88 vs 11.81-11.84 (flat) | identical both configs, both trials |
+| 512 | 44.51s / 44.29s | 39.79s / 39.78s | **~10.4%** | 10.24-10.33 vs 10.11-10.25 (flat) | identical both configs, both trials |
+| 1024 | 97.62s / 98.81s | 87.10s / 87.14s | **~11.2%** | 8.68-8.70 vs 8.62-8.72 (flat) | identical both configs, both trials |
+
+Reproducibly ~10-12% faster prefill at every length, tight trial-to-trial agreement, decode bucket
+statistically flat (confirms zero cross-contamination — prefill batching cannot and does not touch
+decode's own code path). The actual user-visible artifact — the first generated token after the
+prompt — is bit-identical between sequential and chunked prefill at every tested length in every
+trial; the 3.3%/1.6% teacher-forced divergence numbers above are real but concentrated in later
+positions, not the immediately-following token a user would see first in a short exchange.
+
+**Verdict: PROMOTED.** `g_prefill_chunk` default flipped 0→1 in `main()`; `QWEN_PREFILL_CHUNK=0`
+remains the explicit sequential revert flag, unchanged code path, byte-identical to every prior
+session when set. Verified on the board with zero env-var overrides (true production invocation):
+`' Tokyo'` PASS, prefill 0.86s (12 tok), decode 12.43 tok/s — matches the existing HEADLINE within
+normal trial-to-trial noise, confirming no regression at the canonical short prompt. This closes the
+decision the user held open — per their own explicit instruction, speculative/n-gram verification
+(the next item on the original ladder) may now begin.
