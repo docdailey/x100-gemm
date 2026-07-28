@@ -1055,6 +1055,11 @@ static int g_scratch_align=0;
  * comment for why partial 2-3-way overlaps are deliberately not padded-and-batched). File-scope so
  * run_mbatch_test can read and report them after a full run. */
 static long g_moe4_hits=0, g_moe4_total_expert_slots=0;
+static int g_prefill_moe4=1; /* QWEN_PREFILL_MOE4=0: ablation for prefill_chunk4 only (does NOT
+    affect forward4_dense_batch/decode) -- forces the ecount==4 MoE-FFN M4 path off, isolating how
+    much of batched prefill's speedup comes from dense-layer batching alone vs the expert-FFN
+    grouping on top, matching how milestones 2 vs 3 separated the same two contributions for
+    decode. Default 1 (both mechanisms on, the real production/benchmark configuration). */
 static long g_moe_ecount_hist[5]={0,0,0,0,0}; /* histogram of ecount[e] in {0,1,2,3,4} across every
     expert/layer/decode-step visited -- diagnostic only, answers whether PARTIAL overlap (2-3 of 4
     sequences picking the same expert) is common enough to be worth a future padded-M4 batching
@@ -1713,6 +1718,145 @@ static void forward4_dense_batch(Model*m,int tok[4],int pos[4],Kv*kv[4],float*lo
     lin_mm_hp_m4(&m->lm,Abuf4,y4lm);
     for(int s=0;s<4;s++) memcpy(logits[s],y4lm+s*m->lm.N,(size_t)m->lm.N*4);
 }
+
+/* Batched prefill track (codex_recs_1.md §22.38): batches the DENSE layers (QKV, O, router,
+ * lm_head) across 4 CONSECUTIVE positions of one prompt/sequence via the same validated M4 kernel
+ * used for decode-phase M-batching (§22.35-37), instead of the current token-at-a-time prefill
+ * (N sequential forward() calls). Unlike decode's M-batch, all 4 positions' input tokens are known
+ * upfront from the prompt -- no cross-position autoregressive dependency for the dense layers, so
+ * batching them is a strictly simpler case than decode's own (there, 4 independent sequences had
+ * to genuinely coexist; here, 4 positions of the SAME known prompt trivially do).
+ *
+ * Attention stays per-position, exact, UNBATCHED this milestone -- a genuine flash-attention-style
+ * tiled/blocked causal computation (sharing K/V reads across the 4 chunk positions) is a separate,
+ * larger undertaking with its own numerical-tiling risk, deliberately not attempted here, matching
+ * the same "batch what clearly batches, defer the harder fused piece" scoping used for decode's
+ * own dense-vs-expert split. Correctness of the per-position split is straightforward: each
+ * position's own K/V depends only on that position's own (now M4-batched) QKV output, not on any
+ * OTHER position in the chunk, so all 4 positions' K/V can be written into the cache up front; each
+ * position's own attention then reads with its OWN correct causal bound (`j<=pos0+i`), which is
+ * exactly equivalent to writing+attending one position at a time -- the causal bound alone
+ * guarantees position pos0+i's attention never reads position pos0+i+1..3's K/V, independent of
+ * whether that later K/V happens to already be present in memory.
+ *
+ * MoE expert FFN stays per-position via the existing M1 path, same reasoning as decode's own
+ * scoping (§22.37): each position's own router, from its own hidden state, generally selects a
+ * different expert set; whether WITHIN-sequence positions (which share context/content, unlike
+ * decode's independent sequences) show meaningfully more expert-selection overlap than across-
+ * sequence decode did is an open, checkable question, deferred to this milestone's own measurement
+ * report rather than assumed. */
+static void prefill_chunk4(Model*m,const int toks[4],int pos0,Kv*kv,float*logits[4],
+        float*h[4],float*hn[4],float*q[4],float*k[4],float*vv[4],float*att[4],float*tmp[4],
+        float*g[4],float*u[4],float*eout[4],uint8_t*Abuf[4],uint8_t*Abuf4,uint8_t*Abuf2_4){
+    int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
+    for(int i=0;i<4;i++) memcpy(h[i],m->tok_embd+(size_t)toks[i]*d,d*4);
+    float cosb[4][256],sinb[4][256];
+    for(int i=0;i<4;i++) rope_table(cosb[i],sinb[i],hd,pos0+i,m->rope_base); /* absolute position,
+        NOT chunk-relative -- rope angle depends on the token's real position in the sequence. */
+    static float *y4q=NULL,*y4k=NULL,*y4v=NULL,*y4o=NULL,*y4r=NULL,*y4lm=NULL,*y4eg=NULL,*y4eu=NULL,*y4ed=NULL;
+    if(!y4q){ int maxqkv=nh*hd>nkv*hd?nh*hd:nkv*hd; y4q=malloc((size_t)4*maxqkv*4); y4k=malloc((size_t)4*maxqkv*4); y4v=malloc((size_t)4*maxqkv*4);
+        y4o=malloc((size_t)4*d*4); y4r=malloc((size_t)4*256*4); y4lm=malloc((size_t)4*(size_t)m->vocab*4);
+        y4eg=malloc((size_t)4*moe*4); y4eu=malloc((size_t)4*moe*4); y4ed=malloc((size_t)4*d*4); }
+
+    for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
+        for(int i=0;i<4;i++) rmsnorm(hn[i],h[i],ly->attn_norm,d,m->eps);
+        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+        lin_mm_hp_m4(&ly->q,Abuf4,y4q); lin_mm_hp_m4(&ly->k,Abuf4,y4k); lin_mm_hp_m4(&ly->v,Abuf4,y4v);
+        for(int i=0;i<4;i++){ memcpy(q[i],y4q+i*ly->q.N,ly->q.N*4); memcpy(k[i],y4k+i*ly->k.N,ly->k.N*4); memcpy(vv[i],y4v+i*ly->v.N,ly->v.N*4); }
+        for(int i=0;i<4;i++){
+            for(int hh=0;hh<nh;hh++){ rmsnorm(q[i]+hh*hd,q[i]+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q[i]+hh*hd,hd,cosb[i],sinb[i]); }
+            for(int hh=0;hh<nkv;hh++){ rmsnorm(k[i]+hh*hd,k[i]+hh*hd,ly->k_norm,hd,m->eps); rope_apply(k[i]+hh*hd,hd,cosb[i],sinb[i]); }
+        }
+        int kvd_s=nkv*hd;
+        float*Kc=kv->Kc+(size_t)l*kv->ctx*kvd_s,*Vc=kv->Vc+(size_t)l*kv->ctx*kvd_s;
+        for(int i=0;i<4;i++){
+            int pos=pos0+i;
+            if(pos<0 || pos>=kv->ctx){ fprintf(stderr,"KV position overflow: pos=%d ctx=%d\n",pos,kv->ctx); abort(); }
+            for(int kvh=0;kvh<nkv;kvh++){
+                memcpy(Kc+(size_t)kvh*kv->ctx*hd+(size_t)pos*hd, k[i]+(size_t)kvh*hd, hd*4);
+                memcpy(Vc+(size_t)kvh*kv->ctx*hd+(size_t)pos*hd, vv[i]+(size_t)kvh*hd, hd*4);
+            }
+        }
+        float scale=1.0f/sqrtf(hd);
+        for(int i=0;i<4;i++){
+            /* exact per-position causal attention, unbatched -- see this function's own top
+             * comment for why. The pos bound alone guarantees correctness even though positions
+             * pos0+i+1..pos0+3's K/V are already resident in the cache by this point. */
+            int pos=pos0+i;
+            if(g_attn_nt<=1){
+                for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q[i]+hh*hd,*sc=tmp[i];
+                    float*Kh=Kc+(size_t)kvh*kv->ctx*hd,*Vh=Vc+(size_t)kvh*kv->ctx*hd;
+                    for(int j=0;j<=pos;j++){ float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
+                    softmax(sc,pos+1);
+                    float*oh=att[i]+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+                    for(int j=0;j<=pos;j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); } }
+            } else {
+                attn_dispatch(q[i],Kc,Vc,att[i],pos,scale,hd,nkv,gpr,kv->ctx,g_attn_nt);
+            }
+        }
+        pack_act_hp_m4(att[0],att[1],att[2],att[3],ly->o.K,Abuf4);
+        lin_mm_hp_m4(&ly->o,Abuf4,y4o);
+        for(int i=0;i<4;i++){ for(int t=0;t<d;t++) h[i][t]+=y4o[i*ly->o.N+t]; }
+        for(int i=0;i<4;i++) rmsnorm(hn[i],h[i],ly->ffn_norm,d,m->eps);
+        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+        int sel[4][32]; float sw[4][32];
+        if(g_router_mode==1) lin_mm_hp_m4(&ly->router_hp,Abuf4,y4r);
+        else if(g_router_mode==2){
+            for(int i=0;i<4;i++){ uint8_t Ai8[3000]; pack_act_i8(hn[i],d,Ai8); lin_mm_i8(&ly->router_i8,Ai8,y4r+i*ly->router_i8.N,nt); }
+        } else {
+            for(int i=0;i<4;i++) for(int e=0;e<ne;e++) y4r[i*ne+e]=vdot_f32(ly->router+(size_t)e*d,hn[i],d);
+        }
+        for(int i=0;i<4;i++){
+            float rl[256]; memcpy(rl,y4r+i*ne,(size_t)ne*4); softmax(rl,ne);
+            for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[i][b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[i][a]=bi; sw[i][a]=bv; }
+            float ssum=0; for(int a=0;a<na;a++)ssum+=sw[i][a]; for(int a=0;a<na;a++)sw[i][a]/=ssum;
+        }
+        /* MoE expert FFN: same exact-4-way-overlap batching as decode's own §22.37, plus the same
+         * per-sequence (here, per-position) M1 fallback for everything else. Reuses the identical
+         * grouping logic; see forward4_dense_batch's own MoE-FFN comment for the full rationale. */
+        int esel[128][4]; int ecount[128];
+        for(int e=0;e<ne;e++){ ecount[e]=0; for(int i=0;i<4;i++) esel[e][i]=-1; }
+        for(int i=0;i<4;i++) for(int a=0;a<na;a++){ int e=sel[i][a]; esel[e][i]=a; ecount[e]++; }
+        int processed[4][32]={{0}};
+        for(int i=0;i<4;i++) for(int t=0;t<d;t++)eout[i][t]=0;
+        for(int e=0;e<ne;e++){
+            g_moe4_total_expert_slots += ecount[e]>0 ? 1 : 0;
+            g_moe_ecount_hist[ecount[e]]++;
+            if(ecount[e]!=4 || !g_prefill_moe4) continue;
+            g_moe4_hits++;
+            pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+            lin_mm_hp_m4(&ly->eg[e],Abuf4,y4eg); lin_mm_hp_m4(&ly->eu[e],Abuf4,y4eu);
+            for(int i=0;i<4;i++){
+                float*gs=y4eg+(size_t)i*moe,*us=y4eu+(size_t)i*moe;
+                if(g_swiglu_fast==1) swiglu_hswish_rvv(gs,us,moe);
+                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(gs,us,moe);
+                else swiglu_exact(gs,us,moe);
+            }
+            pack_act_hp_m4(y4eg+0*(size_t)moe,y4eg+1*(size_t)moe,y4eg+2*(size_t)moe,y4eg+3*(size_t)moe,moe,Abuf4);
+            lin_mm_hp_m4(&ly->ed[e],Abuf4,y4ed);
+            for(int i=0;i<4;i++){
+                int a=esel[e][i]; float w=sw[i][a];
+                for(int t=0;t<d;t++) eout[i][t]+=w*y4ed[i*ly->ed[e].N+t];
+                processed[i][a]=1;
+            }
+        }
+        for(int i=0;i<4;i++) pack_act_hp(hn[i],d,Abuf2_4+(size_t)i*3000);
+        for(int i=0;i<4;i++){
+            for(int a=0;a<na;a++){ if(processed[i][a]) continue; int e=sel[i][a]; float w=sw[i][a];
+                lin_mm_hp(&ly->eg[e],Abuf2_4+(size_t)i*3000,g[i],nt); lin_mm_hp(&ly->eu[e],Abuf2_4+(size_t)i*3000,u[i],nt);
+                if(g_swiglu_fast==1) swiglu_hswish_rvv(g[i],u[i],moe);
+                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(g[i],u[i],moe);
+                else swiglu_exact(g[i],u[i],moe);
+                lin_mm(&ly->ed[e],g[i],tmp[i],nt,Abuf[i]);
+                for(int t=0;t<d;t++)eout[i][t]+=w*tmp[i][t]; }
+            for(int t=0;t<d;t++)h[i][t]+=eout[i][t];
+        }
+    }
+    for(int i=0;i<4;i++) rmsnorm(hn[i],h[i],m->out_norm,d,m->eps);
+    pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+    lin_mm_hp_m4(&m->lm,Abuf4,y4lm);
+    for(int i=0;i<4;i++) memcpy(logits[i],y4lm+i*m->lm.N,(size_t)m->lm.N*4);
+}
 static int argmax(const float*l,int n){ int b=0; float bv=l[0]; for(int i=1;i<n;i++)if(l[i]>bv){bv=l[i];b=i;} return b; }
 
 static uint8_t g_bdec[0x200]; static int g_bi=0;
@@ -2337,6 +2481,108 @@ static void run_mbatch_test(Model*m){
     free(Abuf4buf); free(Abuf2_4);
 }
 
+/* Batched prefill (codex_recs_1.md §22.38), QWEN_PREFILL_TEST=1: validates and benchmarks
+ * prefill_chunk4 (4-consecutive-position dense-layer M4 batching within ONE sequence) against the
+ * existing token-at-a-time sequential prefill (repeated forward() calls), per the ladder's own
+ * explicit requirement: "Benchmark prompt lengths 128/512/1024. Preserve exact causal masking and
+ * compare logits against sequential prefill." Test lengths: 16 (short, matches this whole session's
+ * own short/128/512/1024 A/B convention), 128/512/1024 (the explicitly required lengths), and 19 --
+ * deliberately NOT a multiple of 4, included specifically to exercise and validate the N-mod-4
+ * remainder fallback path (the other four lengths are all exact multiples of 4, so alone they'd
+ * never touch that code path). Prompts synthesized via the same hp9-tiling convention already
+ * established for QWEN_CTXLEN benchmarks (prompt[i]=hp9[i%113]).
+ *
+ * Unlike the decode M-batch milestones (codex_recs_1.md §22.35-37), prefill has NO argmax-choice
+ * compounding: every position's input token is fixed by the prompt itself, not fed back from a
+ * possibly-different model prediction, so the divergence source here is purely M4's own per-chunk
+ * shared-scale quantization noise (plus its ordinary propagation through the KV cache into later
+ * positions' attention) -- expected to be much smaller than milestone 2's 70.31% figure, and this
+ * harness reports the real number rather than assuming it. */
+static void run_prefill_test(Model*m){
+    const int TESTLENS[]={16,19,128,512,1024}; int NLEN=5;
+    /* QWEN_PREFILL_SANITIZE=1: caps the length sweep at N=512 -- sanitizer runs are slow (ASan
+     * especially), and N=1024 exercises the exact same code paths as N=512 (same chunked/remainder
+     * structure, just more repetitions), so it adds runtime without adding memory-safety coverage.
+     * Not used for the real speed benchmark, only to bound sanitizer wall-clock time. */
+    { const char*sz=getenv("QWEN_PREFILL_SANITIZE"); if(sz && atoi(sz)) NLEN=4; }
+    { const char*pm=getenv("QWEN_PREFILL_MOE4"); if(pm) g_prefill_moe4=atoi(pm); }
+    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
+    int maxk4=qd>d?qd:d;
+    static int prompt[1536];
+    for(int L=0;L<NLEN;L++){
+        int np=TESTLENS[L]; for(int i=0;i<np;i++) prompt[i]=hp9[i%113];
+        int ctx=np+4;
+
+        /* --- Path 1: sequential exact prefill, own Kv/buffers, the already-proven forward() path --- */
+        Kv kv1; kv1.kvd=m->nkv*m->hd; kv1.ctx=ctx; kv1.Kc=calloc((size_t)m->nl*ctx*kv1.kvd,4); kv1.Vc=calloc((size_t)m->nl*ctx*kv1.kvd,4);
+        float*hn1=malloc(d*4),*q1=malloc(qd*4),*k1=malloc(kv1.kvd*4),*vv1=malloc(kv1.kvd*4),*att1=malloc(qd*4),
+             *tmp1=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*g1=malloc(moe*4),*u1=malloc(moe*4),*eout1=malloc(d*4),*logits1=malloc((size_t)m->vocab*4);
+        uint8_t*Abuf1=malloc((size_t)(maxk/256)*AREC),*Abuf1b=malloc((size_t)(maxk/256)*AREC);
+        static int argmax1[1536];
+        double t1_0=now();
+        for(int p=0;p<np;p++){ forward(m,prompt[p],p,&kv1,logits1,hn1,q1,k1,vv1,att1,tmp1,g1,u1,eout1,Abuf1,Abuf1b); argmax1[p]=argmax(logits1,m->vocab); }
+        double t1=now()-t1_0;
+        static float flogits1[160000]; memcpy(flogits1,logits1,(size_t)m->vocab*4);
+
+        /* --- Path 2: chunked M4 prefill (4 consecutive positions at a time) + remainder fallback --- */
+        Kv kv2; kv2.kvd=m->nkv*m->hd; kv2.ctx=ctx; kv2.Kc=calloc((size_t)m->nl*ctx*kv2.kvd,4); kv2.Vc=calloc((size_t)m->nl*ctx*kv2.kvd,4);
+        float*h2[4],*hn2[4],*q2[4],*k2[4],*vv2[4],*att2[4],*tmp2[4],*g2[4],*u2[4],*eout2[4],*logits2[4]; uint8_t*Abuf2arr[4];
+        for(int s=0;s<4;s++){
+            h2[s]=malloc(d*4); hn2[s]=malloc(d*4); q2[s]=malloc(qd*4); k2[s]=malloc(kv2.kvd*4); vv2[s]=malloc(kv2.kvd*4);
+            att2[s]=malloc(qd*4); tmp2[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
+            g2[s]=malloc(moe*4); u2[s]=malloc(moe*4); eout2[s]=malloc(d*4); logits2[s]=malloc((size_t)m->vocab*4);
+            Abuf2arr[s]=malloc((size_t)(maxk/256)*AREC);
+        }
+        uint8_t*Abuf4buf=malloc((size_t)(maxk4/256)*AREC_M4);
+        uint8_t*Abuf2_4=malloc((size_t)4*3000);
+        static int argmax2[1536];
+        long moe4_hits0=g_moe4_hits, moe4_slots0=g_moe4_total_expert_slots;
+        long hist0[5]; for(int i=0;i<5;i++) hist0[i]=g_moe_ecount_hist[i];
+        int nchunks=np/4, rem=np%4;
+        double t2_0=now();
+        for(int c=0;c<nchunks;c++){
+            int toks4[4]; for(int i=0;i<4;i++) toks4[i]=prompt[c*4+i];
+            prefill_chunk4(m,toks4,c*4,&kv2,logits2,h2,hn2,q2,k2,vv2,att2,tmp2,g2,u2,eout2,Abuf2arr,Abuf4buf,Abuf2_4);
+            for(int i=0;i<4;i++) argmax2[c*4+i]=argmax(logits2[i],m->vocab);
+        }
+        for(int r=0;r<rem;r++){
+            int p=nchunks*4+r;
+            forward(m,prompt[p],p,&kv2,logits2[0],hn2[0],q2[0],k2[0],vv2[0],att2[0],tmp2[0],g2[0],u2[0],eout2[0],Abuf2arr[0],Abuf2_4);
+            argmax2[p]=argmax(logits2[0],m->vocab);
+        }
+        double t2=now()-t2_0;
+        static float flogits2[160000];
+        if(rem>0) memcpy(flogits2,logits2[0],(size_t)m->vocab*4); else memcpy(flogits2,logits2[3],(size_t)m->vocab*4);
+
+        long match=0; for(int p=0;p<np;p++) if(argmax1[p]==argmax2[p]) match++;
+        double fmax=0,fsum=0; for(int e=0;e<m->vocab;e++){ double ad=fabs((double)flogits1[e]-(double)flogits2[e]); if(ad>fmax)fmax=ad; fsum+=ad; }
+
+        printf("\n=== batched prefill test: N=%d (%d M4 chunks + %d remainder tokens) ===\n", np, nchunks, rem);
+        printf("token agreement (chunked-M4 vs sequential, argmax over all %d positions): %ld/%d (%.2f%%)\n", np, match, np, 100.0*match/np);
+        printf("final-position logits: max_abs_diff=%e mean_abs_diff=%e (%d comparisons) -- expected small, nonzero (M4's shared-scale quantization, not a bug)\n",
+            fmax, fsum/m->vocab, m->vocab);
+        printf("sequential prefill: %.3fs (%.1f tok/s) | chunked-M4 prefill: %.3fs (%.1f tok/s) | speedup: %.3fx\n",
+            t1, np/t1, t2, np/t2, t1/t2);
+        if(nchunks>0){
+            long h1=g_moe_ecount_hist[1]-hist0[1],h2c=g_moe_ecount_hist[2]-hist0[2],h3=g_moe_ecount_hist[3]-hist0[3],h4=g_moe_ecount_hist[4]-hist0[4];
+            long tot=h1+h2c+h3+h4;
+            printf("MoE expert-FFN 4-way overlap WITHIN this prefill chunk sequence: %ld/%ld expert-slots (%.2f%%) -- count=1:%ld(%.2f%%) count=2:%ld(%.2f%%) count=3:%ld(%.2f%%) count=4:%ld(%.2f%%)\n",
+                g_moe4_hits-moe4_hits0, g_moe4_total_expert_slots-moe4_slots0,
+                (g_moe4_total_expert_slots-moe4_slots0)>0?100.0*(g_moe4_hits-moe4_hits0)/(g_moe4_total_expert_slots-moe4_slots0):0.0,
+                h1,tot>0?100.0*h1/tot:0.0, h2c,tot>0?100.0*h2c/tot:0.0, h3,tot>0?100.0*h3/tot:0.0, h4,tot>0?100.0*h4/tot:0.0);
+        }
+        fflush(stdout); /* under ASan, LeakSanitizer's atexit-time report can call a raw _exit()
+            that skips normal stdio flushing -- without this, a real crash or a leak-detector exit
+            partway through the length sweep would silently discard every printf above it, exactly
+            the failure mode that hid this harness's own real output on its first sanitizer run. */
+
+        for(int s=0;s<4;s++){ free(h2[s]);free(hn2[s]);free(q2[s]);free(k2[s]);free(vv2[s]);free(att2[s]);free(tmp2[s]);free(g2[s]);free(u2[s]);free(eout2[s]);free(logits2[s]);free(Abuf2arr[s]); }
+        free(Abuf4buf); free(Abuf2_4); free(kv2.Kc); free(kv2.Vc);
+        free(hn1);free(q1);free(k1);free(vv1);free(att1);free(tmp1);free(g1);free(u1);free(eout1);free(logits1);free(Abuf1);free(Abuf1b);
+        free(kv1.Kc); free(kv1.Vc);
+    }
+}
+
 int main(int c,char**v){
     if(c<2){ printf("usage: %s model.gguf [ngen] [nt]\n",v[0]); return 1; }
     int ngen=(c>2)?atoi(v[2]):16, nt=(c>3)?atoi(v[3]):4;
@@ -2450,12 +2696,54 @@ int main(int c,char**v){
     /* QWEN_MBATCH_TEST=1: M-batch track milestone 1 test (codex_recs_1.md §22.35) -- real 4-
      * sequence batched decode vs 4 separate M=1 decodes, see run_mbatch_test's own comment. */
     { const char*mv=getenv("QWEN_MBATCH_TEST"); if(mv && atoi(mv)){ run_mbatch_test(&m); return 0; } }
+    /* QWEN_PREFILL_TEST=1: batched prefill test (codex_recs_1.md §22.38) -- chunked-M4 prefill
+     * (prefill_chunk4) vs sequential per-token prefill, see run_prefill_test's own comment. */
+    { const char*pv=getenv("QWEN_PREFILL_TEST"); if(pv && atoi(pv)){ run_prefill_test(&m); return 0; } }
+    /* QWEN_PREFILL_CHUNK (env var, same convention): batched prefill (codex_recs_1.md §22.38) --
+     * chunked-M4 prefill (prefill_chunk4, 4 consecutive positions batched via the M-batch track's
+     * already-validated dense-layer M4 kernel) vs the sequential token-at-a-time baseline.
+     * Validated (QWEN_PREFILL_TEST=1, run_prefill_test): 96-100% per-position token agreement (no
+     * argmax-feedback compounding during prefill, unlike decode M-batch -- every position's input
+     * token is fixed by the prompt, not fed back from a possibly-different prediction, so the only
+     * divergence source is M4's own shared-scale quantization noise propagating through the KV
+     * cache), ~1.11-1.12x prefill speedup at N=16/19/128/512/1024, reproducible, no length-
+     * dependent degradation. Default 0 (sequential, byte-identical to every prior session) -- this
+     * has NOT yet been run through the full multi-prompt NLL/perplexity quality harness that gated
+     * router/swiglu's own promotion (codex_recs_1.md §22.15/22.20-21), so it stays an explicit
+     * opt-in pending that review rather than a promoted default. */
+    int g_prefill_chunk=0; { const char*pc=getenv("QWEN_PREFILL_CHUNK"); if(pc) g_prefill_chunk=atoi(pc); }
 
     static int prompt[1536]; int np;
     if(ctxlen_req>0){ np=ctxlen_req; for(int i=0;i<np;i++) prompt[i]=hp9[i%113]; }
     else { int base[]={785,6722,315,9625,374,12095,13,576,6722,315,6323,374}; np=12; memcpy(prompt,base,sizeof(base)); }
     double tp=now(); int first=0;
-    for(int p=0;p<np;p++){ forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); if(p==np-1)first=argmax(logits,m.vocab); }
+    if(g_prefill_chunk){
+        float*h4[4],*hn4[4],*q4[4],*k4[4],*vv4[4],*att4[4],*tmp4[4],*g4[4],*u4[4],*eout4[4],*logits4[4]; uint8_t*Abuf4arr[4];
+        for(int s=0;s<4;s++){
+            h4[s]=malloc(d*4); hn4[s]=malloc(d*4); q4[s]=malloc(qd*4); k4[s]=malloc(kv.kvd*4); vv4[s]=malloc(kv.kvd*4);
+            att4[s]=malloc(qd*4); tmp4[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
+            g4[s]=malloc(moe*4); u4[s]=malloc(moe*4); eout4[s]=malloc(d*4); logits4[s]=malloc((size_t)m.vocab*4);
+            Abuf4arr[s]=malloc((size_t)(maxk/256)*AREC);
+        }
+        int maxk4b=qd>d?qd:d;
+        uint8_t*Abuf4buf=malloc((size_t)(maxk4b/256)*AREC_M4);
+        uint8_t*Abuf2_4=malloc((size_t)4*3000);
+        int nchunks=np/4, rem=np%4;
+        for(int c=0;c<nchunks;c++){
+            int toks4[4]; for(int i=0;i<4;i++) toks4[i]=prompt[c*4+i];
+            prefill_chunk4(&m,toks4,c*4,&kv,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
+            if(c==nchunks-1 && rem==0){ memcpy(logits,logits4[3],(size_t)m.vocab*4); first=argmax(logits,m.vocab); }
+        }
+        for(int r=0;r<rem;r++){
+            int p=nchunks*4+r;
+            forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+            if(p==np-1) first=argmax(logits,m.vocab);
+        }
+        for(int s=0;s<4;s++){ free(h4[s]);free(hn4[s]);free(q4[s]);free(k4[s]);free(vv4[s]);free(att4[s]);free(tmp4[s]);free(g4[s]);free(u4[s]);free(eout4[s]);free(logits4[s]);free(Abuf4arr[s]); }
+        free(Abuf4buf); free(Abuf2_4);
+    } else {
+        for(int p=0;p<np;p++){ forward(&m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2); if(p==np-1)first=argmax(logits,m.vocab); }
+    }
     int echo_np=np<=64?np:64; /* QWEN_CTXLEN can make np huge (1024+); don't spam the log */
     printf("\nprompt      : "); for(int i=0;i<echo_np;i++)tok_print(&g,prompt[i]); if(np>echo_np)printf(" ...(%d more)",np-echo_np);
     printf("\nfirst argmax: %d ('",first); tok_print(&g,first); printf("')  expect 26194 (' Tokyo') -> %s%s\n", first==26194?"PASS":"FAIL", ctxlen_req>0?" (ctxlen test: mismatch expected, prompt isn't the capitals prompt)":"");

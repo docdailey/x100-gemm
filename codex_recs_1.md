@@ -3260,3 +3260,145 @@ specific to N=4, not necessarily to expert-batching as an idea — but building 
 at a larger, more production-realistic N is a separate, larger undertaking (a real multi-request
 serving loop, not a fixed hand-constructed batch) not attempted here. `g_moe4_hits`/
 `g_moe_ecount_hist` remain in the code as a reusable diagnostic for any future N.
+
+### 22.38 Batched prefill: chunked-M4 prefill within one sequence — KEPT as validated opt-in, NOT yet promoted to production default
+
+Explicit direction after the M-batch track closed: "Next credible track is batched prefill or a
+real continuous-serving scheduler with larger N. For user-perceived speed, batched prefill is the
+higher priority; larger-N serving primarily targets aggregate multi-user throughput." Per the
+original ladder instruction's own framing of this track: "Replace token-at-a-time prompt ingestion
+with tiled causal prefill using multi-row kernels. Benchmark prompt lengths 128/512/1024. Preserve
+exact causal masking and compare logits against sequential prefill."
+
+**Design.** Unlike decode M-batching (milestones 1-3), which needs multiple genuinely independent
+concurrent sequences to have anything to batch, prefill's own N tokens are all known upfront from
+the prompt — no cross-position autoregressive dependency exists for the dense layers. This reframes
+M-batching as batching across 4 CONSECUTIVE POSITIONS of ONE sequence's own prompt, not across 4
+independent sequences. Scoped identically to the decode milestones: dense layers (QKV, O, router,
+lm_head) batched via the already-validated M4 kernel/`pack_act_hp_m4`/`lin_mm_hp_m4` path; attention
+stays per-position, exact, unbatched (a flash-attention-style tiled causal computation sharing K/V
+reads across the chunk is a separate, larger, deferred undertaking); MoE expert FFN uses the same
+same-expert-4-way-grouping mechanism milestone 3 built, reused as-is (see measurement below for why
+this reuse mattered). Correctness of the per-position split: each position's own K/V depends only on
+its own (now M4-batched) QKV output, not on any other position in the chunk, so all 4 positions' K/V
+can be written into the cache before any of the 4 positions' attention runs — each position's own
+attention then reads with its own correct causal bound (`j<=pos0+i`), exactly equivalent to
+writing+attending one position at a time, since the causal bound alone (not whether later-chunk K/V
+happens to already be resident) determines what a given position's attention can see.
+
+**Implementation.** `prefill_chunk4(Model*m, const int toks[4], int pos0, Kv*kv, float*logits[4],
+...)` — one `Kv`, one `pos0` (base position of the 4-token chunk), tokens read directly from the
+known prompt. Per-position RoPE tables computed from each position's own ABSOLUTE position
+(`pos0+i`), not chunk-relative. Mirrors `forward4_dense_batch`'s per-layer structure closely by
+design (dense M4 dispatch → per-position K/V write → per-position attention → M4 O-projection →
+M4 router → milestone-3-style expert grouping/fallback → final M4 lm_head), to minimize the risk of
+introducing new bugs relative to the already-validated milestone 2/3 code. `run_prefill_test`
+(`QWEN_PREFILL_TEST=1`) validates and benchmarks at N∈{16, 19, 128, 512, 1024} — 16 matches this
+session's short/128/512/1024 A/B convention; 19 is deliberately NOT a multiple of 4, included
+specifically to exercise the N-mod-4 remainder fallback (the other four lengths are all exact
+multiples of 4 and alone would never touch that code path); 128/512/1024 are the explicitly required
+lengths. Prompts synthesized via the same `hp9`-tiling convention already established for
+`QWEN_CTXLEN` benchmarks. Wired into the actual production prefill loop in `main()` behind a new
+`QWEN_PREFILL_CHUNK` env var (default 0, sequential — byte-identical to every prior session);
+`QWEN_PREFILL_CHUNK=1` selects the chunked path, correctly falling back to per-token `forward()` for
+any final `N mod 4` remainder tokens.
+
+**A real bug found and fixed before any valid result: wrong invocation, not a code bug.** The
+harness's first run crashed 100% reproducibly (SIGSEGV, exit 139) with zero program output — even
+before "loaded from cache" would print. Root-caused via `dmesg`'s fault-address report plus a `-g`
+debug rebuild and `addr2line`: the crash was inside `gguf_open`'s `U32()` field parser, called from
+`main()`, NOT anywhere in `prefill_chunk4`/`run_prefill_test`. Cause: the invocation passed the
+`.imecache` path as `argv[1]` (the slot `gguf_open` expects a raw GGUF file for), when the actual raw
+model is a separate file (`models/Qwen3-30B-A3B-Q4_0.gguf`) and the cache path is a distinct,
+normally-defaulted 5th argument — `gguf_open` tried to parse the cache's completely different binary
+layout as GGUF headers and read a garbage length field into a `memcpy`. Fixed by using the correct
+`argv[1]`; the new code was never at fault. Documented per the standing "root-cause every crash via
+reproducible evidence" instruction rather than assumed.
+
+**Validation.** With the corrected invocation, both paths ran cleanly across all 5 lengths — no
+crash, no bounds-guard trip. Unlike decode M-batching, prefill has NO argmax-feedback compounding:
+every position's input token is fixed by the prompt itself, never fed back from a possibly-different
+model prediction, so the only divergence source is M4's own per-chunk shared-scale quantization
+noise (plus its ordinary propagation through the KV cache into later positions' attention) — not the
+autoregressive "one flipped choice changes every subsequent input" mechanism that produced
+milestone 2's 70.31% figure.
+
+| N | chunks+remainder | token agreement (argmax, all positions) | final-position logits max/mean abs diff | sequential | chunked-M4 | speedup |
+|---|---|---|---|---|---|---|
+| 16 | 4+0 | 16/16 (100.00%) | 1.15 / 0.245 | 1.281s (12.5 tok/s) | 1.151s (13.9 tok/s) | **1.113x** |
+| 19 | 4+3 | 19/19 (100.00%) | 0.78 / 0.153 | 1.523s (12.5 tok/s) | 1.383s (13.7 tok/s) | **1.101x** |
+| 128 | 32+0 | 123/128 (96.09%) | 1.28 / 0.223 | 10.508s (12.2 tok/s) | 9.350s (13.7 tok/s) | **1.124x** |
+| 512 | 128+0 | 507/512 (99.02%) | 1.63 / 0.225 | 45.309s (11.3 tok/s) | 40.558s (12.6 tok/s) | **1.117x** |
+| 1024 | 256+0 | 1019/1024 (99.51%) | 0.69 / 0.114 | 99.874s (10.3 tok/s) | 89.399s (11.5 tok/s) | **1.117x** |
+
+Token agreement is 96-100% at every length (vs. milestone 2's 70.31%) — confirms the no-compounding
+hypothesis. N=19's clean pass (100% agreement, correct chunk+remainder token count) validates the
+remainder fallback path specifically. Speedup is consistent, real, and reproducible: 1.10-1.12x with
+no length-dependent degradation, on the actual `-O3` production build.
+
+**Sanitizers.** ASan and UBSan (`-O2`, `QWEN_PREFILL_SANITIZE=1` capping the sweep at N≤512 — N=1024
+exercises the identical chunked/remainder code paths as N=512, just more repetitions, so it adds
+sanitizer wall-clock without adding memory-safety coverage). Both clean; token agreement and logit
+diffs bit-identical to the plain build at every tested length. One methodology issue caught and fixed
+along the way, not a memory-safety bug: the first ASan run reported only a `LeakSanitizer` summary
+(pre-existing, expected — the model's own weight/KV/scratch buffers intentionally live for the
+process's whole lifetime and are never explicitly freed before `main()` returns, true of every prior
+harness in this file) and printed NONE of the harness's own diagnostic output, because
+`LeakSanitizer` calls a raw `_exit()` after its report — bypassing normal stdio flush and silently
+discarding the fully-buffered stdout `printf` output that was sitting unflushed at that point. Fixed
+two ways: added an explicit `fflush(stdout)` after each test length's report block (real hardening —
+without it, ANY early/abnormal exit mid-sweep, sanitizer-triggered or not, would have silently
+discarded every result before it), and reran with `ASAN_OPTIONS=detect_leaks=0` (the actual
+memory-safety checks are what this pass validates; the pre-existing, intentional, always-present
+leak of long-lived top-level buffers is not a new finding and not what's under test here).
+
+**Ablation: does the reused MoE expert-FFN batching (milestone 3's mechanism) contribute anything on
+top of dense-layer batching alone?** Within one prompt's own consecutive positions, the 4-way
+same-expert overlap rate turned out to be 6.80-9.39% across the 5 lengths — roughly 8-10x milestone
+3's cross-sequence 0.89%, since positions within one prompt share local context/content far more
+than 4 independently-sampled sequences do. Given that much higher raw overlap, it was worth checking
+whether — unlike decode — it now moves the needle. Added `QWEN_PREFILL_MOE4=0` (`prefill_chunk4`-only
+ablation flag, forces the `ecount==4` M4 expert path off, pure M1 fallback for all expert-FFN work,
+does not touch decode's `forward4_dense_batch`) and reran the same 5-length sweep:
+
+| N | dense-only speedup (MOE4=0) | dense+expert speedup (MOE4=1, default) |
+|---|---|---|
+| 16 | 1.115x | 1.113x |
+| 19 | 1.105x | 1.101x |
+| 128 | 1.136x | 1.124x |
+| 512 | 1.122x | 1.117x |
+| 1024 | 1.117x | 1.117x |
+
+The two configurations are statistically indistinguishable at every length (dense-only is if
+anything marginally higher, within this board's established trial-to-trial noise band) — **a
+second, independent confirmation of milestone 3's finding, now at 8-10x the raw overlap rate**:
+same-expert 4-way grouping just isn't a fruitful lever at N=4, regardless of how much overlap is
+available, almost certainly because milestone 2's own finding (M4's arithmetic cost scales with M
+rather than being amortized for free) caps the per-batched-call benefit independent of how often
+the batchable case fires. (Token-agreement percentages differ by configuration in a non-monotonic
+way — e.g. 93.75% at N=16 with MOE4=0 vs 100% with MOE4=1 — despite MOE4=0 using the more-exact M1
+path for every expert call; this is expected noise, not a red flag: the two configurations accumulate
+different floating-point rounding trajectories across 48 layers, and which one happens to land closer
+to the sequential reference's argmax at a borderline position is not a monotonic function of "how much
+approximation was used," consistent with this session's own established "close call flips" framing.)
+The `g_prefill_moe4` code path is kept (harmless, sanitizer-clean, and the diagnostic — a much higher
+within-sequence overlap rate than cross-sequence — is worth having on record even though it doesn't
+change the speed verdict).
+
+**Keep/promotion decision.** **KEPT as a validated, working capability** — real, reproducible
+~1.10-1.14x prefill speedup, sanitizer-clean, honestly characterized divergence (96-100% agreement,
+explained mechanism, not hand-waved), wired into `main()`'s real production prefill loop and smoke-
+tested end-to-end (`QWEN_PREFILL_CHUNK=1` on the canonical prompt still resolves to `' Tokyo'`, PASS,
+same as `QWEN_PREFILL_CHUNK=0`). **NOT promoted to the production default** (stays opt-in, default
+0) — unlike router int8-M1 and SwiGLU rational-Padé, which only reached production-default status
+after a dedicated multi-prompt NLL/perplexity quality harness (§22.15, §22.20-21) with predeclared
+thresholds, this track's own validation standard (matching milestones 1-3) has been token-agreement
+and logit-closeness on synthesized benchmark text, not that harness. Given batched prefill is, unlike
+decode M-batching, a genuine single-user production lever (every real prompt ingestion is exactly
+the single-sequence case this batches), promoting it to the default is a real "change model
+semantics for every future invocation" decision — flagged for explicit confirmation rather than
+auto-promoted, per the standing instruction's own "a decision changes model semantics" stop
+condition. Remaining, not started: the full quality-harness pass this would need before a default
+promotion; a real continuous-serving scheduler at larger N (explicitly de-prioritized behind batched
+prefill by the user's own most recent framing); speculative/n-gram verification; quality-changing
+long-context experiments (require explicit approval per the original ladder).

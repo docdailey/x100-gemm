@@ -242,6 +242,37 @@ plausibly change this (birthday-paradox-style: "any 2+ overlap" gets more common
 **This closes the M-batch track's core empirical question**: dense-layer batching gives a real,
 modest ~1.11x decode speedup at N=4; expert-FFN batching adds nothing further at this concurrency.
 
+**Batched prefill: chunked-M4 prefill within one sequence — KEPT as validated opt-in (2026-07-28,
+`codex_recs_1.md` §22.38).** Per explicit direction, prioritized over larger-N serving ("for
+user-perceived speed, batched prefill is the higher priority"). Reframes M-batching across 4
+CONSECUTIVE POSITIONS of one sequence's own prompt (all known upfront, no autoregressive dependency
+for dense layers) rather than across independent sequences — dense layers (QKV/O/router/lm_head)
+batched via the same validated M4 kernel; attention stays per-position/exact (K/V for all 4 chunk
+positions written before any of the 4 positions' attention runs, correct because each position's own
+causal bound alone determines visibility); MoE-FFN reuses milestone 3's same-expert-4-way grouping
+as-is. A first-run crash (SIGSEGV, zero output) was root-caused via `dmesg`+`addr2line` to a wrong
+invocation (cache path passed where the raw `.gguf` path belongs), not a bug in the new code. **Token
+agreement 96-100% at N=16/19/128/512/1024 (vs milestone 2's 70.31%)** — prefill has no argmax-
+feedback compounding since every position's token is fixed by the prompt, not fed back from a
+possibly-different prediction; divergence is purely M4's quantization noise. **Speedup: consistent
+1.10-1.14x across all 5 lengths**, real, on the production `-O3` build, no length-dependent
+degradation. N=19 (deliberately not a multiple of 4) validates the remainder-fallback path. ASan/
+UBSan (`-O2`) clean; one methodology fix along the way (not a bug): `LeakSanitizer`'s raw `_exit()`
+was discarding unflushed stdout before this run added explicit `fflush()`s, and the pre-existing
+model-buffer "leaks" (long-lived by design, true of every prior harness) needed
+`ASAN_OPTIONS=detect_leaks=0` to get past to the real memory-safety checks. **Ablation
+(`QWEN_PREFILL_MOE4=0`) found the expert-FFN grouping contributes nothing measurable beyond dense-
+layer batching** (1.10-1.14x either way, differences within noise) despite a 6.8-9.4% within-prompt
+overlap rate — 8-10x milestone 3's cross-sequence 0.89% — a second, stronger confirmation that
+same-expert grouping isn't a fruitful lever at N=4 regardless of overlap rate. Wired into `main()`'s
+real production prefill loop behind `QWEN_PREFILL_CHUNK` (default 0, byte-identical to every prior
+session); smoke-tested end-to-end (`=1` still resolves the canonical prompt to `' Tokyo'`, PASS).
+**KEPT, but NOT promoted to the production default** — unlike router/SwiGLU, which only reached
+default status after a dedicated multi-prompt NLL/perplexity harness, this track's validation has
+been token-agreement/logit-closeness on synthesized text; since batched prefill (unlike decode
+M-batching) is a genuine single-user production lever, flipping the default is a real "changes model
+semantics for every invocation" decision, held for explicit confirmation rather than auto-promoted.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
