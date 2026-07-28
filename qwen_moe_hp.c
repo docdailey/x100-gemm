@@ -849,16 +849,29 @@ static float* g_qk_capture=NULL;
  * time -0.2%/-4.5%/-11.6%/-17.8%, attn bucket -31.5%/-35.1%/-33.7%/-34.6%, token-identical,
  * 0/55,050,240 integration-validation mismatches. */
 static int g_av_fuse=1;
+/* Exact-path closure (codex_recs_1.md §22.34), under A/B: per-worker attention scratch buffers
+ * (g_attn_scratch/g_attn_scratch_multi) are small enough (e.g. 32KB at ctx=1024) to go through
+ * glibc's normal heap allocator rather than its mmap-backed large-allocation path (which returns
+ * page-aligned memory already) -- plain malloc only guarantees ~16-byte alignment, not a full
+ * 64-byte cache line. g_scratch_align gates 64-byte-aligned allocation (posix_memalign) vs the
+ * original malloc, to test whether cache-line alignment measurably helps the RVV loads/stores that
+ * walk these buffers. 0 (default until promoted) = original malloc. */
+static int g_scratch_align=0;
+static void* scratch_alloc(size_t n){
+    if(!g_scratch_align) return malloc(n);
+    void*p=NULL; size_t sz=((n+63)/64)*64; if(sz==0) sz=64;
+    return posix_memalign(&p,64,sz)==0 ? p : NULL;
+}
 static void attn_scratch_ensure(int ctx){
     if(g_attn_scratch_ctx>=ctx) return;
-    for(int i=0;i<MAXNT;i++){ free(g_attn_scratch[i]); g_attn_scratch[i]=malloc((size_t)ctx*4); }
+    for(int i=0;i<MAXNT;i++){ free(g_attn_scratch[i]); g_attn_scratch[i]=scratch_alloc((size_t)ctx*4); }
     g_attn_scratch_ctx=ctx;
 }
 static void attn_scratch_multi_ensure(int ctx,int gpr){
     if(g_attn_scratch_multi_ctx>=ctx && g_attn_scratch_multi_gpr>=gpr) return;
     int gg=gpr>g_attn_scratch_multi_gpr?gpr:g_attn_scratch_multi_gpr;
     int cc=ctx>g_attn_scratch_multi_ctx?ctx:g_attn_scratch_multi_ctx;
-    for(int i=0;i<MAXNT;i++){ free(g_attn_scratch_multi[i]); g_attn_scratch_multi[i]=malloc((size_t)gg*cc*4); }
+    for(int i=0;i<MAXNT;i++){ free(g_attn_scratch_multi[i]); g_attn_scratch_multi[i]=scratch_alloc((size_t)gg*cc*4); }
     g_attn_scratch_multi_ctx=cc; g_attn_scratch_multi_gpr=gg;
 }
 /* Phase 6 (codex_recs_1.md §22.33): attention worker count may now exceed nkv (4) -- up to 8, using
@@ -1892,6 +1905,10 @@ int main(int c,char**v){
      * configured g_attn_nt on every real call, diffing the two output buffers. Not meant to be
      * left on during the real A/B. */
     { const char*wv=getenv("QWEN_WORKERS_VALIDATE"); if(wv) g_workers_validate=atoi(wv); }
+    /* QWEN_SCRATCH_ALIGN (env var, same convention): exact-path closure (attention_optimization_plan.md,
+     * codex_recs_1.md §22.34), under A/B -- default 0 (plain malloc). 1 = 64-byte-aligned
+     * (posix_memalign) attention scratch buffers. */
+    { const char*sa=getenv("QWEN_SCRATCH_ALIGN"); if(sa) g_scratch_align=atoi(sa); }
     /* ctx must cover prefill+ngen regardless of which prompt path is taken -- the default path's
      * prefill is a fixed 12 tokens (see `np` below), NOT just the QWEN_CTXLEN path. Previously only
      * the QWEN_CTXLEN branch grew ctx, so any ngen (2nd CLI arg, directly user-controlled, no

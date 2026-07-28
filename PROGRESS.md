@@ -175,6 +175,17 @@ short HEADLINE moved again: ~12.3-12.35→12.37 tok/s. **Phases 1-6 of the atten
 branch are all complete and kept** — next per the broader authorization: exact-path closure, then
 M-batch/continuous batching.
 
+**Exact-path closure CLOSED — no candidate cleared its gate (2026-07-28, `codex_recs_1.md`
+§22.34).** Re-profile: attention now negligible at short context, still subordinate to linear/MoE
+even at ctx=1024. Of the 4 named residuals (KV prefetch, scratch allocation, cache alignment,
+next-layer prefetch): 3 ruled out by direct evidence (KV cache already page-aligned via glibc mmap;
+scratch allocation already lazy/reused; KV prefetch unsupported given head-major layout's already-
+sequential access and flat dispatch overhead); next-layer prefetch has no safe window given MoE's
+data-dependent expert routing (same cross-layer dependency the directive itself warned against).
+The one candidate with real evidence (scratch-buffer 64-byte alignment) was tested: no reproducible
+win (-0.8%/-0.4%/+0.35% at short/512/1024) — not kept, `g_scratch_align` stays 0 by default. **Exact
+M=1 decode path declared closed.** Next: M-batch/continuous batching.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

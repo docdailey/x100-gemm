@@ -2952,3 +2952,72 @@ tracks (exact-path closure, M-batch/continuous batching, batched prefill, specul
 verification, and quality-changing long-context experiments) proceed per the broader authorization,
 with track 7 (quality-changing experiments) requiring explicit approval before promoting any
 semantics-changing mode, per that authorization's own terms.
+
+### 22.34 Exact-path closure: re-profile + one evidence-supported residual — CLOSED (no candidate cleared its gate)
+
+Explicit authorization: re-profile every bucket after Phases 5-6; test only evidence-supported
+residuals (KV prefetch, score/scratch allocation, cache alignment, safe next-layer memory
+prefetch); no cross-layer compute-overlap claims; declare the exact M=1 path closed when no
+candidate clears its gate.
+
+**Re-profile at the new production default** (`attn_nt=8`, all fusions on): at the canonical short
+prompt, attention is now negligible — 1.0ms of 80.7ms wall (`<1.3%`); linear(kernel) dominates at
+60.0ms (`74%`). At ctx=1024, attention has grown to 34.5ms but linear/MoE still dominates at 61.9ms
+(1.8x), with `expert(gate/up/down)` alone at 37.8ms (constant across contexts, as expected for MoE
+FFN work that doesn't depend on KV history) the single largest sub-bucket at every context tested.
+`rest(other)` sits flat at 7.7-8.0ms regardless of context — genuinely constant per-token overhead
+(residual adds, rmsnorm, KV-cache-write memcpys), not attention-related.
+
+**Evidence review before implementing anything** (per the explicit "test only evidence-supported
+residuals" scope), for each of the four named candidates:
+
+- **Cache alignment**: checked directly. `kv.Kc`/`kv.Vc` (the KV cache itself) are large enough
+  (>100MB at ctx=1024) that glibc's malloc/calloc routes them through its mmap-backed large-
+  allocation path, which already returns page-aligned (4096-byte) memory — far more aligned than a
+  single 64-byte cache line requires. No evidence supports further work there. The per-worker
+  attention scratch buffers (`g_attn_scratch`/`g_attn_scratch_multi`), however, are small (e.g.
+  32KB at ctx=1024) and go through glibc's normal heap allocator, which only guarantees ~16-byte
+  alignment — a real, checkable gap. This is the one candidate with concrete supporting evidence,
+  so it's the one actually tested (below).
+- **Score/scratch allocation**: already lazy and reused across calls (`attn_scratch_ensure`/
+  `attn_scratch_multi_ensure` only reallocate when the required size grows), not re-allocated per
+  token or per layer — this was already the Phase 3 requirement and remains true. No further
+  candidate here beyond the alignment question above.
+- **KV prefetch**: no evidence supports this. Head-major layout (Phase 2) already makes each
+  worker's own K/V history contiguous, and each worker's access pattern is a simple ascending scan
+  — exactly the pattern hardware prefetchers already handle well. Dispatch overhead has stayed flat
+  and tiny (0.08-0.14ms) through every A/B in this branch, showing no sign of memory-latency
+  starvation that software prefetch would address.
+- **Safe next-layer memory prefetch**: not pursued. This model is MoE with data-dependent expert
+  routing — which experts' weight blocks are needed for the *next* layer isn't known until that
+  layer's own router computation completes, which itself depends on that layer's own attention
+  output. There is no safe, useful prefetch window that reaches genuinely across a layer boundary
+  without first computing most of what a real cross-layer overlap would need to avoid computing —
+  this is the same transformer-dependency constraint the execution directive explicitly warned
+  against claiming to bypass. Not evidence-supported as scoped; would need a substantially different
+  investigation (e.g., speculating on the router's next-layer decision) to become one.
+
+**Scratch-buffer cache-line alignment, tested.** `g_scratch_align` (env var `QWEN_SCRATCH_ALIGN`)
+switches the attention scratch allocator between plain `malloc` (default) and 64-byte-aligned
+`posix_memalign`. Correctness: trivially unaffected (pure allocation-strategy change, no data-path
+change; canonical `' Tokyo'` check passed both ways). A/B, 2 trials, short prompt + ctx=512/1024:
+
+| | short | 512 | 1024 |
+|---|---|---|---|
+| wall/token | 81.3→80.65ms (-0.8%) | 97.8→97.4ms (-0.4%) | 115.2→115.6ms (**+0.35%**) |
+
+No reproducible win at any context — the short/512 deltas are within this board's typical trial-to-
+trial noise band (compare e.g. Phase 6's own short-context pairs, which varied by a similar margin
+run-to-run), and ctx=1024 trends slightly the *wrong* direction. This does not clear any reasonable
+"reproducible improvement" bar. **Not kept** — `g_scratch_align` stays at its default (0, plain
+malloc); the flag remains in the code (documented, off by default) as a tested-and-rejected option,
+per this session's practice of keeping negative results visible rather than deleting the evidence.
+
+**Declared: the exact M=1 decode path is closed.** All four named residual candidates were
+either ruled out by direct evidence (cache alignment for the KV cache itself; scratch allocation
+strategy, already lazy/reused) or tested and found not to clear their gate (scratch-buffer cache-
+line alignment); the remaining two (KV prefetch, next-layer prefetch) lack supporting evidence for
+this architecture and, in next-layer prefetch's case, run into the same real cross-layer dependency
+constraint the execution directive itself flagged. No further exact-path attention or scratch/cache
+micro-optimization is planned without new evidence. Per the broader authorization, next: M-batch/
+continuous batching, the primary remaining hardware-throughput lever.

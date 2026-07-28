@@ -504,8 +504,17 @@ Do not combine layout, threading, and fused kernels into one patch.
 
 Phases 1–6 are complete and kept — see the scoreboard above and `codex_recs_1.md` §22.27–§22.33.
 QK, AV, softmax, and worker count are all now optimized on the exact path (`attn_nt=8` default).
-This attention-optimization branch's scope is substantially exhausted; per the broader
-authorization, next is exact-path closure (re-profile every bucket, test only evidence-supported
-residuals: KV prefetch, scratch allocation, cache alignment, safe next-layer prefetch — no
-cross-layer compute-overlap claims), then M-batch/continuous batching as the primary remaining
-hardware-throughput lever.
+
+**Exact-path closure result (2026-07-28, `codex_recs_1.md` §22.34): CLOSED — no candidate cleared
+its gate.** Re-profile: attention is now negligible at short context (`<1.3%` of wall) and still
+subordinate to linear/MoE even at ctx=1024 (34.5ms vs 61.9ms). Of the four named residuals, three
+were ruled out directly by evidence (the KV cache is already page-aligned via glibc's mmap path;
+scratch allocation is already lazy/reused; KV prefetch has no supporting evidence given head-major
+layout already yields hardware-prefetcher-friendly sequential access and dispatch overhead shows no
+latency-starvation signature) or lack a safe window (next-layer prefetch, blocked by MoE's
+data-dependent expert routing — the same cross-layer dependency the execution directive itself
+warned against claiming to bypass). The fourth (scratch-buffer 64-byte alignment, `posix_memalign`
+vs `malloc`, the one candidate with a concrete evidence gap) was implemented and A/B'd: no
+reproducible win at short/512/1024 (-0.8%/-0.4%/**+0.35%**) — not kept, `g_scratch_align` stays 0
+by default, flag preserved as a documented, tested-and-rejected option. **The exact M=1 decode path
+is declared closed.** Per the broader authorization, next: M-batch/continuous batching.
