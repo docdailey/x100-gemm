@@ -186,6 +186,23 @@ The one candidate with real evidence (scratch-buffer 64-byte alignment) was test
 win (-0.8%/-0.4%/+0.35% at short/512/1024) — not kept, `g_scratch_align` stays 0 by default. **Exact
 M=1 decode path declared closed.** Next: M-batch/continuous batching.
 
+**M-batch track, milestone 1: vendor M4 kernel ported and validated (2026-07-28, `codex_recs_1.md`
+§22.35).** Confirmed with the user before starting, given this is a genuinely new vendor-kernel
+port (same scale of effort the original M1 port required), not a tuning-flag phase. Found the
+vendor library ships a real, hand-tuned M=4 RVV kernel already used in production
+(`gemm_kernel_i8i4_hp_m4`) — a porting task, not novel design. Key finding: M4's per-subblock
+quantization scale is shared across all 4 batched rows (max abs value across all 4 jointly), so its
+output is *not* bit-identical to 4 separate M1 calls -- expected, principled, not a bug. Ported
+`run_hp_m4`/`pack_A_hp_m4` and validated in `bench/vendor_ime_m4_probe.c`. One methodology bug
+caught and fixed first: an exact-fp32-activation oracle produced a misleading ~100%+ "error" for
+*both* M1 and M4 (conflating A-side quantization noise with kernel correctness); switched to
+`vendor_ime_a2_full.c`'s own proven "reconstruct from actual stored quantized bytes" methodology.
+**Result: M4 vs its own reconstructed reference has 0.119% mean error, essentially identical to
+M1's own 0.119% (ratio 0.999x)** — the port is correct. Kernel-port milestone complete; remaining:
+wire into production linear dispatch, build a real multi-sequence batched-decode harness, validate
+against separate M=1 inference, report aggregate/per-sequence tok/s, latency, memory, M=1
+regression.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

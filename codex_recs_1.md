@@ -3021,3 +3021,74 @@ this architecture and, in next-layer prefetch's case, run into the same real cro
 constraint the execution directive itself flagged. No further exact-path attention or scratch/cache
 micro-optimization is planned without new evidence. Per the broader authorization, next: M-batch/
 continuous batching, the primary remaining hardware-throughput lever.
+
+### 22.35 M-batch track, milestone 1: vendor M4 kernel ported and validated
+
+Explicit authorization: "Investigate vendor HP M=2/M=4/M=8 kernels or construct a validated
+multi-row path... Report aggregate tok/s, per-sequence tok/s, latency, memory use, and M=1
+regression for M=1/2/4/8. Never describe synthetic GEMM throughput as model tok/s." Given the scale
+jump from every prior tuning-flag phase (this is a genuinely new vendor-kernel port, the same class
+of effort the original M1 port itself required, including a documented false start), confirmed with
+the user before committing session budget to it.
+
+**Investigation.** The vendor library ships a real, hand-tuned RVV kernel for M≥4,
+`gemm_kernel_i8i4_hp_m4` (`reference/spacemit-backend/ime2_kernels.cpp:3360`), already dispatched
+in the vendor's own production llama.cpp build (`ime.cpp:276/583`, `count_m>=4` branch) — this is a
+porting task, not novel kernel design. No literal M=2 or M=8 general-purpose kernel exists (a
+`moe_m2_gemm_kernel_i8i4` exists but is MoE-routing-specific, a different use case); M4 is the
+largest real hand-tuned tile. Confirmed `block_q4_0` (this engine's weight format) has
+`block_type_has_zp<block_q4_0>()==false` (`ime.cpp:107`), so the live call path is M4's no-zp
+branch, not the with-zp branch (initially misread — the with-zp comment block appears first in the
+source and was read first, a red herring corrected before any code was written).
+
+**A-record ground truth**, from the vendor's own packer `quantize_a_4row_i8_hp`
+(`rvv_kernels.cpp:2100`, `vlenb==128` branch — this board's A100 harts, VLEN=1024), not
+hand-derived from the denser asm comments alone (which describe "4 x fp16 row scales" but the
+packer shows this is one shared fp16 scale per subblock across all 4 rows, plus 6 unused padding
+bytes — confirmed by the packer only ever writing index 0 of each 4-slot area). Key finding:
+**M4's per-subblock quantization scale is computed from the max absolute value across all 4
+batched rows jointly** (`v_max_abs = max(max(|a0|,|a1|),max(|a2|,|a3|))`), not per row —
+structurally different from every prior fusion in this session (QK/AV/softmax/worker-count were
+all bit-exact by construction; M4 batching is not, by design, since sharing one scale across 4
+rows is the mechanism that makes the wider hardware tile possible). This means M4's output is
+expected to differ numerically from 4 independent M1 calls on the same rows — a quantization-
+tradeoff question, not a bit-exactness gate.
+
+**Port and probe** (`bench/vendor_ime_m4_probe.c`): `run_hp_m4` is a verbatim asm port of the
+no-zp branch; `pack_A_hp_m4` matches the vendor packer's exact computation (1160-byte record: 8×
+136B subblocks + 64B a_sum trailer + 8B scale_avg area, only the documented-used bytes written).
+B-record (weights) is unchanged from M1 (`block_q4_0x32`, same weight stream — confirmed by
+`b_tile_stride` depending only on `k_blks`, never on M).
+
+**A validation methodology bug found and fixed before trusting any result.** The probe's first
+version compared kernel output against an "oracle" using exact fp32 activations (no A-side
+quantization at all) — this produced a wildly misleading ~100-140% "mean error" for *both* M1 and
+M4, which would be impossible given M1's own already-proven production correctness. Root cause:
+comparing against exact-fp32 activations conflates the kernel's own correctness with A-side int8
+quantization's inherent ~8-bit rounding error, which is large in isolation (up to a couple percent
+per term, compounding over 256 terms) and has nothing to do with whether the port is right. Fixed
+by adopting `vendor_ime_a2_full.c`'s own already-proven methodology exactly: reconstruct each
+kernel's reference from its *own actual stored, quantized, fp16-rounded packed bytes* (both A and
+W sides), matching "does the ported asm correctly compute the dot product its own documented byte
+format implies" — the real question, isolated from expected quantization noise.
+
+**Result, 200 trials, 25,600 comparisons** (random K=256, N=32 blocks, board otherwise idle):
+
+| | mean_abs_err | % of mean value | max_abs_err |
+|---|---|---|---|
+| M1 vs its own reconstructed reference | 1.00e-2 | 0.119% | 1.03e-1 |
+| M4 vs its own reconstructed reference | 1.00e-2 | 0.119% | 1.12e-1 |
+
+**M4/M1 mean-error ratio: 0.999×** — M4 introduces no meaningful extra error beyond M1's own
+already-accepted quantization noise; the ported asm correctly implements its documented byte
+format. M1-vs-M4 direct output comparison shows a real, expected, nonzero difference (mean 0.041,
+max 0.24) — the shared-scale quantization tradeoff described above, not a bug.
+
+**Milestone 1 (kernel port + numerical validation) is complete.** Remaining for the full M-batch
+track per the original authorization: wire the validated kernel into the production linear/FFN
+dispatch path for M rows, build a genuine multi-sequence batched-decode harness (independent
+prompts/KV-caches sharing weight reads at the linear layer, attention still per-sequence), validate
+every batched sequence against separate M=1 inference, and report aggregate/per-sequence
+tok/s, latency, memory, and M=1 regression for the concrete M values this hardware actually
+supports (M=1 exact; M=4 via the kernel validated here; M=8 as two M4 dispatches; M=2 has no
+dedicated tile and would need its own tradeoff decision — pad to M4 or fall back to two M1 calls).
