@@ -3690,3 +3690,116 @@ of N pending sequences fill the next round, picking ones that share experts coul
 milestone 3's measured 0.89% batchable-overlap rate) and answering milestone 3's own explicitly
 deferred question ("larger N would very plausibly change this calculus... but needs a real serving
 loop to validate, separate undertaking").
+
+### 22.42 Larger-N serving, architecture (B) hart-scaling measurement — projected gain does not clear the predeclared bar, NOT recommended
+
+Explicit direction: "Choose architecture B provisionally. Before implementing a scheduler or
+multi-lane runtime, measure the existing M1 production path at nt=1, nt=2, and nt=4, with explicit
+hart/IME-unit mappings. Report short, ctx512, and ctx1024 wall time plus linear and attention
+buckets... From those results, model aggregate throughput for 1×4-unit, 2×2-unit, and 4×1-unit
+lanes, including expected per-stream latency. Do not implement multi-lane serving until the
+projected configuration improves aggregate throughput materially—target at least 25%—without
+exceeding 2× per-stream latency. Keep current M1 production behavior untouched." Deferred the
+expert-overlap oracle (architecture A only, rejected unless requirements change).
+
+**Method: zero new code.** Every number below comes from the EXISTING, unmodified, already-
+validated production binary, re-run with `QWEN_ATTN_NT` set equal to the CLI `nt` argument (both
+control hart count; `g_attn_nt` otherwise defaults to 8 independent of `nt`, so leaving it unset
+would have measured an asymmetric config, not a genuine symmetric N-hart lane). Hart mapping is
+exact, read directly from `g_hart_order[8]={8,10,12,14,9,11,13,15}` (pool worker `tn` binds to
+`g_hart_order[tn%8]`): nt=1 → hart 8 only; nt=2 → harts 8,10; nt=4 → harts 8,10,12,14 (today's
+production linear-worker set). One operational note: the first sweep attempt lost its nt=2/nt=4
+results to an SSH disconnect mid-run (the remote process kept running but its output pipe was dead,
+appearing to hang) — re-run via `nohup ... &disown` writing to a board-side file, the standard
+robust pattern this session already established for long jobs, this time applied to a plain
+measurement sweep where it had been skipped.
+
+**Raw measurement (single lane, solo — no contention, this board's full memory bandwidth to
+itself):**
+
+| hart count | harts used | prompt | tok/s | linear (ms/tok) | attention (ms/tok) | wall (ms/tok) |
+|---|---|---|---|---|---|---|
+| 1 | 8 | short | 5.02 | 170.2 | 8.6 | 199.4 |
+| 1 | 8 | ctx512 | 2.61 | 170.4 | 191.9 | 383.0 |
+| 1 | 8 | ctx1024 | 1.81 | 170.3 | 360.7 | 551.8 |
+| 2 | 8,10 | short | 8.24 | 98.7 | 2.9 | 121.4 |
+| 2 | 8,10 | ctx512 | 5.68 | 98.7 | 57.6 | 176.0 |
+| 2 | 8,10 | ctx1024 | 4.50 | 98.4 | 103.8 | 222.1 |
+| 4 | 8,10,12,14 | short | 12.39 | 59.7 | 1.6 | 80.7 |
+| 4 | 8,10,12,14 | ctx512 | 9.11 | 60.7 | 29.4 | 109.7 |
+| 4 | 8,10,12,14 | ctx1024 | 7.35 | 60.4 | 55.7 | 136.0 |
+
+**A finding this measurement itself surfaces, bearing directly on the projection below: the linear
+bucket scales SUBLINEARLY with hart count** — 170ms(1 hart)→98.7ms(2 hart)→60ms(4 hart) is a 2.83x
+speedup for a 4x hart increase, not 4x. This is the SAME memory-bandwidth-bound signature already
+established earlier in this session (`PROGRESS.md`'s own nt=8-regressed finding) — linear/MoE work
+is limited by how fast weights stream from RAM, not by hart count, so adding harts past a point
+yields diminishing returns even for ONE lane running ALONE with the full memory bus to itself.
+
+**Aggregate throughput projection (IDEALIZED UPPER BOUND — explicitly NOT a real multi-lane
+measurement).** Each config below multiplies one lane's own SOLO throughput (measured with the
+board's full memory bandwidth uncontended) by the lane count — this assumes ZERO inter-lane
+contention, which the sublinear scaling finding above already shows is unrealistic: running lanes
+TRULY CONCURRENTLY adds a SECOND layer of bandwidth competition beyond what a single reduced-hart
+lane already experiences alone. Real concurrent aggregate throughput is expected to be MEANINGFULLY
+LOWER than these numbers, not higher — so a config that already fails the bar under this optimistic
+projection would fail worse in reality, while a config that only barely clears it here is not
+trustworthy evidence that it would clear it for real.
+
+| context | 1×4-unit (baseline) | 2×2-unit (2×2-hart, optimistic) | vs baseline | 4×1-unit (4×1-hart, optimistic) | vs baseline |
+|---|---|---|---|---|---|
+| short | 12.39 tok/s | 16.48 tok/s | **+33.0%** | 20.08 tok/s | **+62.1%** |
+| ctx512 | 9.11 tok/s | 11.36 tok/s | **+24.7%** | 10.44 tok/s | **+14.6%** |
+| ctx1024 | 7.35 tok/s | 9.00 tok/s | **+22.4%** | 7.24 tok/s | **-1.5% (net loss)** |
+
+**Per-stream latency ratio (lane's own solo wall time ÷ today's 4-hart baseline wall time — a
+sequence sharing NOTHING, running truly alone in its own lane, at whatever hart count that lane
+has):**
+
+| context | 2×2-unit per-stream latency | 4×1-unit per-stream latency |
+|---|---|---|
+| short | 1.50x | 2.47x — **FAILS ≤2x** |
+| ctx512 | 1.61x | 3.49x — **FAILS ≤2x** |
+| ctx1024 | 1.63x | 4.06x — **FAILS ≤2x** |
+
+**Verdict against the predeclared gate (≥25% aggregate throughput, ≤2x per-stream latency, both
+required): NEITHER configuration clears the bar.**
+
+- **4×1-unit FAILS decisively on both axes.** Latency fails badly at every context (2.47x-4.06x,
+  more than double the ≤2x ceiling at 512/1024). Throughput only clears +25% at short context;
+  ctx512 falls to +14.6% and ctx1024 is a net LOSS (-1.5%) even under the optimistic no-contention
+  projection — the 4-way split of an already memory-bandwidth-bound kernel gives up more from
+  sublinear per-lane scaling than it gains from lane count as context (and therefore per-token
+  attention cost) grows.
+- **2×2-unit clears latency comfortably (1.50-1.63x, well under 2x) but is AT BEST borderline on
+  throughput even under the optimistic projection** — clears at short context (+33.0%) but sits
+  right at the 25% line at ctx512 (+24.7%, technically under) and clearly under it at ctx1024
+  (+22.4%). Given the sublinear-scaling finding above means REAL concurrent throughput is expected
+  to be lower than this already-borderline optimistic number, and ctx512/ctx1024 (not the short
+  canonical prompt) are the realistic regime for actual agentic/coding use this board serves, the
+  honest read is that 2×2-unit would plausibly MISS the 25% bar under real concurrent contention at
+  the context lengths that matter most, even though it technically clears it at the easiest
+  (short-context) test point.
+
+**Recommendation, directly following the user's own predeclared decision rule: multi-lane serving
+(architecture B) is NOT implemented.** Neither configuration meets the stated bar once realistic
+context lengths and the (unmeasured, but structurally certain given the sublinear single-lane
+scaling already observed) inter-lane bandwidth-contention penalty are honestly accounted for. This
+closes both halves of the larger-N continuous serving track evaluated this session: architecture (A)
+was rejected in §22.41 pending changed requirements (single-user M-batch's own real ~3.6x per-round
+latency cost, established in milestones 1-3 and re-confirmed for the speculative-decoding cost model
+in §22.40); architecture (B) is now rejected here on its own predeclared measurement gate.
+
+**One clarifying note on the baseline used above.** The "1×4-unit" comparison point (nt=4,
+attn_nt=4, symmetric — chosen so all three configs in the table divide the exact SAME fixed 4-hart
+budget, a fair controlled comparison) is NOT today's actual shipped default. Production ships
+asymmetric (`nt=4` for linear, `g_attn_nt=8` for attention — Phase 6, §22.33's own real, validated
+win from giving attention MORE harts than linear), which is faster at longer context than the
+symmetric 4-hart baseline used here (e.g. ~8.7 tok/s real shipped vs 7.35 tok/s for the symmetric
+test at ctx1024). This means the bar architecture (B) would actually need to clear, if judged against
+what genuinely ships today rather than this section's controlled 4-hart baseline, is HIGHER than
+what's shown above — so this section's "does not clear +25%" conclusion is, if anything,
+conservative in architecture (B)'s favor, not overstated against it.
+
+Current M1 production behavior (nt=4 default, `g_attn_nt=8` default) is completely untouched — this section
+is measurement and analysis only, no code changed.

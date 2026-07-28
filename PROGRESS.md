@@ -339,6 +339,23 @@ Next: expert-overlap oracle (extends milestone 3's N=4 measurement to larger que
 primarily relevant to architecture (A) — flagged for the user's input on which architecture(s) to
 pursue before further engineering.
 
+**Larger-N serving, architecture (B) hart-scaling measurement — NOT RECOMMENDED (2026-07-28,
+`codex_recs_1.md` §22.42).** User chose (B) provisionally with a predeclared gate: only implement
+multi-lane serving if the projected config improves aggregate throughput ≥25% without exceeding 2x
+per-stream latency. Measured the EXISTING unmodified M1 path at nt=1/2/4 (symmetric `QWEN_ATTN_NT`
+matching `nt`, real hart mapping: nt=1→hart 8, nt=2→harts 8,10, nt=4→harts 8,10,12,14), zero new
+code. Found the linear bucket scales SUBLINEARLY with hart count (170→98.7→60ms for 1→2→4 harts,
+2.83x for a 4x hart increase — the same memory-bandwidth-bound signature already known from the
+nt=8 regression finding). Projected aggregate throughput (idealized, assumes zero inter-lane
+contention — real concurrent throughput expected LOWER, not higher, given the sublinear single-lane
+finding): 2×2-unit gets +33.0%/+24.7%/+22.4% (short/512/1024) — clears the bar only at short
+context, borderline-to-under at the realistic 512/1024 lengths. 4×1-unit gets +62.1%/+14.6%/-1.5%
+(a net LOSS at ctx1024) and FAILS the latency gate badly at every context (2.47x-4.06x vs the
+required ≤2x). **Verdict: neither configuration clears the predeclared bar — multi-lane serving is
+NOT implemented.** This closes both halves of the larger-N track: architecture (A) rejected in
+§22.41 (steep per-round latency cost), architecture (B) rejected here (measured gain doesn't clear
+its own gate). Current M1 production behavior completely untouched.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
