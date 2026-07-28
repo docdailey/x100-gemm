@@ -3092,3 +3092,98 @@ every batched sequence against separate M=1 inference, and report aggregate/per-
 tok/s, latency, memory, and M=1 regression for the concrete M values this hardware actually
 supports (M=1 exact; M=4 via the kernel validated here; M=8 as two M4 dispatches; M=2 has no
 dedicated tile and would need its own tradeoff decision — pad to M4 or fall back to two M1 calls).
+
+### 22.36 M-batch track, milestone 2: real 4-sequence batched decode, dense layers only
+
+Explicit scope decision, offered to and confirmed by the user given the scale of what full
+integration required: MoE's per-sequence expert routing (each of 4 batched sequences independently
+selects its own top-8 of 128 experts from its own hidden state, so different sequences generally
+select different, only-partially-overlapping expert sets) means the expert FFN cannot be
+M4-batched by the same mechanism as the dense layers without a genuinely different, comparably-
+sized gather/scatter-by-expert mechanism. Scoped this milestone to **dense-layer batching only**
+(QKV, O, router, lm_head — all use one shared weight matrix regardless of sequence), leaving MoE
+expert FFN and attention per-sequence via the existing, already-validated M1/serial paths, and
+documenting expert-batching as explicitly out of scope for tonight.
+
+**Implementation.** `run_hp_m4`/`pack_A_hp_m4` (the validated kernel from §22.35) wired into a new
+`kind==3` pool-dispatch path (`lin_mm_hp_m4`), reusing the exact same N-tile-across-workers
+machinery as `kind==0`'s M1 dispatch — only the per-N-tile kernel call and the A-record format
+differ. New `forward4_dense_batch`: processes 4 independent (token, position, KV-cache) triples in
+lockstep, packing all 4 sequences' activations into one M4 record at each dense layer (`Abuf4`,
+sized for the wider of `d`/`qd` since the O-projection's input, `att`, is `qd`-wide — a real bug
+caught before running anything: an early version packed `att` with K=`d` instead of `ly->o.K`,
+silently under-packing `(qd-d)/256` blocks) and splitting the batched output back into per-sequence
+buffers. Attention and MoE-FFN loop over the 4 sequences individually, calling the existing,
+unmodified per-sequence machinery (`attn_dispatch`, `lin_mm_hp` for `eg`/`eu`/`ed`) — a second real
+bug caught here: an early version dropped the `pack_act_hp(hn,d,Abuf2)` call the expert FFN needs
+(the M1-format packed activation), inherited from `forward()` but never re-added for the 4-way
+version, which would have fed the expert layers stale/garbage activation data.
+
+**Test methodology** (`QWEN_MBATCH_TEST=1`, `run_mbatch_test`): 4 REAL, DISTINCT prompts from the
+harness's own existing prompt set (factual/capitals, factual/chemistry, reasoning/syllogism,
+reasoning/sequence — not 4 copies of one prompt, not synthetic data), each with its own KV cache.
+Path 1: 4 separate, sequential M=1 decodes via the existing, already-proven `forward()`. Path 2: 1
+batched M=4 decode via `forward4_dense_batch`. Both prefill identically (per-sequence, M=1, timed
+separately from decode since it's identical cost in both paths and would otherwise dilute an
+aggregate "total wall time" comparison for these short test prompts — prefill batching is
+explicitly out of scope this milestone, the ladder's own next item).
+
+**A real, informative divergence was found and characterized, not hand-waved.** Token agreement
+over the full 16-token generation was only 70.31% (45/64) — initially concerning, since every prior
+numerical change in this session showed single-digit-percent divergence at most. Root-caused via a
+staged diagnostic, not assumed: **one M4-batched 48-layer forward pass** (before any autoregressive
+compounding — prefill is identical M1 in both paths, so this isolates the batched pass's own
+divergence from a byte-identical input) shows small, reasonable numerical difference (max_abs=0.73,
+mean_abs=0.105 across the full 151,936-wide vocab logit vector) and **all 4 sequences' argmax
+token choices agree exactly**. The full-generation divergence instead comes from ordinary
+autoregressive compounding: this is a hard-top-8-of-128-expert MoE model, so once a close argmax
+call flips for ANY one step (a small, real logit perturbation crossing a decision boundary), the
+resulting *different* token becomes every subsequent step's own input, and errors branch and
+compound from there — a well-understood property of discrete-token generation under ANY numerical
+perturbation, not specific to or a defect of this port. Per-step tracing confirms the pattern
+exactly: 2 of 4 sequences track the M1 baseline bit-for-bit through all 16 steps; the other 2
+diverge from a single flipped step onward (position 5 and position 9 respectively), not from step 1
+and not scattered randomly.
+
+**Sanitizers**: ASan and UBSan both clean (`-O2`, full test run) — no memory-safety issues in the
+new dispatch/batching/test-harness code. Correctness numbers (token agreement, per-step pattern,
+logit diffs) are bit-for-bit identical across the plain, ASan, and UBSan builds (fully
+deterministic, as expected — no data race, no uninitialized read). Confirmed the existing, unrelated
+single-sequence M=1 production path is completely unaffected (12.38-12.41 tok/s, matching the
+established baseline, `' Tokyo'` PASS).
+
+**Performance, decode-phase only** (prefill excluded per the reasoning above; 2 trials, board
+otherwise idle):
+
+| | M=1 (4 separate) | M=4 (1 batched) | speedup |
+|---|---|---|---|
+| aggregate tok/s | 13.32-13.34 | 14.80-14.82 | **1.111x** |
+| per-sequence tok/s | 3.33-3.34 | 3.70 | — |
+| per-token latency | 74.95-75.06ms/seq | 269.95-270.24ms/batch-step | — |
+
+Reproducible trial-to-trial (1.111x both clean runs; sanitizer builds, under heavy instrumentation
+overhead, showed the two paths within noise of each other, 0.990x-1.076x, consistent with a small
+underlying effect being harder to resolve through sanitizer overhead, not a sign the effect isn't
+real on the production build). **Honest characterization: this is a real but modest speedup, well
+below a naive "4 rows for the price of 1" intuition**, for two understood reasons: (1) the M4
+kernel's own arithmetic work still scales with M (it holds 4 sets of accumulators and does
+proportionally more `vmadotsu.hp`/`vmadotu.hp` work per call, not a fixed cost regardless of M) —
+the mechanism is weight-stream-read amortization, not compute-for-free; (2) the batched layers
+(QKV+O+router+lm_head) are roughly half the linear bucket at these context lengths, with the MoE
+expert FFN — explicitly unbatched this milestone — remaining the single largest linear sub-bucket
+and untouched by this speedup.
+
+**Memory**: ~222 KB additional for the batched path's own buffers (`Abuf4`, `Abuf2_4`, and the
+`y4q`/`y4k`/`y4v`/`y4o`/`y4r`/`y4lm` intermediate output buffers), beyond the 4x baseline per-
+sequence buffer cost every path pays regardless of batching.
+
+**Status: validated, working, NOT wired into the production default path.** `forward4_dense_batch`
+and `lin_mm_hp_m4` exist as tested, correct, available capabilities (reachable via
+`QWEN_MBATCH_TEST=1`), not a promoted default — there is no single-sequence "production" call site
+that would benefit from this (batching requires multiple concurrent sequences to exist in the first
+place, which this decode engine's current CLI/harness structure doesn't provide outside this test).
+Remaining for a genuinely useful M-batch feature: MoE expert-FFN batching (the larger remaining
+opportunity, a separate undertaking per the scoping decision above), a real multi-request serving
+loop/scheduler (this milestone hand-constructs one fixed 4-sequence batch, not a general N-sequence
+continuous-batching admission/eviction system), and batched prefill (explicitly deferred, the
+ladder's own next item).

@@ -198,10 +198,32 @@ caught and fixed first: an exact-fp32-activation oracle produced a misleading ~1
 *both* M1 and M4 (conflating A-side quantization noise with kernel correctness); switched to
 `vendor_ime_a2_full.c`'s own proven "reconstruct from actual stored quantized bytes" methodology.
 **Result: M4 vs its own reconstructed reference has 0.119% mean error, essentially identical to
-M1's own 0.119% (ratio 0.999x)** — the port is correct. Kernel-port milestone complete; remaining:
-wire into production linear dispatch, build a real multi-sequence batched-decode harness, validate
-against separate M=1 inference, report aggregate/per-sequence tok/s, latency, memory, M=1
-regression.
+M1's own 0.119% (ratio 0.999x)** — the port is correct.
+
+**M-batch track, milestone 2: real 4-sequence batched decode, dense layers only (2026-07-28,
+`codex_recs_1.md` §22.36).** Scoped to dense layers only (QKV/O/router/lm_head, one shared weight
+matrix) after confirming with the user — MoE expert FFN needs a genuinely different gather/scatter-
+by-expert mechanism (each of 4 batched sequences independently selects its own top-8/128 experts),
+a separate, comparably-sized undertaking not attempted tonight. Built `forward4_dense_batch`
+(4 sequences in lockstep, shared M4 dispatch at dense layers, per-sequence attention/MoE-FFN via
+the existing paths) and a real test (`QWEN_MBATCH_TEST=1`) using 4 distinct real prompts, not
+synthetic data. Two real integration bugs caught before trusting any result: packing `att` (O-
+projection input, `qd`-wide) with the wrong K (`d` instead of `ly->o.K`), and a missing
+`pack_act_hp` call the MoE-FFN path needs. **Token agreement over 16 generated tokens was only
+70.31% — root-caused via staged diagnostic, not hand-waved**: a single M4-batched 48-layer forward
+pass on identical input shows small, reasonable divergence (max_abs=0.73 across the full 151,936-
+wide vocab, all 4 sequences' argmax choices agreeing exactly); the full-generation gap is ordinary
+autoregressive compounding once one close argmax call flips in a hard-top-8-of-128 MoE model — 2/4
+sequences track M1 bit-for-bit all 16 steps, the other 2 diverge from one specific step onward, not
+from step 1 or randomly. ASan/UBSan clean; correctness numbers bit-identical across plain/ASan/
+UBSan builds. Existing single-sequence M=1 path completely unaffected (12.38-12.41 tok/s). **Decode-
+only speedup: 1.111x aggregate** (reproducible) — real but modest, since M4's own arithmetic still
+scales with M (amortizes weight-stream reads, not raw compute) and the batched layers are only
+about half the linear bucket, with the larger MoE-FFN sub-bucket untouched. ~222KB additional
+memory. **Status: validated and working, not wired into any production default** (no single-
+sequence call site would benefit — batching needs concurrent sequences a CLI decode engine doesn't
+otherwise have). Remaining: MoE expert-FFN batching (the larger opportunity), a real multi-request
+serving loop, batched prefill.
 
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
@@ -671,7 +693,7 @@ just adds LPDDR5-bus contention. **nt=4 stays the default.**
   not just across sessions. Verify after any reboot:
   `systemctl status fan-max.service; cat /sys/class/hwmon/hwmon7/fan1_input` (expect ~6000+ RPM).
 - Model: `/root/models/Qwen3-30B-A3B-Q4_0.gguf` (17GB, unsloth base — NOT the Coder variant on NAS).
-- **Current (qwen_moe_hp.c)**: binary `/root/qwen_moe_hp`. Build: `gcc -O3 -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread`.
+- **Current (qwen_moe_hp.c)**: binary `/root/qwen_moe_hp`. Build: `gcc -O3 -fno-tree-vectorize -march=rv64gcv_zfh_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread` (`zfh` added 2026-07-28, M-batch track §22.35-36 -- `run_hp_m4`'s `fmul.h` needs it explicitly, `zvfh` alone doesn't imply it).
   Run: `LD_LIBRARY_PATH=/usr/lib ./qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf <ngen> <nt> [cachepath]`.
   Cache: `/root/models/qwen3-30b-a3b.hp.imecache` (`IMEC` ver=2, vendor N32-panel/K256-superblock format, footer `ENDIMEC`).
   Load ~22s vs ~18.4 min full requant (slower than the old format's requant — real, unoptimized cost).

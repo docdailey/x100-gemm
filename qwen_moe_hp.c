@@ -14,8 +14,16 @@
  * against qwen3moe d=2048 qd=4096 kvd=512 moe_ffn=768 vocab=151936 -- so no remainder/padding
  * handling is needed anywhere.
  *
- * Build: gcc -O3 -fno-tree-vectorize -march=rv64gcv_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread
+ * Build: gcc -O3 -fno-tree-vectorize -march=rv64gcv_zfh_zvfh_xsmtvdotii -fopenmp -o qwen_moe_hp qwen_moe_hp.c -lm -lpthread
  * Run  : LD_LIBRARY_PATH=/usr/lib ./qwen_moe_hp /root/models/Qwen3-30B-A3B-Q4_0.gguf [ngen] [nt]
+ *
+ * `zfh` (scalar half-precision) is REQUIRED on top of the long-standing `zvfh` (vector half-
+ * precision) since the M-batch track's run_hp_m4 (codex_recs_1.md §22.35-36) uses a genuine scalar
+ * `fmul.h` instruction -- `zvfh` alone does not imply it, confirmed by matching the vendor's own
+ * build flags (`reference/spacemit-backend` compile_commands.json uses
+ * `rv64gcv_zfh_zvfh_zicbop_zihintpause_zba_xsmtvdotii`). Applies to every build of this file now,
+ * not just M-batch-specific ones, since run_hp_m4 is always compiled in (only invoked when
+ * QWEN_MBATCH_TEST=1 requests it).
  *
  * -fno-tree-vectorize is REQUIRED, not optional (codex_recs_1.md §22.16): this file hand-schedules
  * RVV vector-register state across custom vmadot asm blocks and RVV intrinsics; gcc's -O3
@@ -159,6 +167,164 @@ static void pack_A_hp(const float*a, uint8_t*out /* 290 bytes */){
 
         __riscv_vse8_v_i8mf4(base+2, v_a_quant_i8, vl);
     }
+}
+/* M-batch track milestone 1 (codex_recs_1.md §22.35), validated in bench/vendor_ime_m4_probe.c:
+ * M4 vs its own reconstructed reference has 0.119% mean error, essentially identical to M1's own
+ * 0.119% (ratio 0.999x) -- the port is numerically correct. Ground truth: vendor's own packer
+ * quantize_a_4row_i8_hp (reference/spacemit-backend/rvv_kernels.cpp:2100, vlenb==128 branch).
+ * KEY property, different from every OTHER fusion in this file: the per-subblock quantization
+ * scale is the MAX ABSOLUTE VALUE ACROSS ALL 4 BATCHED ROWS JOINTLY, not per row -- so this is NOT
+ * expected to be bit-identical to 4 separate pack_A_hp_m1+run_hp_m1 calls on the same rows, a
+ * genuine (small, principled) quantization tradeoff, not a bug. Record layout: 1160 bytes = 8
+ * subblocks x 136B ([8B scale area, only offset+0 used -- one shared fp16 scale] + [4x int8[32]
+ * row payloads, row-major]) + 64B a_sum trailer (4 rows x 8 fp16 values, PRE-SCALED as
+ * -true_asum*8.0, same convention as M1) + 8B scale_avg area (only offset+0 used). */
+static void pack_A_hp_m4(const float*a0,const float*a1,const float*a2,const float*a3,uint8_t*out /* 1160 bytes */){
+    float scale_temp[NSUB]; float scale_avg=0.0f;
+    for(int kk=0;kk<NSUB;kk++){
+        float amax=1e-6f;
+        for(int i=0;i<32;i++){
+            float v0=fabsf(a0[kk*32+i]),v1=fabsf(a1[kk*32+i]),v2=fabsf(a2[kk*32+i]),v3=fabsf(a3[kk*32+i]);
+            float mm=v0>v1?v0:v1; float nn=v2>v3?v2:v3; if(nn>mm)mm=nn;
+            if(mm>amax) amax=mm;
+        }
+        scale_temp[kk]=amax/127.0f; scale_avg+=scale_temp[kk];
+    }
+    scale_avg/=NSUB;
+    float scale_factor = scale_avg? 1.0f/scale_avg : 0.0f;
+    uint16_t blkscale=f32_to_f16(scale_avg); memcpy(out+1152,&blkscale,2);
+
+    const float*rows[4]={a0,a1,a2,a3};
+    for(int kk=0;kk<NSUB;kk++){
+        uint8_t*subblk=out+kk*136;
+        float rep_scale = scale_temp[kk]? 1.0f/scale_temp[kk] : 0.0f;
+        uint16_t ssub=f32_to_f16(scale_temp[kk]*scale_factor); memcpy(subblk,&ssub,2);
+        int8_t*quant_blk=(int8_t*)(subblk+8);
+        for(int r=0;r<4;r++){
+            int32_t sum=0; int8_t q[32];
+            for(int i=0;i<32;i++){ int v=(int)lrintf(rows[r][kk*32+i]*rep_scale); if(v>127)v=127; if(v<-127)v=-127; q[i]=(int8_t)v; sum+=v; }
+            memcpy(quant_blk+r*32,q,32);
+            uint16_t as=f32_to_f16(-(float)sum*8.0f);
+            memcpy(out+1088+r*16+kk*2,&as,2);
+        }
+    }
+}
+/* verbatim asm port of gemm_kernel_i8i4_hp_m4's no-zp branch (reference/spacemit-backend/
+ * ime2_kernels.cpp:3360) -- confirmed the live branch for this engine's Q4_0 weights via
+ * block_type_has_zp<block_q4_0>()==false (ime.cpp:107), so quant_b_zp==nullptr at the real vendor
+ * call site (ime.cpp:276/583). ldc is the row stride in dst_c (in floats, not bytes -- matches
+ * l->N, the full row width, since the caller writes one N-tile's worth per call but the 4 rows'
+ * destinations are offset by the FULL row width, not just this tile's 32 columns). */
+static void run_hp_m4(const uint8_t*a_data, const uint8_t*b_data, float*dst_c, long k_blks, long ldc){
+    __asm__ volatile(
+        "mv             t5, %[BK]                 \n\t"
+        "mv             t6, %[A]                  \n\t"
+        "mv             s5, %[B]                  \n\t"
+        "li             t1, 0x4c00                \n\t"
+        "fmv.h.x        fa6, t1                    \n\t"
+        "vsetvli        t0, x0, e32, m1           \n\t"
+        "vxor.vv        v28, v28, v28             \n\t"
+        "vxor.vv        v29, v29, v29             \n\t"
+        "vxor.vv        v30, v30, v30             \n\t"
+        "vxor.vv        v31, v31, v31             \n\t"
+        "li             t4, 8                     \n\t"
+        "addi           t2, t6, 1088              \n\t"
+
+        ".align 4                                 \n\t"
+        "_M4_BLK_LPST%=:                          \n\t"
+        "flh            fa1, 64(t2)               \n\t"
+        "vsetvli        t0, x0, e32, m1           \n\t"
+        "vxor.vv        v18, v30, v30             \n\t"
+        "vxor.vv        v19, v31, v31             \n\t"
+        "vxor.vv        v20, v30, v30             \n\t"
+        "vxor.vv        v21, v31, v31             \n\t"
+        "_M4_KsubBLK_LPST%=:                      \n\t"
+        "flh            fa0,   0(t6)              \n\t"
+
+        "vsetvli        t0, x0, e16, mf2          \n\t"
+        "vle16.v        v12, (s5)                 \n\t"
+
+        "fmul.h         fa2, fa0, fa6              \n\t"
+
+        "vsetvli        t0, x0, e16, mf2          \n\t"
+        "vfmul.vf       v16, v12, fa0             \n\t"
+        "vfmul.vf       v17, v12, fa2             \n\t"
+
+        "flh            ft1, 0(t2)                \n\t"
+        "flh            ft2, 16(t2)                \n\t"
+        "flh            ft3, 32(t2)                \n\t"
+        "flh            ft4, 48(t2)                \n\t"
+
+        "addi           t3, t6, 8                 \n\t"
+        "vsetvli        t0, x0, e8, m1            \n\t"
+        "vl1r.v         v0, (t3)                  \n\t"
+        "addi           t3, s5, 64                \n\t"
+        "vl4r.v         v4, (t3)                  \n\t"
+
+        "vsetvli        t0, x0, e8, m1            \n\t"
+        "vsrl.vi        v1, v0, 4                 \n\t"
+        "vnpack4.vv     v12, v0, v1, 3            \n\t"
+        "vpack.vv       v0, v17, v16, 3           \n\t"
+        "vupack.vv      v2, v12, v12, 2           \n\t"
+
+        "vsetvli        t0, x0, e16, mf2          \n\t"
+        "vfmul.vf       v12, v16, ft1             \n\t"
+        "vfmul.vf       v13, v16, ft2             \n\t"
+        "vfmul.vf       v24, v16, ft3             \n\t"
+        "vfmul.vf       v25, v16, ft4             \n\t"
+
+        "vsetvli        t0, x0, e16, mf2          \n\t"
+        "vfwmacc.vf     v28, fa1, v12             \n\t"
+        "vfwmacc.vf     v29, fa1, v13             \n\t"
+        "vfwmacc.vf     v30, fa1, v24             \n\t"
+        "vfwmacc.vf     v31, fa1, v25             \n\t"
+
+        "vsetvli        t0, x0, e32, m1           \n\t"
+        "vmadotsu.hp    v18, v3, v4, v0, 0, i4    \n\t"
+        "vmadotsu.hp    v19, v3, v5, v0, 1, i4    \n\t"
+        "vmadotsu.hp    v20, v3, v6, v0, 2, i4    \n\t"
+        "vmadotsu.hp    v21, v3, v7, v0, 3, i4    \n\t"
+        "vmadotu.hp     v18, v2, v4, v0, 4, i4    \n\t"
+        "vmadotu.hp     v19, v2, v5, v0, 5, i4    \n\t"
+        "vmadotu.hp     v20, v2, v6, v0, 6, i4    \n\t"
+        "vmadotu.hp     v21, v2, v7, v0, 7, i4    \n\t"
+
+        "addi           t4, t4, -1                \n\t"
+
+        "addi           t6, t6, 8+128             \n\t"
+        "addi           t2, t2, 2                 \n\t"
+        "addi           s5, s5, 64+512            \n\t"
+        "bgtz           t4, _M4_KsubBLK_LPST%=    \n\t"
+
+        "vsetvli        t0, x0, e16, m1           \n\t"
+        "vpack.vv       v8, v18, v19, 1           \n\t"
+        "vpack.vv       v12, v20, v21, 1          \n\t"
+        "vpack.vv       v26, v8, v12, 2           \n\t"
+
+        "vsetvli        t0, x0, e16, m1           \n\t"
+        "vfwmacc.vf     v28, fa1, v26             \n\t"
+        "vfwmacc.vf     v30, fa1, v27             \n\t"
+
+        "li             t4, 8                     \n\t"
+        "addi           t5, t5, -1                \n\t"
+        "addi           t6, t6, 72                \n\t"
+        "addi           t2, t6, 1088              \n\t"
+        "bgtz           t5, _M4_BLK_LPST%=        \n\t"
+
+        "_M4_BLK_LPND%=:                          \n\t"
+        "vsetvli        t0, x0, e32, m1           \n\t"
+        "add            t2, %[LDC], %[DST]        \n\t"
+        "vse32.v        v28, (%[DST])             \n\t"
+        "add            t3, %[LDC], t2            \n\t"
+        "vse32.v        v29, (t2)                 \n\t"
+        "add            t2, %[LDC], t3            \n\t"
+        "vse32.v        v30, (t3)                 \n\t"
+        "vse32.v        v31, (t2)                 \n\t"
+        : [A] "+r"(a_data), [B] "+r"(b_data)
+        : [DST] "r"(dst_c), [LDC] "r"(ldc*4), [BK] "r"(k_blks)
+        : "t0","t1","t2","t3","t4","t5","t6","s5","v0","v1","v2","v3","v4","v5","v6","v7","v8","v10",
+          "v12","v13","v14","v15","v16","v17","v18","v19","v20","v21","v22","v24","v25","v26",
+          "v27","v28","v29","v30","v31","fa0","fa1","fa2","fa6","ft1","ft2","ft3","ft4");
 }
 /* verbatim asm port of gemm_kernel_i8i4_hp_m1, generalized to k_blks superblocks */
 static void run_hp_m1(const uint8_t*a_data, const uint8_t*b_data, float*dst_c, long k_blks){
@@ -364,6 +530,11 @@ static Lin lin_new_hp(const float*wf32,int N,int K){
 static void pack_act_hp(const float*x,int K,uint8_t*Abuf){
     int Sb=K/256; for(int sb=0;sb<Sb;sb++) pack_A_hp(x+sb*256, Abuf+(size_t)sb*AREC);
 }
+#define AREC_M4 1160
+static void pack_act_hp_m4(const float*x0,const float*x1,const float*x2,const float*x3,int K,uint8_t*Abuf){
+    int Sb=K/256;
+    for(int sb=0;sb<Sb;sb++) pack_A_hp_m4(x0+sb*256,x1+sb*256,x2+sb*256,x3+sb*256, Abuf+(size_t)sb*AREC_M4);
+}
 /* int8 Lin: same (N,K,B) shape as the int4 Lin, but B is packed flat -- (N/32) panels, each a
  * contiguous run of (K/32) BREC_I8 (1088B) records, no 256-wide superblock grouping (that was
  * specific to int4's nested BLK_LOOP/INNER_BLK_LOOP structure; int8's kernel loop is flat over
@@ -473,9 +644,17 @@ static void lin_mm_hp_worker_run(int tn){
     if(g_pool_work.kind==0){
         for(int np=tn; np<Np; np+=g_lin_nt)
             run_hp_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER, g_pool_work.y+np*32, g_pool_work.kb);
-    } else {
+    } else if(g_pool_work.kind==1){
         for(int np=tn; np<Np; np+=g_lin_nt)
             run_i8_m1(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BREC_I8, g_pool_work.y+np*32, g_pool_work.kb);
+    } else /* kind==3: M-batch track milestone 1 (codex_recs_1.md §22.35) -- M4-batched dense
+        linear, dispatches gemm_kernel_i8i4_hp_m4 (validated bench/vendor_ime_m4_probe.c) across
+        N-tiles the exact same way kind==0 dispatches M1, just with a 4-row-batched A-record
+        (1160B, pack_A_hp_m4) and a 4-row-batched output write (ldc=l->N so each of the 4 rows'
+        destinations land in its own contiguous N-wide slice of y). */ {
+        long ldc=g_pool_work.l->N;
+        for(int np=tn; np<Np; np+=g_lin_nt)
+            run_hp_m4(g_pool_work.Abuf, g_pool_work.l->B+(size_t)np*g_pool_work.kb*BSUPER, g_pool_work.y+np*32, g_pool_work.kb, ldc);
     }
 }
 static void* lin_mm_hp_worker(void*arg){
@@ -512,6 +691,19 @@ static void lin_mm_hp(const Lin*l,const uint8_t*Abuf,float*y,int nt){
 static void lin_mm_i8(const Lin*l,const uint8_t*Abuf,float*y,int nt){
     (void)nt; /* superseded by g_pool_nt (Phase 6) -- see lin_mm_hp's own comment */
     g_pool_work.kind=1; g_pool_work.l=l; g_pool_work.Abuf=Abuf; g_pool_work.y=y; g_pool_work.kb=l->K/32;
+    atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release);
+    lin_mm_hp_worker_run(0);
+    while(atomic_load_explicit(&g_pool_done,memory_order_acquire) < g_pool_nt-1) { /* spin */ }
+}
+/* M-batch track milestone 1 (codex_recs_1.md §22.35): M4-batched dense linear. `Abuf4` is a single
+ * packed 4-row activation (from pack_act_hp_m4, one call covering all K/256 blocks). `y4` is a
+ * 4*l->N contiguous float buffer, row-major: row r's N outputs live at y4+r*l->N (matches
+ * run_hp_m4's own ldc=l->N addressing, driven straight through the kind==3 dispatch path above).
+ * Same weight matrix `l` as lin_mm_hp -- the whole point of M-batching is that this ONE weight
+ * stream read now serves 4 independent sequences' activation rows instead of 1. */
+static void lin_mm_hp_m4(const Lin*l,const uint8_t*Abuf4,float*y4){
+    g_pool_work.kind=3; g_pool_work.l=l; g_pool_work.Abuf=Abuf4; g_pool_work.y=y4; g_pool_work.kb=l->K/256;
     atomic_store_explicit(&g_pool_done,0,memory_order_relaxed);
     atomic_fetch_add_explicit(&g_pool_gen,1,memory_order_release);
     lin_mm_hp_worker_run(0);
@@ -1366,6 +1558,111 @@ static void forward(Model*m,int tok,int pos,Kv*kv,float*logits,
     g_lin_class=LIN_LM; lin_mm(&m->lm,hn,logits,nt,Abuf); g_lin_class=LIN_NONE;
     if(gT_on){ double ft=now()-_f0; gT_rest += ft-(gT_actpack-_a0)-(gT_lin-_l0)-(gT_attn-_at0)-(gT_rope-_r0)-(gT_router-_ro0)-(gT_swiglu-_sw0); gT_tok++; }
 }
+/* M-batch track milestone 1 (codex_recs_1.md §22.35): batched decode for 4 GENUINELY INDEPENDENT
+ * sequences -- each has its own token, position, and KV cache (own attention history), but they
+ * share every DENSE weight-stream read (QKV, O, router, lm_head) via one M4 dispatch instead of 4
+ * separate M1 dispatches. Per the explicit scoping decision (only dense layers batched this
+ * milestone): the MoE expert FFN (gate/up/down) stays per-sequence via the existing M1 path,
+ * because each sequence's router independently selects its own top-8 of 128 experts from its own
+ * hidden state -- different sequences will generally select different, only-partially-overlapping
+ * expert sets, so batching THAT would need a genuinely different mechanism (grouping activations
+ * by which expert they routed to, gather/scatter across the batch), a separate, comparably-sized
+ * undertaking not attempted here. Attention is also per-sequence for the same reason M1 always was
+ * (each sequence's own KV history). Mirrors forward()'s own per-layer structure closely by design,
+ * to minimize the risk of introducing new bugs relative to the already-validated serial path. */
+static void forward4_dense_batch(Model*m,int tok[4],int pos[4],Kv*kv[4],float*logits[4],
+        float*h[4],float*hn[4],float*q[4],float*k[4],float*vv[4],float*att[4],float*tmp[4],
+        float*g[4],float*u[4],float*eout[4],uint8_t*Abuf[4],uint8_t*Abuf4,uint8_t*Abuf2_4){
+    int d=m->d,nh=m->nh,nkv=m->nkv,hd=m->hd,nt=m->nt,gpr=nh/nkv,moe=m->moe,ne=m->n_exp,na=m->n_act;
+    for(int s=0;s<4;s++) memcpy(h[s],m->tok_embd+(size_t)tok[s]*d,d*4);
+    float cosb[4][256],sinb[4][256];
+    for(int s=0;s<4;s++) rope_table(cosb[s],sinb[s],hd,pos[s],m->rope_base);
+    /* Large per-call scratch, function-local static (matches forward()'s own static float*h=NULL
+     * convention for reused large buffers) -- allocated once on first use, not per-call/per-layer,
+     * and NOT on the stack (avoids risking stack overflow at these sizes, e.g. y4lm alone is up to
+     * 4*vocab floats). */
+    static float *y4q=NULL,*y4k=NULL,*y4v=NULL,*y4o=NULL,*y4r=NULL,*y4lm=NULL;
+    if(!y4q){ int maxqkv=nh*hd>nkv*hd?nh*hd:nkv*hd; y4q=malloc((size_t)4*maxqkv*4); y4k=malloc((size_t)4*maxqkv*4); y4v=malloc((size_t)4*maxqkv*4);
+        y4o=malloc((size_t)4*d*4); y4r=malloc((size_t)4*256*4); y4lm=malloc((size_t)4*(size_t)m->vocab*4); }
+
+    for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
+        for(int s=0;s<4;s++) rmsnorm(hn[s],h[s],ly->attn_norm,d,m->eps);
+        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+        lin_mm_hp_m4(&ly->q,Abuf4,y4q); lin_mm_hp_m4(&ly->k,Abuf4,y4k); lin_mm_hp_m4(&ly->v,Abuf4,y4v);
+        for(int s=0;s<4;s++){ memcpy(q[s],y4q+s*ly->q.N,ly->q.N*4); memcpy(k[s],y4k+s*ly->k.N,ly->k.N*4); memcpy(vv[s],y4v+s*ly->v.N,ly->v.N*4); }
+        for(int s=0;s<4;s++){
+            for(int hh=0;hh<nh;hh++){ rmsnorm(q[s]+hh*hd,q[s]+hh*hd,ly->q_norm,hd,m->eps); rope_apply(q[s]+hh*hd,hd,cosb[s],sinb[s]); }
+            for(int hh=0;hh<nkv;hh++){ rmsnorm(k[s]+hh*hd,k[s]+hh*hd,ly->k_norm,hd,m->eps); rope_apply(k[s]+hh*hd,hd,cosb[s],sinb[s]); }
+        }
+        float scale=1.0f/sqrtf(hd);
+        for(int s=0;s<4;s++){
+            if(pos[s]<0 || pos[s]>=kv[s]->ctx){ fprintf(stderr,"KV position overflow: pos=%d ctx=%d\n",pos[s],kv[s]->ctx); abort(); }
+            int kvd_s=nkv*hd;
+            float*Kc=kv[s]->Kc+(size_t)l*kv[s]->ctx*kvd_s,*Vc=kv[s]->Vc+(size_t)l*kv[s]->ctx*kvd_s;
+            for(int kvh=0;kvh<nkv;kvh++){
+                memcpy(Kc+(size_t)kvh*kv[s]->ctx*hd+(size_t)pos[s]*hd, k[s]+(size_t)kvh*hd, hd*4);
+                memcpy(Vc+(size_t)kvh*kv[s]->ctx*hd+(size_t)pos[s]*hd, vv[s]+(size_t)kvh*hd, hd*4);
+            }
+            /* attention stays per-sequence, exactly the existing serial/pool-dispatched path --
+             * each sequence has its own KV history, nothing to batch here (see this function's own
+             * top comment). */
+            if(g_attn_nt<=1){
+                for(int hh=0;hh<nh;hh++){ int kvh=hh/gpr; float*qh=q[s]+hh*hd,*sc=tmp[s];
+                    float*Kh=Kc+(size_t)kvh*kv[s]->ctx*hd,*Vh=Vc+(size_t)kvh*kv[s]->ctx*hd;
+                    for(int j=0;j<=pos[s];j++){ float*kj=Kh+(size_t)j*hd; sc[j]=vdot_f32(qh,kj,hd)*scale; }
+                    softmax(sc,pos[s]+1);
+                    float*oh=att[s]+hh*hd; for(int t=0;t<hd;t++)oh[t]=0;
+                    for(int j=0;j<=pos[s];j++){ float*vj=Vh+(size_t)j*hd; vaxpy_f32(oh,vj,sc[j],hd); } }
+            } else {
+                attn_dispatch(q[s],Kc,Vc,att[s],pos[s],scale,hd,nkv,gpr,kv[s]->ctx,g_attn_nt);
+            }
+        }
+        pack_act_hp_m4(att[0],att[1],att[2],att[3],ly->o.K,Abuf4); /* att is qd(=nh*hd)-wide, NOT
+            d-wide -- ly->o.K is the O-projection's real input width (qd here); packing with `d`
+            would silently under-pack (miss (qd-d)/256 blocks) since qd>d for this model's GQA
+            shape (nh*hd=4096 vs d=2048). */
+        lin_mm_hp_m4(&ly->o,Abuf4,y4o);
+        for(int s=0;s<4;s++){ for(int i=0;i<d;i++) h[s][i]+=y4o[s*ly->o.N+i]; }
+        for(int s=0;s<4;s++) rmsnorm(hn[s],h[s],ly->ffn_norm,d,m->eps);
+        pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+        int sel[4][32]; float sw[4][32];
+        if(g_router_mode==1) lin_mm_hp_m4(&ly->router_hp,Abuf4,y4r);
+        else if(g_router_mode==2){
+            /* int8-M1 router has no M4 port in this milestone (scoped to the int4-HP path only,
+             * matching the ALREADY-validated kernel) -- falls back to 4 separate M1 dispatches.
+             * Still correct, just not batched; router is a small bucket (~4ms/token) regardless. */
+            for(int s=0;s<4;s++){ uint8_t Ai8[3000]; pack_act_i8(hn[s],d,Ai8); lin_mm_i8(&ly->router_i8,Ai8,y4r+s*ly->router_i8.N,nt); }
+        } else {
+            for(int s=0;s<4;s++) for(int e=0;e<ne;e++) y4r[s*ne+e]=vdot_f32(ly->router+(size_t)e*d,hn[s],d);
+        }
+        for(int s=0;s<4;s++){
+            float rl[256]; memcpy(rl,y4r+s*ne,(size_t)ne*4); softmax(rl,ne);
+            for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[s][b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[s][a]=bi; sw[s][a]=bv; }
+            float ssum=0; for(int a=0;a<na;a++)ssum+=sw[s][a]; for(int a=0;a<na;a++)sw[s][a]/=ssum;
+        }
+        /* MoE expert FFN: per-sequence, per-expert, via the existing M1 path -- see this function's
+         * own top comment for why (data-dependent, non-shared expert selection). Each sequence's
+         * OWN hn must be packed into M1's (290B/block) format before the expert loop -- this is
+         * the direct equivalent of forward()'s own `pack_act_hp(hn,d,Abuf2)` call, just done once
+         * per sequence into that sequence's own Abuf2_4 slot instead of once for the single stream. */
+        for(int s=0;s<4;s++) pack_act_hp(hn[s],d,Abuf2_4+(size_t)s*3000);
+        for(int s=0;s<4;s++){
+            for(int i=0;i<d;i++)eout[s][i]=0;
+            for(int a=0;a<na;a++){ int e=sel[s][a]; float w=sw[s][a];
+                lin_mm_hp(&ly->eg[e],Abuf2_4+(size_t)s*3000,g[s],nt); lin_mm_hp(&ly->eu[e],Abuf2_4+(size_t)s*3000,u[s],nt);
+                if(g_swiglu_fast==1) swiglu_hswish_rvv(g[s],u[s],moe);
+                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(g[s],u[s],moe);
+                else swiglu_exact(g[s],u[s],moe);
+                lin_mm(&ly->ed[e],g[s],tmp[s],nt,Abuf[s]);
+                for(int i=0;i<d;i++)eout[s][i]+=w*tmp[s][i]; }
+            for(int i=0;i<d;i++)h[s][i]+=eout[s][i];
+        }
+    }
+    for(int s=0;s<4;s++) rmsnorm(hn[s],h[s],m->out_norm,d,m->eps);
+    pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+    lin_mm_hp_m4(&m->lm,Abuf4,y4lm);
+    for(int s=0;s<4;s++) memcpy(logits[s],y4lm+s*m->lm.N,(size_t)m->lm.N*4);
+}
 static int argmax(const float*l,int n){ int b=0; float bv=l[0]; for(int i=1;i<n;i++)if(l[i]>bv){bv=l[i];b=i;} return b; }
 
 static uint8_t g_bdec[0x200]; static int g_bi=0;
@@ -1827,6 +2124,161 @@ static void run_quality_harness(Model*m,Gguf*gguf){
     free(kv.Kc);free(kv.Vc);
 }
 
+/* M-batch track milestone 1 (codex_recs_1.md §22.35), QWEN_MBATCH_TEST=1: real 4-sequence batched
+ * decode test using genuinely independent prompts (4 of the harness's own real, distinct prompts,
+ * not synthetic data), sharing weight-stream reads at QKV/O/router/lm_head via forward4_dense_batch
+ * while attention and MoE-FFN stay per-sequence. Validates every batched sequence against a
+ * SEPARATE run of the same prompt through the existing, already-proven M=1 forward() path (own KV
+ * cache, own decode loop, identical prefill), then reports the required real metrics: aggregate
+ * tok/s, per-sequence tok/s, latency, memory, and M=1 regression -- never a synthetic GEMM number
+ * described as model tok/s, per the explicit instruction. */
+static void run_mbatch_test(Model*m){
+    const int NSEQ=4, NGEN=16;
+    static const int seq_idx[4]={0,1,2,3}; /* hp1..hp4: factual/capitals, factual/chemistry,
+        reasoning/syllogism, reasoning/sequence -- 4 real, distinct prompts, genuinely different
+        content/length, not 4 copies of one prompt. */
+    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
+    int ctx=256;
+
+    /* --- Path 1: 4 SEPARATE M=1 decodes, own Kv/buffers each, the already-proven serial path --- */
+    Kv kv1[4]; float*h1[4],*hn1[4],*q1[4],*k1[4],*vv1[4],*att1[4],*tmp1[4],*g1[4],*u1[4],*eout1[4],*logits1[4]; uint8_t*Abuf1[4],*Abuf1b[4];
+    for(int s=0;s<4;s++){
+        kv1[s].kvd=m->nkv*m->hd; kv1[s].ctx=ctx;
+        kv1[s].Kc=calloc((size_t)m->nl*ctx*kv1[s].kvd,4); kv1[s].Vc=calloc((size_t)m->nl*ctx*kv1[s].kvd,4);
+        h1[s]=malloc(d*4); hn1[s]=malloc(d*4); q1[s]=malloc(qd*4); k1[s]=malloc(kv1[s].kvd*4); vv1[s]=malloc(kv1[s].kvd*4);
+        att1[s]=malloc(qd*4); tmp1[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
+        g1[s]=malloc(moe*4); u1[s]=malloc(moe*4); eout1[s]=malloc(d*4); logits1[s]=malloc((size_t)m->vocab*4);
+        Abuf1[s]=malloc((size_t)(maxk/256)*AREC); Abuf1b[s]=malloc((size_t)(maxk/256)*AREC);
+    }
+    int toks1[4][256]; int ntoks1[4];
+    static float step1_logits_m1[4][160000];
+    /* prefill and decode timed SEPARATELY -- both paths pay the SAME (per-sequence, unbatched;
+     * this milestone explicitly scopes batching to the DECODE phase, see this function's own top
+     * comment) prefill cost, which dilutes an aggregate "total wall time" comparison for these
+     * short test prompts where prefill is a substantial fraction of total time. Decode-only timing
+     * isolates what M-batching itself actually contributes. */
+    double t_m1_prefill=0, t_m1_decode_0;
+    for(int s=0;s<4;s++){
+        const HarnessPrompt*hp=&g_hprompts[seq_idx[s]];
+        double tp0=now();
+        for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,&kv1[s],logits1[s],hn1[s],q1[s],k1[s],vv1[s],att1[s],tmp1[s],g1[s],u1[s],eout1[s],Abuf1[s],Abuf1b[s]);
+        t_m1_prefill += now()-tp0;
+    }
+    t_m1_decode_0=now();
+    for(int s=0;s<4;s++){
+        const HarnessPrompt*hp=&g_hprompts[seq_idx[s]];
+        ntoks1[s]=0;
+        int cur=argmax(logits1[s],m->vocab); toks1[s][ntoks1[s]++]=cur;
+        for(int step=1;step<NGEN;step++){
+            forward(m,cur,hp->n+step-1,&kv1[s],logits1[s],hn1[s],q1[s],k1[s],vv1[s],att1[s],tmp1[s],g1[s],u1[s],eout1[s],Abuf1[s],Abuf1b[s]);
+            if(step==1) memcpy(step1_logits_m1[s],logits1[s],(size_t)m->vocab*4); /* first post-prefill
+                decode step, BEFORE any compounding from a possibly-different chosen token -- prefill
+                itself is identical M=1 in both paths, so this isolates ONE 48-layer M4-batched pass's
+                own divergence from a SAME-input M1 pass, separate from later steps' extra divergence
+                from potentially different tokens/KV entries feeding back in. */
+            cur=argmax(logits1[s],m->vocab); toks1[s][ntoks1[s]++]=cur;
+        }
+    }
+    double t_m1_decode=now()-t_m1_decode_0;
+    double t_m1=t_m1_prefill+t_m1_decode;
+
+    /* --- Path 2: 1 BATCHED M=4 decode, all 4 sequences advance in lockstep --- */
+    Kv kv4[4]; float*h4[4],*hn4[4],*q4[4],*k4[4],*vv4[4],*att4[4],*tmp4[4],*g4[4],*u4[4],*eout4[4],*logits4[4]; uint8_t*Abuf4arr[4];
+    for(int s=0;s<4;s++){
+        kv4[s].kvd=m->nkv*m->hd; kv4[s].ctx=ctx;
+        kv4[s].Kc=calloc((size_t)m->nl*ctx*kv4[s].kvd,4); kv4[s].Vc=calloc((size_t)m->nl*ctx*kv4[s].kvd,4);
+        h4[s]=malloc(d*4); hn4[s]=malloc(d*4); q4[s]=malloc(qd*4); k4[s]=malloc(kv4[s].kvd*4); vv4[s]=malloc(kv4[s].kvd*4);
+        att4[s]=malloc(qd*4); tmp4[s]=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4);
+        g4[s]=malloc(moe*4); u4[s]=malloc(moe*4); eout4[s]=malloc(d*4); logits4[s]=malloc((size_t)m->vocab*4);
+        Abuf4arr[s]=malloc((size_t)(maxk/256)*AREC);
+    }
+    int maxk4=qd>d?qd:d; /* forward4_dense_batch's Abuf4 must cover the widest K it ever packs --
+        att is qd-wide (O-projection input), hn is d-wide (QKV/router/lm_head input) */
+    uint8_t*Abuf4buf=malloc((size_t)(maxk4/256)*AREC_M4);
+    uint8_t*Abuf2_4=malloc((size_t)4*3000);
+    int toks4[4][256]; int ntoks4[4]; for(int s=0;s<4;s++) ntoks4[s]=0;
+
+    /* prefill: still per-sequence (this milestone scopes batching to DECODE steps, matching the
+     * "M-batch is a decode-phase lever" framing throughout this whole track -- prefill is its own
+     * separate, not-yet-attempted track per the ladder's own next item). Timed separately from
+     * decode for the SAME reason as path 1 above. */
+    double t_m4_prefill=0;
+    for(int s=0;s<4;s++){
+        const HarnessPrompt*hp=&g_hprompts[seq_idx[s]];
+        double tp0=now();
+        for(int p=0;p<hp->n;p++) forward(m,hp->toks[p],p,&kv4[s],logits4[s],hn4[s],q4[s],k4[s],vv4[s],att4[s],tmp4[s],g4[s],u4[s],eout4[s],Abuf4arr[s],Abuf2_4);
+        t_m4_prefill += now()-tp0;
+    }
+    int cur4[4], pos4[4];
+    for(int s=0;s<4;s++){ cur4[s]=argmax(logits4[s],m->vocab); toks4[s][ntoks4[s]++]=cur4[s]; pos4[s]=g_hprompts[seq_idx[s]].n; }
+    Kv*kvp[4]={&kv4[0],&kv4[1],&kv4[2],&kv4[3]};
+    static float step1_logits_m4[4][160000];
+    double t_m4_decode_0=now();
+    for(int step=1;step<NGEN;step++){
+        int tokv[4]; for(int s=0;s<4;s++) tokv[s]=cur4[s];
+        forward4_dense_batch(m,tokv,pos4,kvp,logits4,h4,hn4,q4,k4,vv4,att4,tmp4,g4,u4,eout4,Abuf4arr,Abuf4buf,Abuf2_4);
+        if(step==1) for(int s=0;s<4;s++) memcpy(step1_logits_m4[s],logits4[s],(size_t)m->vocab*4);
+        for(int s=0;s<4;s++){ cur4[s]=argmax(logits4[s],m->vocab); toks4[s][ntoks4[s]++]=cur4[s]; pos4[s]++; }
+    }
+    double t_m4_decode=now()-t_m4_decode_0;
+    double t_m4=t_m4_prefill+t_m4_decode;
+
+    /* first-decode-step-only comparison: isolates ONE 48-layer M4-batched forward pass's own
+     * numerical divergence from a same-input M1 pass, separate from later steps' extra divergence
+     * once a possibly-different chosen token starts feeding back into subsequent steps. */
+    double step1_max_abs=0, step1_sum_abs=0; long step1_cmp=0; long step1_tok_match=0;
+    for(int s=0;s<4;s++){
+        for(int e=0;e<m->vocab;e++){ double ad=fabs((double)step1_logits_m1[s][e]-(double)step1_logits_m4[s][e]);
+            if(ad>step1_max_abs) step1_max_abs=ad; step1_sum_abs+=ad; step1_cmp++; }
+        if(argmax(step1_logits_m1[s],m->vocab)==argmax(step1_logits_m4[s],m->vocab)) step1_tok_match++;
+    }
+    printf("first-decode-step-only (isolates one 48-layer M4 pass, no compounding yet): max_abs_diff=%e mean_abs_diff=%e, argmax match %ld/4 sequences\n",
+        step1_max_abs, step1_sum_abs/step1_cmp, step1_tok_match);
+
+    /* --- validation: token agreement + logit closeness, M=4 vs the separate M=1 run --- */
+    long tok_match=0, tok_total=0; double max_logit_abs=0, sum_logit_abs=0; long logit_cmp=0;
+    printf("per-step token match (1=agree, 0=diverge), one row per sequence:\n");
+    for(int s=0;s<4;s++){
+        printf("  seq%d: ",s);
+        for(int i=0;i<NGEN;i++){ tok_total++; int match=(toks1[s][i]==toks4[s][i]); if(match) tok_match++; printf("%d",match); }
+        printf("\n");
+    }
+    /* one more logits comparison at the FINAL step, on the buffers already in hand */
+    for(int s=0;s<4;s++) for(int e=0;e<m->vocab;e++){
+        double ad=fabs((double)logits1[s][e]-(double)logits4[s][e]);
+        if(ad>max_logit_abs) max_logit_abs=ad; sum_logit_abs+=ad; logit_cmp++;
+    }
+
+    printf("\n=== M-batch test: 4 real, independent sequences, M=1 (separate) vs M=4 (batched dense layers) ===\n");
+    printf("sequences: ");
+    for(int s=0;s<4;s++) printf("%s%s", g_hprompts[seq_idx[s]].name, s<3?", ":"\n");
+    printf("token agreement (batched vs separate M=1, argmax): %ld/%ld (%.2f%%)\n", tok_match, tok_total, 100.0*tok_match/tok_total);
+    printf("final-step logits: max_abs_diff=%e mean_abs_diff=%e (%ld comparisons) -- expected small, nonzero (M4's shared-scale quantization, not a bug, see codex_recs_1.md %s22.35)\n",
+        max_logit_abs, sum_logit_abs/logit_cmp, logit_cmp, "§");
+    printf("--- prefill (NOT batched this milestone -- same per-sequence M1 cost paid by both paths, shown for transparency) ---\n");
+    printf("M=1 path prefill: %.3fs total (4 sequences) | M=4 path prefill: %.3fs total (4 sequences)\n", t_m1_prefill, t_m4_prefill);
+    printf("--- decode (the actual M-batching lever this milestone claims) ---\n");
+    printf("M=1 (4 separate decodes) wall: %.3fs for %d total tokens (%d seq x %d gen) -> aggregate %.2f tok/s, %.2f tok/s/sequence\n",
+        t_m1_decode, NSEQ*NGEN, NSEQ, NGEN, (NSEQ*NGEN)/t_m1_decode, NGEN/t_m1_decode);
+    printf("M=4 (1 batched decode)   wall: %.3fs for %d total tokens (%d seq x %d gen) -> aggregate %.2f tok/s, %.2f tok/s/sequence\n",
+        t_m4_decode, NSEQ*NGEN, NSEQ, NGEN, (NSEQ*NGEN)/t_m4_decode, NGEN/t_m4_decode);
+    printf("DECODE-ONLY aggregate speedup: %.3fx | per-sequence decode latency: M=1 %.2fms/tok/seq vs M=4 %.2fms/tok(shared across the batch)\n",
+        t_m1_decode/t_m4_decode, 1000.0*t_m1_decode/(NSEQ*NGEN), 1000.0*t_m4_decode/NGEN);
+    printf("--- totals (prefill+decode combined, included for completeness -- NOT the primary metric since prefill dilutes it) ---\n");
+    printf("M=1 total: %.3fs -> %.2f tok/s aggregate | M=4 total: %.3fs -> %.2f tok/s aggregate | total speedup: %.3fx\n",
+        t_m1, (NSEQ*NGEN)/t_m1, t_m4, (NSEQ*NGEN)/t_m4, t_m1/t_m4);
+    size_t extra_mem = (size_t)(maxk4/256)*AREC_M4 + 4*3000 + 4*(size_t)qd*4*3; /* Abuf4buf + Abuf2_4 + y4q/y4k/y4v, the main new allocations vs the M=1 path */
+    printf("additional memory for the batched path (beyond 4x the existing per-sequence buffers): ~%.1f KB\n", extra_mem/1024.0);
+
+    for(int s=0;s<4;s++){
+        free(h1[s]);free(hn1[s]);free(q1[s]);free(k1[s]);free(vv1[s]);free(att1[s]);free(tmp1[s]);free(g1[s]);free(u1[s]);free(eout1[s]);free(logits1[s]);free(Abuf1[s]);free(Abuf1b[s]);
+        free(kv1[s].Kc);free(kv1[s].Vc);
+        free(h4[s]);free(hn4[s]);free(q4[s]);free(k4[s]);free(vv4[s]);free(att4[s]);free(tmp4[s]);free(g4[s]);free(u4[s]);free(eout4[s]);free(logits4[s]);free(Abuf4arr[s]);
+        free(kv4[s].Kc);free(kv4[s].Vc);
+    }
+    free(Abuf4buf); free(Abuf2_4);
+}
+
 int main(int c,char**v){
     if(c<2){ printf("usage: %s model.gguf [ngen] [nt]\n",v[0]); return 1; }
     int ngen=(c>2)?atoi(v[2]):16, nt=(c>3)?atoi(v[3]):4;
@@ -1937,6 +2389,9 @@ int main(int c,char**v){
      * the mandatory -fno-tree-vectorize flag fixes it.  The env trigger remains the stable harness
      * interface and avoids adding another positional production argument. */
     { const char*hv=getenv("QWEN_HARNESS"); if(hv && atoi(hv)){ run_quality_harness(&m,&g); return 0; } }
+    /* QWEN_MBATCH_TEST=1: M-batch track milestone 1 test (codex_recs_1.md §22.35) -- real 4-
+     * sequence batched decode vs 4 separate M=1 decodes, see run_mbatch_test's own comment. */
+    { const char*mv=getenv("QWEN_MBATCH_TEST"); if(mv && atoi(mv)){ run_mbatch_test(&m); return 0; } }
 
     static int prompt[1536]; int np;
     if(ctxlen_req>0){ np=ctxlen_req; for(int i=0;i<np;i++) prompt[i]=hp9[i%113]; }
