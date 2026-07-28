@@ -2734,6 +2734,152 @@ static void run_prefill_test(Model*m){
     }
 }
 
+/* Speculative/n-gram verification track (codex_recs_1.md §22.40), QWEN_SPEC_ORACLE=1. Explicit
+ * direction: "begin with instrumentation and an acceptance-rate oracle before integrating a draft
+ * mechanism." This measures, on REAL greedy-generated trajectories (the unmodified, already-
+ * validated production decode path -- no new numerics), what accept rate a simple n-gram/"prompt
+ * lookup" drafter would achieve: at each generated position, look up the most recent PRIOR
+ * occurrence (earlier in the same prompt+generation) of the last `n` tokens, and propose the K
+ * tokens that followed it as a guess for what comes next -- no separate draft model needed, the
+ * standard approach for CPU/edge speculative decoding. Verification here is pure token-array
+ * comparison against the trajectory the model ACTUALLY produced (already known, since the
+ * trajectory is real and already generated) -- deliberately NOT yet building the batched-verify
+ * mechanism a real integrated draft+verify decode loop would need (a natural fit for the already-
+ * validated M4 kernel: K=3 draft tokens + 1 anchor position = 4-wide, matching M4's native width
+ * exactly -- noted for the next step, not built here). */
+
+/* Returns the number of tokens proposed (0..K) into draft[]: finds the most recent PRIOR
+ * occurrence of hist[t-n..t-1] within hist[0..t-n-1] and copies what followed it, bounded by K and
+ * by how many tokens are actually known to have followed that occurrence (must be < t, since only
+ * hist[0..t-1] is known at generation time -- the proposal cannot reference not-yet-generated
+ * tokens). Returns 0 if no prior occurrence exists. */
+static int ngram_propose(const int*hist,int t,int n,int K,int*draft){
+    if(t<n) return 0;
+    for(int j=t-n-1;j>=0;j--){
+        int match=1;
+        for(int i=0;i<n;i++) if(hist[j+i]!=hist[t-n+i]){ match=0; break; }
+        if(!match) continue;
+        int navail=t-(j+n); if(navail>K) navail=K;
+        if(navail<=0) continue;
+        for(int i=0;i<navail;i++) draft[i]=hist[j+n+i];
+        return navail;
+    }
+    return 0;
+}
+
+#define SPEC_NGEN 384
+#define SPEC_NCFG 12
+static const int SPEC_N[SPEC_NCFG]={2,2,2,2,2,2,3,3,3,3,3,3};
+static const int SPEC_K[SPEC_NCFG]={1,2,3,4,6,8,1,2,3,4,6,8};
+
+/* One real free-running greedy trajectory (prompt + SPEC_NGEN generated tokens), reusing forward()
+ * unchanged -- exactly what harness_generate_generic already does, just longer than the harness's
+ * own 60-80 token cap (need enough generated length for the n-gram oracle's stats to be
+ * meaningful). Router/SwiGLU pinned to production (2/2), matching every other harness. */
+static void spec_generate_trajectory(Model*m,const int*prompt,int np,int*out_hist,int*out_n){
+    int ctx=np+SPEC_NGEN+4;
+    Kv kv; kv.kvd=m->nkv*m->hd; kv.ctx=ctx; kv.Kc=calloc((size_t)m->nl*ctx*kv.kvd,4); kv.Vc=calloc((size_t)m->nl*ctx*kv.kvd,4);
+    int d=m->d,qd=m->nh*m->hd,moe=m->moe,maxk=qd>moe?(qd>d?qd:d):(moe>d?moe:d); if(d>maxk)maxk=d;
+    float*hn=malloc(d*4),*q=malloc(qd*4),*k=malloc(kv.kvd*4),*vv=malloc(kv.kvd*4),*att=malloc(qd*4),
+         *tmp=malloc((size_t)(moe>ctx?(moe>d?moe:d):(ctx>d?ctx:d))*4),*gg=malloc(moe*4),*u=malloc(moe*4),*eout=malloc(d*4),*logits=malloc((size_t)m->vocab*4);
+    uint8_t*Abuf=malloc((size_t)(maxk/256)*AREC),*Abuf2=malloc((size_t)(maxk/256)*AREC);
+    g_router_mode=2; g_router_validate=0; g_swiglu_fast=2;
+    for(int i=0;i<np;i++) out_hist[i]=prompt[i];
+    for(int p=0;p<np;p++) forward(m,prompt[p],p,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+    int cur=argmax(logits,m->vocab); out_hist[np]=cur;
+    for(int s=1;s<SPEC_NGEN;s++){
+        forward(m,cur,np+s-1,&kv,logits,hn,q,k,vv,att,tmp,gg,u,eout,Abuf,Abuf2);
+        cur=argmax(logits,m->vocab); out_hist[np+s]=cur;
+    }
+    g_swiglu_fast=0;
+    *out_n=np+SPEC_NGEN;
+    free(hn);free(q);free(k);free(vv);free(att);free(tmp);free(gg);free(u);free(eout);free(logits);free(Abuf);free(Abuf2);
+    free(kv.Kc);free(kv.Vc);
+}
+
+static void run_speculative_oracle(Model*m){
+    /* Test set spans the ladder's own explicit concern -- "keep only if useful-token throughput
+     * improves outside copy-heavy prompts" -- so this measures BOTH extremes honestly rather than
+     * only the favorable case. "Repetitive": hp9 (the 113-token narrative already used for
+     * QWEN_CTXLEN benchmarks) tiled 4x back-to-back as the PROMPT itself, real tokenized content,
+     * inducing genuine in-context repetition (a well-known LLM behavior: seeing a block repeated
+     * in-context makes continuing the pattern likely). "General/novel": four of the harness's own
+     * real, distinct prompts spanning factual/reasoning/code/multilingual content, each given a
+     * long free-running continuation well past the quality harness's own short gen cap. */
+    static int prompt_rep[512]; int np_rep=113*4; for(int i=0;i<np_rep;i++) prompt_rep[i]=hp9[i%113];
+    struct { const int*toks; int n; const char*name; } seeds[5] = {
+        {hp1,12,"factual/capitals"}, {hp4,24,"reasoning/sequence"}, {hp5,23,"code/fibonacci"},
+        {hp7,7,"multilingual/french"}, {prompt_rep,np_rep,"REPETITIVE(tiled hp9 x4)"},
+    };
+    int NT=5;
+    static int hist[5][512+SPEC_NGEN]; int hn_[5];
+
+    printf("\n=== speculative/n-gram oracle: generating %d real free-running trajectories (%d gen tokens each) ===\n",NT,SPEC_NGEN);
+    for(int i=0;i<NT;i++){
+        double t0=now();
+        spec_generate_trajectory(m,seeds[i].toks,seeds[i].n,hist[i],&hn_[i]);
+        printf("  [%d/%d] %-28s prompt=%3d total=%3d done (%.1fs)\n",i+1,NT,seeds[i].name,seeds[i].n,hn_[i],now()-t0);
+    }
+
+    printf("\n=== per-config acceptance stats (n=n-gram match length, K=max draft length) ===\n");
+    printf("%-28s","prompt");
+    for(int c=0;c<SPEC_NCFG;c++) printf(" n%dK%d ",SPEC_N[c],SPEC_K[c]);
+    printf("\n");
+    double agg_mean[SPEC_NCFG]={0}; long agg_rounds[SPEC_NCFG]={0}, agg_accepted[SPEC_NCFG]={0};
+    long agg_hist[SPEC_NCFG][9]={{0}}; /* accepted-length histogram, 0..8 (SPEC_K max is 8) */
+    for(int i=0;i<NT;i++){
+        printf("%-28s",seeds[i].name);
+        for(int c=0;c<SPEC_NCFG;c++){
+            int n=SPEC_N[c],K=SPEC_K[c]; int draft[8];
+            long rounds=0, accepted_sum=0;
+            int t=seeds[i].n; /* start of generation; positions before this are the prompt itself */
+            while(t<hn_[i]-1){
+                int nd=ngram_propose(hist[i],t,n,K,draft);
+                int accepted=0;
+                for(int a=0;a<nd && t+a<hn_[i]-1;a++){ if(hist[i][t+a]==draft[a]) accepted++; else break; }
+                rounds++; accepted_sum+=accepted;
+                if(accepted>8)accepted=8; agg_hist[c][accepted]++;
+                t += accepted+1;
+            }
+            double mean=rounds?(double)accepted_sum/rounds:0;
+            printf(" %.2f",mean);
+            agg_mean[c]+=mean; agg_rounds[c]+=rounds; agg_accepted[c]+=accepted_sum;
+        }
+        printf("\n");
+    }
+    printf("\n=== aggregate (mean accepted tokens/round, across all %d trajectories) ===\n",NT);
+    for(int c=0;c<SPEC_NCFG;c++){
+        double macc = agg_rounds[c]? (double)agg_accepted[c]/agg_rounds[c] : 0;
+        printf("  n=%d K=%d: mean accepted/round=%.3f (%ld rounds total)  histogram[0..%d]=",SPEC_N[c],SPEC_K[c],macc,agg_rounds[c],SPEC_K[c]);
+        for(int h=0;h<=SPEC_K[c] && h<=8;h++) printf("%ld ",agg_hist[c][h]);
+        printf("\n");
+    }
+    /* K=3 highlighted specifically: 3 draft tokens + 1 anchor position = 4-wide, the already-
+     * validated M4 kernel's native batch width -- the natural target for the next step's batched-
+     * verify mechanism, not an arbitrary choice. */
+    printf("\n--- K=3 (natural M4-width fit: 3 draft + 1 anchor = 4-wide verify) breakdown by content type ---\n");
+    for(int c=0;c<SPEC_NCFG;c++) if(SPEC_K[c]==3){
+        printf("  n=%d: ", SPEC_N[c]);
+        for(int i=0;i<NT;i++){
+            int n=SPEC_N[c],K=SPEC_K[c]; int draft[8]; long rounds=0, accepted_sum=0;
+            int t=seeds[i].n;
+            while(t<hn_[i]-1){
+                int nd=ngram_propose(hist[i],t,n,K,draft); int accepted=0;
+                for(int a=0;a<nd && t+a<hn_[i]-1;a++){ if(hist[i][t+a]==draft[a]) accepted++; else break; }
+                rounds++; accepted_sum+=accepted; t+=accepted+1;
+            }
+            printf("%s=%.2f ", seeds[i].name, rounds?(double)accepted_sum/rounds:0);
+        }
+        printf("\n");
+    }
+    printf("\nNOTE: this is real, measured acceptance-rate data from real greedy trajectories -- NOT\n"
+           "yet a tok/s projection. Translating mean-accepted/round into real speedup needs the actual\n"
+           "batched-verify mechanism's own cost (an M4-batched K+1-wide verify pass costs MORE than one\n"
+           "ordinary decode step -- M4 arithmetic scales with M per codex_recs_1.md §22.36 -- so a\n"
+           "config with mean accepted <1 could plausibly be a NET LOSS even though it 'accepts\n"
+           "something'). That cost model is the next step's own job, not this oracle's.\n");
+}
+
 int main(int c,char**v){
     if(c<2){ printf("usage: %s model.gguf [ngen] [nt]\n",v[0]); return 1; }
     int ngen=(c>2)?atoi(v[2]):16, nt=(c>3)?atoi(v[3]):4;
@@ -2847,6 +2993,9 @@ int main(int c,char**v){
     /* QWEN_PREFILL_HARNESS=1: batched prefill quality harness (codex_recs_1.md §22.39) -- decides
      * whether chunked-M4 prefill is eligible for promotion to the production default. */
     { const char*ph=getenv("QWEN_PREFILL_HARNESS"); if(ph && atoi(ph)){ run_prefill_quality_harness(&m); return 0; } }
+    /* QWEN_SPEC_ORACLE=1: speculative/n-gram acceptance-rate oracle (codex_recs_1.md §22.40) --
+     * measures real n-gram drafting accept rate before any draft mechanism is integrated. */
+    { const char*so=getenv("QWEN_SPEC_ORACLE"); if(so && atoi(so)){ run_speculative_oracle(&m); return 0; } }
     /* QWEN_MBATCH_TEST=1: M-batch track milestone 1 test (codex_recs_1.md §22.35) -- real 4-
      * sequence batched decode vs 4 separate M=1 decodes, see run_mbatch_test's own comment. */
     { const char*mv=getenv("QWEN_MBATCH_TEST"); if(mv && atoi(mv)){ run_mbatch_test(&m); return 0; } }

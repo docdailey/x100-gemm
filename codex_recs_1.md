@@ -3480,3 +3480,102 @@ session when set. Verified on the board with zero env-var overrides (true produc
 normal trial-to-trial noise, confirming no regression at the canonical short prompt. This closes the
 decision the user held open — per their own explicit instruction, speculative/n-gram verification
 (the next item on the original ladder) may now begin.
+
+### 22.40 Speculative/n-gram verification: instrumentation + acceptance-rate oracle — general content likely a net loss, repetitive content a modest real win
+
+Explicit direction: "Next branch: speculative/ngram verification, targeting improved effective
+single-user token rate by verifying several proposed tokens per weight stream. This should begin
+with instrumentation and an acceptance-rate oracle before integrating a draft mechanism. Larger-N
+continuous serving comes afterward for aggregate multi-user throughput."
+
+**Design.** Deliberately scoped to ONLY the oracle step, per the user's own two-phase framing — no
+batched-verify mechanism built yet. `ngram_propose(hist,t,n,K,draft)`: pure host-side "prompt
+lookup" drafting (no draft model, standard technique for CPU/edge speculative decoding) — at
+position `t`, search backward through the known token history for the most recent PRIOR occurrence
+of the last `n` tokens, and propose (up to `K`, bounded by how many tokens are actually known to
+have followed that occurrence) the tokens that followed it as a guess for what comes next. Pure
+integer array search, no model inference in the drafting step itself. `spec_generate_trajectory`
+generates a REAL 384-token free-running greedy continuation (reusing `forward()`, completely
+unmodified — no new numerics) from a given prompt seed, at production config (int8 router +
+rational-Padé SwiGLU). `run_speculative_oracle` (`QWEN_SPEC_ORACLE=1`) generates 5 such
+trajectories and, for each, sweeps `n`∈{2,3} × `K`∈{1,2,3,4,6,8}, replaying `ngram_propose` at every
+generated position and comparing the proposal against what the trajectory ACTUALLY contains at
+those positions (already known, since the trajectory is real) — counting the longest matching
+prefix accepted per round, advancing by `accepted+1` positions each round (matching real
+speculative-decoding bookkeeping: an accepted prefix plus one guaranteed "free" token from the
+verify pass's own final-position logits).
+
+**Test set spans the ladder's own explicit concern** ("keep only if useful-token throughput
+improves outside copy-heavy prompts"): four of the harness's own real, distinct prompts
+(factual/reasoning/code/multilingual) given long free-running continuations well past the quality
+harness's own short gen cap, PLUS one deliberately repetitive prompt — `hp9` (the real 113-token
+narrative already used for `QWEN_CTXLEN` benchmarks) tiled 4x back-to-back as the prompt itself,
+inducing genuine in-context repetition (real tokenized content, not synthetic — a model conditioned
+on 3 verbatim repeats very plausibly continues the pattern into a 4th).
+
+**Sanitizers.** ASan (`detect_leaks=0`, matching §22.38's own established reason) and UBSan, `-O2`:
+both clean, zero errors. Acceptance numbers bit-identical across plain/ASan/UBSan builds.
+
+**Result — mean accepted tokens per round, K=3 (the natural fit: 3 draft + 1 anchor = 4-wide,
+matching the already-validated M4 kernel's native batch width exactly):**
+
+| prompt | n=2 | n=3 |
+|---|---|---|
+| factual/capitals | 0.39 | 0.19 |
+| reasoning/sequence | 0.53 | 0.47 |
+| code/fibonacci | 0.24 | 0.14 |
+| multilingual/french | 0.33 | 0.23 |
+| REPETITIVE (tiled hp9 x4) | 2.58 | **3.00** |
+
+General/novel content tops out around 0.5 accepted/round even at the best (n,K) combination tested
+(reasoning/sequence, n=2, K=8: 0.68) — most rounds accept 0 or 1 of the K proposed tokens. The
+repetitive prompt is a different regime entirely: n=3,K=3 gets 3.00/3 (essentially perfect
+acceptance), and n=3,K=8 gets 7.93/8 — the model, having seen the block verbatim 3 times already,
+overwhelmingly continues the pattern, and n-gram lookup finds the exact match instantly.
+
+**Translating this into a real speedup projection (labeled explicitly as an estimate, using the
+already-measured, real M4/prefill cost-scaling data — not a new measurement).** A K=3-draft +
+1-anchor verify round is structurally identical to `prefill_chunk4`'s own 4-consecutive-position
+mechanism (each candidate position's K/V depends only on its own hypothetical input, causally
+bounded attention, exactly the chunked-prefill pattern already validated and promoted in §22.38-39)
+— so its real cost can be read directly off already-measured chunked-prefill numbers: sequential 4
+single-position calls run ~1.10-1.14x slower than one chunked 4-wide call, i.e. **cost(4-wide verify
+round) ≈ 3.5-3.6× cost(one ordinary single-position decode step)** (M4's own arithmetic scales with
+M rather than being free, per §22.36's finding — this is not "4 tokens for the price of 1", it's "4
+tokens for the price of ~3.6"). Useful tokens produced per round = `accepted+1`. Breakeven against
+plain one-token-at-a-time decoding requires `(accepted+1)/3.57 > 1`, i.e. **accepted > ~2.57 out of
+3 drafted tokens, just to match plain decoding's own throughput** — anything below that is a NET
+SLOWDOWN, not merely "no speedup," because a wasted 4-wide verify call costs meaningfully more than
+the single real decode step it could have done instead.
+
+| prompt (K=3, best n) | accepted | useful (accepted+1) | projected ratio vs plain decode |
+|---|---|---|---|
+| factual/capitals (n=2) | 0.39 | 1.39 | **0.389x — ~2.6x SLOWER** |
+| reasoning/sequence (n=2) | 0.53 | 1.53 | **0.429x — ~2.3x SLOWER** |
+| code/fibonacci (n=2) | 0.24 | 1.24 | **0.347x — ~2.9x SLOWER** |
+| multilingual/french (n=2) | 0.33 | 1.33 | **0.373x — ~2.7x SLOWER** |
+| REPETITIVE (n=3) | 3.00 | 4.00 | **1.12x — a real, modest win** |
+
+**Verdict, directly answering the ladder's own predeclared gate ("keep only if useful-token
+throughput improves outside copy-heavy prompts"): as specified (simple n-gram/prompt-lookup
+drafting, M4-batched verify), general/novel content is projected to be a clear NET LOSS
+(~2.3-2.9x slower than plain decoding), not merely a non-improvement — the fundamental issue is
+structural, not a tunable parameter: n-gram lookup can only predict continuations that already
+exist somewhere in the visible context, so it cannot do meaningfully better on genuinely novel text
+no matter how the match length or draft width is tuned (confirmed empirically: neither `n`∈{2,3}
+nor `K` up to 8 lifts general-content acceptance past ~0.7/round). Only genuinely repetitive content
+(where acceptance is already near-total) shows a real win, and that win (~1.12x) is modest — capped
+by the same "M4 arithmetic scales with M" ceiling that bounded every other M-batch technique this
+session (milestones 2/3, batched prefill).**
+
+This is exactly the kind of "is the next, larger investment worth it" decision point the user's own
+two-phase framing was designed to surface cheaply, before committing to building the actual
+batched-verify decode loop (a comparably-sized undertaking to the M-batch/prefill mechanisms
+already built). Flagged for the user's explicit decision on how to proceed, per this session's own
+established pattern for scope forks (M4 kernel port scale, dense-vs-expert-FFN batching scope):
+build the integrated mechanism anyway, scoped ONLY to a detectable-repetition fast path (with a
+cheap runtime signal — e.g. bail to plain decoding whenever a recent draft round's acceptance is
+low, so the narrow win is captured without paying the general-case tax); investigate a different/
+cheaper verify mechanism before committing to full M4 batching; or close this track here as a
+documented, evidence-based negative-for-general/positive-for-niche finding and move to larger-N
+continuous serving instead (the user's own next-mentioned track).

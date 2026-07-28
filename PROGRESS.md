@@ -291,6 +291,27 @@ flag. Verified with zero env-var overrides (true production invocation): `' Toky
 canonical short prompt. This closes the decision the user held open before allowing the ladder to
 continue — speculative/n-gram verification (next item) may now begin.
 
+**Speculative/n-gram verification: instrumentation + acceptance-rate oracle (2026-07-28,
+`codex_recs_1.md` §22.40).** Per explicit direction, began with instrumentation and an
+acceptance-rate oracle BEFORE building any draft mechanism. `ngram_propose` (pure host-side
+"prompt lookup" drafting, no draft model) + `run_speculative_oracle` (`QWEN_SPEC_ORACLE=1`):
+generated 5 real 384-token free-running greedy trajectories (4 general prompts + one deliberately
+repetitive prompt, `hp9` tiled 4x), swept n-gram length and draft width, measured real acceptance
+against what the trajectories actually contain. ASan/UBSan clean, numbers bit-identical across
+builds. **Result: general/novel content tops out ~0.5-0.7 accepted/round even at the best
+parameters; the repetitive prompt gets near-total acceptance (3.00/3 at K=3, 7.93/8 at K=8).**
+Using the already-measured, real chunked-prefill cost data (a K=3+1-anchor verify round is
+structurally identical to `prefill_chunk4`'s own mechanism, costing ~3.5-3.6x one ordinary decode
+step, not 4x-for-free) — **projected verdict: general content would be a NET LOSS (~2.3-2.9x
+SLOWER than plain decoding), only repetitive content shows a real but modest win (~1.12x)**.
+Directly answers, and fails for the general case, the ladder's own predeclared gate ("keep only if
+useful-token throughput improves outside copy-heavy prompts") — the limitation is structural
+(n-gram lookup can only predict what already exists in visible context), not a tunable parameter.
+Flagged for the user's decision on how to proceed: build the integrated mechanism scoped to a
+detectable-repetition fast path with a low-acceptance bailout; investigate a cheaper verify
+mechanism; or close this track as a documented negative-for-general/positive-for-niche finding and
+move to larger-N continuous serving instead.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave
