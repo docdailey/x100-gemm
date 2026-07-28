@@ -1049,6 +1049,16 @@ static int g_av_fuse=1;
  * original malloc, to test whether cache-line alignment measurably helps the RVV loads/stores that
  * walk these buffers. 0 (default until promoted) = original malloc. */
 static int g_scratch_align=0;
+/* M-batch track milestone 3 (codex_recs_1.md §22.37): expert-FFN batching statistics -- how often
+ * all 4 sequences in forward4_dense_batch's batch happen to independently select the SAME expert
+ * out of 128 (the only overlap case this milestone batches; see forward4_dense_batch's own MoE-FFN
+ * comment for why partial 2-3-way overlaps are deliberately not padded-and-batched). File-scope so
+ * run_mbatch_test can read and report them after a full run. */
+static long g_moe4_hits=0, g_moe4_total_expert_slots=0;
+static long g_moe_ecount_hist[5]={0,0,0,0,0}; /* histogram of ecount[e] in {0,1,2,3,4} across every
+    expert/layer/decode-step visited -- diagnostic only, answers whether PARTIAL overlap (2-3 of 4
+    sequences picking the same expert) is common enough to be worth a future padded-M4 batching
+    strategy, separate from the exact-4-way case this milestone actually batches. */
 static void* scratch_alloc(size_t n){
     if(!g_scratch_align) return malloc(n);
     void*p=NULL; size_t sz=((n+63)/64)*64; if(sz==0) sz=64;
@@ -1581,9 +1591,10 @@ static void forward4_dense_batch(Model*m,int tok[4],int pos[4],Kv*kv[4],float*lo
      * convention for reused large buffers) -- allocated once on first use, not per-call/per-layer,
      * and NOT on the stack (avoids risking stack overflow at these sizes, e.g. y4lm alone is up to
      * 4*vocab floats). */
-    static float *y4q=NULL,*y4k=NULL,*y4v=NULL,*y4o=NULL,*y4r=NULL,*y4lm=NULL;
+    static float *y4q=NULL,*y4k=NULL,*y4v=NULL,*y4o=NULL,*y4r=NULL,*y4lm=NULL,*y4eg=NULL,*y4eu=NULL,*y4ed=NULL;
     if(!y4q){ int maxqkv=nh*hd>nkv*hd?nh*hd:nkv*hd; y4q=malloc((size_t)4*maxqkv*4); y4k=malloc((size_t)4*maxqkv*4); y4v=malloc((size_t)4*maxqkv*4);
-        y4o=malloc((size_t)4*d*4); y4r=malloc((size_t)4*256*4); y4lm=malloc((size_t)4*(size_t)m->vocab*4); }
+        y4o=malloc((size_t)4*d*4); y4r=malloc((size_t)4*256*4); y4lm=malloc((size_t)4*(size_t)m->vocab*4);
+        y4eg=malloc((size_t)4*moe*4); y4eu=malloc((size_t)4*moe*4); y4ed=malloc((size_t)4*d*4); }
 
     for(int l=0;l<m->nl;l++){ Layer*ly=&m->L[l];
         for(int s=0;s<4;s++) rmsnorm(hn[s],h[s],ly->attn_norm,d,m->eps);
@@ -1640,15 +1651,54 @@ static void forward4_dense_batch(Model*m,int tok[4],int pos[4],Kv*kv[4],float*lo
             for(int a=0;a<na;a++){ int bi=-1; float bv=-1e30f; for(int e=0;e<ne;e++){ int used=0; for(int b=0;b<a;b++)if(sel[s][b]==e)used=1; if(!used&&rl[e]>bv){bv=rl[e];bi=e;} } sel[s][a]=bi; sw[s][a]=bv; }
             float ssum=0; for(int a=0;a<na;a++)ssum+=sw[s][a]; for(int a=0;a<na;a++)sw[s][a]/=ssum;
         }
-        /* MoE expert FFN: per-sequence, per-expert, via the existing M1 path -- see this function's
-         * own top comment for why (data-dependent, non-shared expert selection). Each sequence's
-         * OWN hn must be packed into M1's (290B/block) format before the expert loop -- this is
-         * the direct equivalent of forward()'s own `pack_act_hp(hn,d,Abuf2)` call, just done once
-         * per sequence into that sequence's own Abuf2_4 slot instead of once for the single stream. */
+        /* MoE expert FFN (codex_recs_1.md §22.37, M-batch milestone 3): each sequence independently
+         * selects its own top-8-of-128 experts from its own hidden state, so most experts are NOT
+         * shared across the 4-sequence batch. This section batches the one case worth batching --
+         * an expert selected by ALL 4 sequences at once -- via M4, and falls back to the existing
+         * per-sequence M1 path for everything else (an expert selected by only 1-3 sequences).
+         * Deliberately NOT padding 2- or 3-way overlaps up to a full M4 call: milestone 2
+         * (codex_recs_1.md §22.36) found M4's own arithmetic work scales with M rather than being a
+         * fixed cost, so a padded call with 1-3 real rows would do CLOSE TO the same arithmetic as
+         * a full 4-row call while only saving 1-3 weight-stream reads vs 1-3 separate M1 calls --
+         * plausibly a net loss, not clearly a win, and not worth the added complexity/risk without
+         * first knowing (from THIS milestone's own overlap statistics, reported by the caller)
+         * whether partial overlaps are even common enough to matter. */
+        /* esel[e][s] = the slot index a such that sel[s][a]==e (i.e. sequence s's own selection
+         * order for expert e), or -1 if sequence s did not select expert e; ecount[e] = how many
+         * of the 4 sequences selected expert e (0..4). */
+        int esel[128][4]; int ecount[128];
+        for(int e=0;e<ne;e++){ ecount[e]=0; for(int s=0;s<4;s++) esel[e][s]=-1; }
+        for(int s=0;s<4;s++) for(int a=0;a<na;a++){ int e=sel[s][a]; esel[e][s]=a; ecount[e]++; }
+        int processed[4][32]={{0}};
+        for(int s=0;s<4;s++) for(int i=0;i<d;i++)eout[s][i]=0;
+        for(int e=0;e<ne;e++){
+            g_moe4_total_expert_slots += ecount[e]>0 ? 1 : 0;
+            g_moe_ecount_hist[ecount[e]]++;
+            if(ecount[e]!=4) continue;
+            g_moe4_hits++;
+            pack_act_hp_m4(hn[0],hn[1],hn[2],hn[3],d,Abuf4);
+            lin_mm_hp_m4(&ly->eg[e],Abuf4,y4eg); lin_mm_hp_m4(&ly->eu[e],Abuf4,y4eu);
+            for(int s=0;s<4;s++){
+                float*gs=y4eg+(size_t)s*moe,*us=y4eu+(size_t)s*moe;
+                if(g_swiglu_fast==1) swiglu_hswish_rvv(gs,us,moe);
+                else if(g_swiglu_fast==2) swiglu_ratsig_rvv(gs,us,moe);
+                else swiglu_exact(gs,us,moe);
+            }
+            pack_act_hp_m4(y4eg+0*(size_t)moe,y4eg+1*(size_t)moe,y4eg+2*(size_t)moe,y4eg+3*(size_t)moe,moe,Abuf4);
+            lin_mm_hp_m4(&ly->ed[e],Abuf4,y4ed);
+            for(int s=0;s<4;s++){
+                int a=esel[e][s]; float w=sw[s][a];
+                for(int i=0;i<d;i++) eout[s][i]+=w*y4ed[s*ly->ed[e].N+i];
+                processed[s][a]=1;
+            }
+        }
+        /* Each sequence's OWN hn must be packed into M1's (290B/block) format before the fallback
+         * loop -- this is the direct equivalent of forward()'s own `pack_act_hp(hn,d,Abuf2)` call,
+         * just done once per sequence into that sequence's own Abuf2_4 slot instead of once for the
+         * single stream. */
         for(int s=0;s<4;s++) pack_act_hp(hn[s],d,Abuf2_4+(size_t)s*3000);
         for(int s=0;s<4;s++){
-            for(int i=0;i<d;i++)eout[s][i]=0;
-            for(int a=0;a<na;a++){ int e=sel[s][a]; float w=sw[s][a];
+            for(int a=0;a<na;a++){ if(processed[s][a]) continue; int e=sel[s][a]; float w=sw[s][a];
                 lin_mm_hp(&ly->eg[e],Abuf2_4+(size_t)s*3000,g[s],nt); lin_mm_hp(&ly->eu[e],Abuf2_4+(size_t)s*3000,u[s],nt);
                 if(g_swiglu_fast==1) swiglu_hswish_rvv(g[s],u[s],moe);
                 else if(g_swiglu_fast==2) swiglu_ratsig_rvv(g[s],u[s],moe);
@@ -2269,6 +2319,14 @@ static void run_mbatch_test(Model*m){
         t_m1, (NSEQ*NGEN)/t_m1, t_m4, (NSEQ*NGEN)/t_m4, t_m1/t_m4);
     size_t extra_mem = (size_t)(maxk4/256)*AREC_M4 + 4*3000 + 4*(size_t)qd*4*3; /* Abuf4buf + Abuf2_4 + y4q/y4k/y4v, the main new allocations vs the M=1 path */
     printf("additional memory for the batched path (beyond 4x the existing per-sequence buffers): ~%.1f KB\n", extra_mem/1024.0);
+    printf("MoE expert-FFN batching (milestone 3): %ld of %ld (expert, layer, decode-step) slots with >=1 selecting sequence had all 4 sequences select the SAME expert (%.2f%%) -- only this case is M4-batched, the rest fall back to per-sequence M1\n",
+        g_moe4_hits, g_moe4_total_expert_slots, g_moe4_total_expert_slots>0 ? 100.0*g_moe4_hits/g_moe4_total_expert_slots : 0.0);
+    { long tot4=g_moe_ecount_hist[1]+g_moe_ecount_hist[2]+g_moe_ecount_hist[3]+g_moe_ecount_hist[4];
+      printf("full selecting-sequence-count histogram (diagnostic, answers whether PARTIAL overlap is common enough to matter for a future padded-batching strategy):\n");
+      printf("  count=1 (no overlap): %ld (%.2f%%) | count=2: %ld (%.2f%%) | count=3: %ld (%.2f%%) | count=4 (batched): %ld (%.2f%%)\n",
+        g_moe_ecount_hist[1], 100.0*g_moe_ecount_hist[1]/tot4, g_moe_ecount_hist[2], 100.0*g_moe_ecount_hist[2]/tot4,
+        g_moe_ecount_hist[3], 100.0*g_moe_ecount_hist[3]/tot4, g_moe_ecount_hist[4], 100.0*g_moe_ecount_hist[4]/tot4);
+    }
 
     for(int s=0;s<4;s++){
         free(h1[s]);free(hn1[s]);free(q1[s]);free(k1[s]);free(vv1[s]);free(att1[s]);free(tmp1[s]);free(g1[s]);free(u1[s]);free(eout1[s]);free(logits1[s]);free(Abuf1[s]);free(Abuf1b[s]);

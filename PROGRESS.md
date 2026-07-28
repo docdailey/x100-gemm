@@ -225,6 +225,23 @@ sequence call site would benefit — batching needs concurrent sequences a CLI d
 otherwise have). Remaining: MoE expert-FFN batching (the larger opportunity), a real multi-request
 serving loop, batched prefill.
 
+**M-batch track, milestone 3: MoE expert-FFN batching — implemented, measured NOT materially
+worthwhile at N=4 (2026-07-28, `codex_recs_1.md` §22.37).** Per explicit direction: group
+sequences that selected the same expert, batch via M4 when all 4 sequences overlap exactly; fall
+back to per-sequence M1 for partial (2-3-way) overlap, deliberately not padded (§22.36's own
+finding that M4 arithmetic scales with M made padding a plausible net loss, not a clear win). ASan/
+UBSan clean, correctness bit-identical across builds, existing M=1 path unaffected. **The
+measurement: only 0.89% of expert-selection slots hit the batchable 4-way-overlap case (81% have
+zero overlap, 15%/3% have 2-/3-way partial overlap).** Decode-only speedup: 1.103-1.105x —
+statistically indistinguishable from milestone 2's dense-layer-only 1.111x. **Verdict: expert-FFN
+batching by same-expert grouping adds no measurable benefit on top of dense-layer batching at N=4
+concurrent sequences** — overlap is fundamentally too rare at this batch size, and even the full
+partial-overlap upside wouldn't proportionally help given M4's per-row cost. Larger N would very
+plausibly change this (birthday-paradox-style: "any 2+ overlap" gets more common as N grows even as
+"exact match" gets rarer), but validating that needs a real serving loop, a separate undertaking.
+**This closes the M-batch track's core empirical question**: dense-layer batching gives a real,
+modest ~1.11x decode speedup at N=4; expert-FFN batching adds nothing further at this concurrency.
+
 ## HEADLINE: qwen_moe_hp.c is the current best engine — 12.37 tok/s (default config, canonical short prompt), well past vendor parity at nt=4
 Real SpacemiT vendor kernel (`gemm_kernel_i8i4_hp_m1`), ported+verified, integrated + tuned this
 session. Started from `qwen_moe.c`'s 1.49 tok/s (P0.1-P0.3 tuned, custom q4-in-q8-interleave

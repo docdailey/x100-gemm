@@ -3187,3 +3187,76 @@ opportunity, a separate undertaking per the scoping decision above), a real mult
 loop/scheduler (this milestone hand-constructs one fixed 4-sequence batch, not a general N-sequence
 continuous-batching admission/eviction system), and batched prefill (explicitly deferred, the
 ladder's own next item).
+
+### 22.37 M-batch track, milestone 3: MoE expert-FFN batching — implemented, measured NOT materially worthwhile at N=4
+
+Explicit direction: "batch the MoE expert FFN by grouping sequences per selected expert. That
+targets the largest unbatched linear component and should determine whether M-batching becomes
+materially worthwhile."
+
+**Design.** Each of the 4 batched sequences independently selects its own top-8 of 128 experts from
+its own hidden state (§22.36's own scoping rationale). This milestone groups sequences that
+happened to select the SAME expert and batches that group via M4 — but only when the group is a
+full 4-way match (all 4 sequences selected the same expert). Partial 2- or 3-way overlaps
+deliberately fall back to the existing per-sequence M1 path, NOT padded up to a full M4 call: §22.36
+found M4's own arithmetic work scales with M rather than being a fixed per-call cost, so a padded
+call with only 1-3 real rows would do CLOSE TO the same arithmetic as a full 4-row call while only
+saving 1-3 weight-stream reads — plausibly a net loss relative to just running M1 for those rows,
+not a clear win, and not worth the risk without first knowing whether partial overlaps are even
+common enough to matter (measured below).
+
+**Implementation.** For each layer, after the (already-batched, §22.36) router computation
+produces each sequence's own `sel[s][]`/`sw[s][]`, build `esel[e][s]` (the slot index sequence s
+used to select expert e, or -1) and `ecount[e]` (how many of the 4 sequences selected expert e) by
+one pass over all 4×8 selections. For every expert with `ecount[e]==4`: pack all 4 sequences' `hn`
+via `pack_A_hp_m4`, dispatch M4 for `eg[e]`/`eu[e]`, apply SwiGLU per row (four independent calls
+into the batched output rows, no change to the SwiGLU math itself), pack the 4 post-SwiGLU rows and
+dispatch M4 again for `ed[e]`, then scatter each row's own-sequence-weighted contribution into that
+sequence's `eout[s]` and mark that (sequence, slot) pair processed. Every NOT-processed
+(sequence, slot) pair afterward runs through the unchanged, existing per-sequence M1 fallback loop
+from milestone 2 — every one of a sequence's 8 selected experts is guaranteed to be handled exactly
+once, either by the batched or the fallback path, never both, never neither.
+
+**Validation and sanitizers.** Same discipline as prior milestones: `QWEN_MBATCH_TEST=1` re-run
+against the same 4 real, distinct prompts, checked against separate M=1. ASan and UBSan both clean;
+token agreement, per-step divergence pattern, and the expert-overlap statistics below are
+bit-identical across the plain/ASan/UBSan builds (fully deterministic). Existing single-sequence
+M=1 production path confirmed unaffected (12.41 tok/s, unchanged).
+
+**The measurement the user asked for.** Across the full 16-token generation for all 4 sequences
+(48 layers × 16 steps × 4 sequences × 8 selections = 24,576 individual expert selections, collapsing
+to 18,576 distinct (expert, layer, step) slots with at least one selecting sequence):
+
+| selecting-sequence count | slots | % of slots |
+|---|---|---|
+| 1 (no overlap) | 15,044 | 80.99% |
+| 2 | 2,765 | 14.88% |
+| 3 | 602 | 3.24% |
+| 4 (batched this milestone) | 165 | **0.89%** |
+
+Only 0.89% of expert-selection slots hit the case this milestone actually batches. Decode-only
+speedup: **1.103-1.105x**, statistically indistinguishable from milestone 2's dense-layer-only
+1.111x (well within this board's own trial-to-trial noise band, as established throughout this
+session) — expert-FFN batching, as scoped, adds no measurable benefit on top of dense-layer
+batching alone.
+
+**Verdict: MoE expert-FFN batching by same-expert grouping is measured NOT materially worthwhile
+at N=4 concurrent sequences with this model's 128-expert/8-selected configuration.** Two
+independent, now-quantified reasons: (1) overlap is fundamentally too rare at this batch size — 81%
+of expert-selection events involve exactly one sequence, so there is very little to batch in the
+first place; (2) even the full theoretical upside of ALSO batching the 2-3-way partial-overlap
+cases (an additional ~18.1% of slots, per the histogram above) would not proportionally translate
+into speedup given finding (1) from §22.36 that M4's arithmetic cost scales with M rather than
+being amortized for free — the batchable-in-principle opportunity is both rare AND, per row,
+worth proportionally less than dense-layer batching's own win.
+
+**This closes the loop on the M-batch track's core empirical question.** Combining milestones 2 and
+3: dense-layer M-batching gives a real, modest, reproducible ~1.11x decode-phase speedup at N=4;
+expert-FFN batching via same-expert grouping adds nothing further at this concurrency level. Larger
+N (more concurrent sequences) would very plausibly change this calculus — the "exactly-N-way
+overlap" event this milestone requires gets exponentially rarer as N grows, but "at least 2 of N"
+overlap events get more common (birthday-paradox-style), meaning the fundamental limitation here is
+specific to N=4, not necessarily to expert-batching as an idea — but building and validating that
+at a larger, more production-realistic N is a separate, larger undertaking (a real multi-request
+serving loop, not a fixed hand-constructed batch) not attempted here. `g_moe4_hits`/
+`g_moe_ecount_hist` remain in the code as a reusable diagnostic for any future N.
