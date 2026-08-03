@@ -1,0 +1,17 @@
+[Unit]
+Description=Jupiter 2 PP-OCRv6 Tiny API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/vision-api
+Environment=VISION_PROVIDER=cpu
+Environment=VISION_ORT_THREADS=8
+Environment=VISION_RECOGNIZER=onnx-ppocrv6
+Environment=ROSETTA_HARTS=8
+ExecStart=/usr/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

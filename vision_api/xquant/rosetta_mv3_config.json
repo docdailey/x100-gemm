@@ -1,0 +1,15 @@
+{
+  "model_parameters": {
+    "onnx_model": "/work/rosetta-mv3-b1.onnx",
+    "working_dir": "/work/rosetta-mv3-quantized"
+  },
+  "calibration_parameters": {
+    "calibration_batch_size": 1,
+    "input_parametres": [
+      {
+        "file_type": "npy",
+        "data_list_path": "/work/calib_mv3.txt"
+      }
+    ]
+  }
+}

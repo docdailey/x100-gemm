@@ -1,0 +1,6 @@
+/work/rec-calib-batch-0.npy
+/work/rec-calib-batch-1.npy
+/work/rec-calib-batch-2.npy
+/work/rec-calib-batch-3.npy
+/work/rec-calib-batch-4.npy
+/work/rec-calib-batch-5.npy
