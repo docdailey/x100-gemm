@@ -2,3 +2,10 @@
 gemm_bench
 *.dSYM
 *.bak
+
+# embed_native project: extracted weight blobs, HF cache, venv -- regenerate via extract_*.py
+embed_native/*.bin
+embed_native/hf_cache/
+embed_native/.venv/
+embed_native/oracle_*.json
+embed_native/bench_*_results.json
