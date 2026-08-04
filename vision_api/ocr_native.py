@@ -94,6 +94,18 @@ class OCRNative:
             raise RuntimeError(f"ocr_infer failed with rc={rc}")
         return self._out[:need].reshape(steps, self.n_classes)
 
+    def infer_rows(self, rows: np.ndarray) -> list[np.ndarray]:
+        """rows: (n, 3, H, W) preprocessed -> list of (steps, n_classes) arrays.
+
+        One crop per engine call, deliberately. A batch dimension was built and
+        validated bit-identical, and measured a loss at every width for both
+        models -- the engine is activation-bandwidth bound, not weight bound, so
+        batching multiplies the working set without amortising anything that
+        matters. Supporting it also cost ~5% on the single-crop path, so it was
+        removed. See BARE_IME_OCR_PROGRESS.md section 23.
+        """
+        return [self.infer_array(np.ascontiguousarray(row)).copy() for row in rows]
+
 
 NATIVE_MODELS = {
     "native-ppocrv6": ("ppocrv6_rec.bin", "PP-OCRv6_tiny_rec (native RVV FP32)"),

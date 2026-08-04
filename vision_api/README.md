@@ -27,3 +27,21 @@ the health response. Set `VISION_PROVIDER=spacemit` only when testing a fixed pr
 the evidence behind the default. Note that the native engine pins its calling thread to an AI hart
 for life — drive it from one dedicated thread, as `ocr_native.py` does.
 
+## Per-character uncertainty
+
+`score` is the mean top-1 probability over a line's characters — it cannot show a single
+contested character, which is how a misread separator (`1,901` read as `1.901`) can still score
+0.97. Two additive fields fix that:
+
+- `min_char_score` — always present; the minimum per-character probability in the line.
+- `alternatives` — request with `?alternatives=true`; per contested character, the runner-up
+  candidate and both probabilities. Opt-in because on dense prose this model is genuinely
+  uncertain nearly everywhere and it doubles the payload.
+
+```sh
+curl -F image=@page.png 'http://192.168.68.24:8080/v1/ocr?alternatives=true'
+```
+
+No decoded text is ever modified — in particular there is no comma/period normalisation, which
+would be locale-wrong. See `BARE_IME_OCR_PROGRESS.md` section 24.
+

@@ -29,6 +29,19 @@ MAX_PIXELS = 40_000_000
 #                    lowercase-only dictionary makes it unusable for documents.
 RECOGNIZER = os.environ.get("VISION_RECOGNIZER", "native-ppocrv6").lower()
 
+# A decoded character whose runner-up holds at least this much probability mass
+# is reported alongside its alternative. Measured on the FinScan comma/decimal
+# repro: digit positions put 1e-5 or less on their runner-up, correctly-read
+# thousands separators 0.9-2.5%, and actually-misread separators 2-49%. 1% sits
+# below every observed ambiguous separator and far above ordinary characters.
+ALT_THRESHOLD = float(os.environ.get("VISION_ALT_THRESHOLD", "0.01"))
+# Per-character runner-ups are opt-in per request (?alternatives=true). On dense
+# prose this model is genuinely uncertain nearly everywhere -- 1641 alternatives
+# across 97 lines of a paper page -- which is honest but doubles the payload for
+# callers who only want text. `min_char_score` is always present: it is one float
+# and it is the whole point, since a mean cannot show a single bad character.
+ALT_DEFAULT = os.environ.get("VISION_ALTERNATIVES", "0").lower() in ("1", "true", "yes")
+
 
 def _session(path: Path) -> tuple[ort.InferenceSession, str]:
     # SpaceMIT EP 2.0.5 currently segfaults during session creation for both
@@ -173,23 +186,57 @@ class OCRBackend:
             batch[i, :, :, :width] = np.transpose(resized, (2, 0, 1))
         return np.ascontiguousarray(batch)
 
-    def _decode(self, output: np.ndarray) -> list[tuple[str, float]]:
+    def _decode(self, output: np.ndarray) -> list[tuple[str, float, float, list[dict]]]:
+        """CTC greedy decode, plus the per-character uncertainty the model already
+        computed and the line score throws away.
+
+        `score` stays exactly what it always was -- the mean top-1 probability
+        over kept timesteps -- so existing consumers are unaffected. But a mean
+        is the wrong statistic for spotting a single bad character: a five-digit
+        figure whose separator the model genuinely split 0.51/0.49 still averages
+        to 0.90+, which is why a misread can look like a confident read. So also
+        report the minimum per-character probability and, for any character whose
+        runner-up holds a non-trivial share of the mass, that runner-up.
+        """
         decoded = []
         for sequence in output:
             ids = np.argmax(sequence, axis=1)
             scores = np.max(sequence, axis=1)
             text: list[str] = []
             kept: list[float] = []
+            alternatives: list[dict] = []
             previous = -1
-            for index, score in zip(ids.tolist(), scores.tolist()):
+            for step, (index, score) in enumerate(zip(ids.tolist(), scores.tolist())):
                 if index != 0 and index != previous and index < len(self.characters):
+                    position = len(text)
                     text.append(self.characters[index])
                     kept.append(float(score))
+                    # Partial sort of one row only -- kept timesteps are a small
+                    # fraction of the sequence, so this is far cheaper than a
+                    # top-2 over the whole (steps, classes) array.
+                    row = sequence[step]
+                    runner = int(np.argpartition(row, -2)[-2:][0])
+                    if runner == index:
+                        runner = int(np.argpartition(row, -2)[-2:][1])
+                    p_alt = float(row[runner])
+                    if p_alt >= ALT_THRESHOLD and runner < len(self.characters):
+                        alternatives.append({
+                            "index": position,
+                            "char": self.characters[index],
+                            "alt": self.characters[runner],
+                            "p": round(float(score), 6),
+                            "p_alt": round(p_alt, 6),
+                        })
                 previous = index
-            decoded.append(("".join(text), float(np.mean(kept)) if kept else 0.0))
+            decoded.append((
+                "".join(text),
+                float(np.mean(kept)) if kept else 0.0,
+                float(np.min(kept)) if kept else 0.0,
+                alternatives,
+            ))
         return decoded
 
-    def infer(self, image: np.ndarray) -> dict:
+    def infer(self, image: np.ndarray, alternatives: bool = False) -> dict:
         started = time.perf_counter()
         det_input, ratio_h, ratio_w = self._det_input(image)
         t0 = time.perf_counter()
@@ -204,7 +251,7 @@ class OCRBackend:
             range(len(crops)),
             key=lambda index: crops[index].shape[1] / max(crops[index].shape[0], 1),
         )
-        results: list[tuple[str, float]] = [("", 0.0)] * len(crops)
+        results: list[tuple[str, float, float, list]] = [("", 0.0, 0.0, [])] * len(crops)
         for offset in range(0, len(order), 16):
             indices = order[offset:offset + 16]
             batch = [crops[index] for index in indices]
@@ -215,8 +262,7 @@ class OCRBackend:
                 # difference is speed. The batch dimension is independent, so
                 # running the rows one at a time is the same arithmetic.
                 rec_input = self._rec_batch(batch, self.native.height)
-                for row, index in zip(rec_input, indices):
-                    probs = self.native.infer_array(np.ascontiguousarray(row))
+                for index, probs in zip(indices, self.native.infer_rows(rec_input)):
                     results[index] = self._decode(probs[None, ...])[0]
             else:
                 rec_input = self._rec_batch(batch)
@@ -225,13 +271,20 @@ class OCRBackend:
                     results[index] = result
         t3 = time.perf_counter()
         lines = []
-        for box, (text, score) in zip(boxes, results):
+        want_alt = alternatives or ALT_DEFAULT
+        for box, (text, score, min_score, alts) in zip(boxes, results):
             if text and score >= 0.2:
-                lines.append({
+                line = {
                     "text": text,
                     "score": round(score, 6),
                     "box": np.rint(box).astype(int).tolist(),
-                })
+                    # Additive: the mean `score` above cannot expose a single
+                    # contested character. These two can.
+                    "min_char_score": round(min_score, 6),
+                }
+                if want_alt and alts:
+                    line["alternatives"] = alts
+                lines.append(line)
         return {
             "model": self.rec_model,
             "detector": "PP-OCRv6_tiny_det",
@@ -281,7 +334,7 @@ def health() -> dict:
 
 
 @app.post("/v1/ocr")
-async def ocr(image: UploadFile = File(...)) -> dict:
+async def ocr(image: UploadFile = File(...), alternatives: bool = False) -> dict:
     if backend is None:
         raise HTTPException(503, "OCR backend is not initialized")
     data = await image.read(MAX_BYTES + 1)
@@ -293,6 +346,6 @@ async def ocr(image: UploadFile = File(...)) -> dict:
     if decoded.shape[0] * decoded.shape[1] > MAX_PIXELS:
         raise HTTPException(413, "decoded image exceeds 40 megapixels")
     try:
-        return backend.infer(decoded)
+        return backend.infer(decoded, alternatives=alternatives)
     except Exception as exc:
         raise HTTPException(500, f"inference failed: {type(exc).__name__}") from exc

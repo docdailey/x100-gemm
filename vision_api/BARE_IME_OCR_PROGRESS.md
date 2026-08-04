@@ -694,3 +694,214 @@ Env vars: `OCR_HARTS` (worker count, default 8), `OCR_PROF=1` (per-op ms),
   the existing pipeline; they dominate latency on dense-document pages and are
   worth revisiting on quality grounds, but that is a recognition-behaviour change
   and was deliberately left alone.
+
+---
+
+# Phase 3 — closing the speed gaps, and what the model actually knows
+
+Two things were asked for: take the two optimisations phase 2 left on the table,
+and do something honest about a downstream consumer's comma-vs-decimal misreads.
+Both were done. **Both optimisations were implemented, measured, and rejected on
+the evidence** — the numbers phase 1 and 2 predicted them from do not survive
+contact with the shipping build. The precision work landed and is deployed.
+
+Net result: **no speed change** (the engine is byte-for-byte the phase-2 engine),
+plus a new, additive uncertainty signal in `/v1/ocr` that exposes information the
+model was already computing and the API was throwing away.
+
+## 22. Crop batching — built, validated, rejected
+
+Phase 1 called this "the single biggest remaining optimisation". It is not; it is
+a loss at every width for both models.
+
+Implemented properly: buffers became `[channel][sample][h][w]` so a channel's
+stride spans the whole batch and `cols = N * OH * OW` becomes the GEMM's column
+count — one weight stream covering N crops. Depthwise and pooling parallelise
+over `(channel, sample)`, the Squeeze-and-Excite gate is computed per sample, and
+the CTC head's `(N*T, classes)` output falls out row-major with no extra work.
+**Validated bit-identical to batch=1** (same max abs prob diff to the digit, 100%
+argmax agreement, 97/97 exact decode at batch=16).
+
+**PP-OCRv6 Tiny, ms/crop, 24 real crops, 8 AI harts:**
+
+| Width | b=1 | b=4 | b=8 | b=16 |
+|---|---|---|---|---|
+| 160 | 3.34 | **3.07** | 3.33 | 4.23 |
+| 320 | **5.83** | 6.66 | 9.09 | 11.38 |
+| 640 | **11.77** | 17.64 | 26.49 | 33.16 |
+| 1280 | **25.06** | 47.83 | 64.91 | 69.72 |
+| 3200 | **92.52** | 103.04 | 154.42 | 192.53 |
+
+**Rosetta (85 MB of weights — the case batching should most favour), W=100:**
+b=1 57.90, b=2 **54.92**, b=4 85.91, b=8 89.18 ms/crop.
+
+The premise was wrong. Batching amortises *weight* traffic, and this engine is
+not weight-bound — it is activation-bandwidth bound. Even Rosetta, with 20x more
+weights than PP-OCRv6, gains only 5% at b=2 before collapsing. Batching multiplies
+the working set by N while cache stays fixed, so every im2col gather and every
+GEMM column sweep starts missing. The one real (small) win is at b=4 on narrow
+crops, where the tensors still fit and the win is the per-dispatch sync overhead,
+not weight reuse.
+
+**Why ORT's batch-16 beats its own per-crop path** (1.16x at W=3200, the
+observation that motivated this) is therefore not weight amortisation either — it
+is ONNX Runtime's fixed per-`Run()` overhead being spread over 16 crops. This
+engine has almost no per-call overhead, so it has nothing to amortise and only
+the working-set penalty to pay.
+
+**Removed, not kept as a knob.** Merely supporting the batch dimension cost a
+measured ~5% on the single-crop path everyone uses (A/B against the pre-batch
+build: 3.21→3.36, 5.67→6.00, 23.22→24.53, 90.64→91.53 ms/crop) because of the
+extra index arithmetic at N=1. A feature that is never beneficial and taxes the
+common path is dead weight. The engine that ships is byte-for-byte the phase-2
+engine, re-validated after the revert.
+
+## 23. MR=4/NC=3 GEMM shape — re-measured, rejected
+
+Phase 1 measured this register-blocking shape at +22% and deferred it as
+"unjustified risk". Re-measuring at the K values PP-OCRv6 actually uses (K is the
+input channel count, 48-320, because the model is mostly 1x1 convs — phase 1 only
+probed K=288) and with the accumulator in memory as the engine really has it:
+
+| K | MR=8/NC=1 (shipping) | MR=4/NC=3 | ratio |
+|---|---|---|---|
+| 48 | 32.23 | 35.18 | 1.09x |
+| 96 | 32.56 | 36.03 | 1.11x |
+| 160 | 32.79 | 36.45 | 1.11x |
+| 288 | 33.12 | 36.80 | 1.11x |
+| 512 | 33.16 | 36.92 | 1.11x |
+
+**The +22% was an artefact of the baseline.** Phase 1 measured before
+`-funroll-loops` was adopted; unrolling is worth +13% to the MR=8 kernel on its
+own (29.4 → 33.1 GFLOP/s) and cannot be applied to MR=4/NC=3 at all — 12 m2
+accumulators plus 3 m2 operands is 30 of 32 vector registers, and letting gcc
+unroll on top of that makes it spill vectors and **segfault**. It only compiles
+correctly with `__attribute__((optimize("no-unroll-loops")))` on that one
+function. Like-for-like under the shipping flags the gap is **+11%, not +22%**.
+
+Three further reasons not to take even the 11%:
+
+- The engine reaches ~9 GFLOP/s per hart against 33 for the kernel in isolation,
+  so it is not kernel-bound; ~27% of the kernel's rate makes it through. An 11%
+  kernel gain is worth low single digits end to end.
+- NC=3 works in 192-column granules. Most layers here have 100-500 columns, so a
+  large fraction of tiles would hit the tail path — and the natural MR=4 tail
+  (4 FMAs per 4 scalar loads + 1 vector load) is **worse** than the current
+  kernel's ratio, not better.
+- It requires re-packing the weight blob at MR=4 and carrying a compiler
+  landmine that miscompiles silently-ish (a segfault, at least, rather than
+  wrong numbers) if anyone ever adds unrolling back.
+
+Not shipped. `bench/rvv_gemm_shape2.c` reproduces the measurement.
+
+## 24. Comma-vs-decimal: what the model actually knows
+
+The reported failure (FinScan: `1,901` read as `1.901`, ~47% of thousands-groups,
+"the misread scores 1.00 confidence") was taken as given — not re-derived. No
+comma/period normalisation was added, for the reasons given in the brief: it is
+locale-wrong (European documents invert the convention) and the disambiguation
+needs document context this API does not have.
+
+But the premise that confidence is useless here turns out to be **an artefact of
+how the API reported confidence, not of the model.** Running the actual repro
+image through the deployed engine and looking at the full per-timestep
+distribution instead of the collapsed line score:
+
+**Correctly-read separators** (runner-up probability at that timestep):
+
+```
+'1,901'  ',': p=0.991205  runner-up '.' p=0.008623
+'1,901'  ',': p=0.974691  runner-up '.' p=0.025208
+'1,755'  ',': p=0.977421  runner-up '.' p=0.022184
+'2,362'  ',': p=0.999906  runner-up '.' p=0.000066
+```
+
+**Actually-misread separators**, induced by the small preprocessing
+perturbations the brief describes (same crop, different pad/interpolation):
+
+```
+'20.000' '.': p=0.853685  runner-up ',' p=0.143309
+'20.000' '.': p=0.741653  runner-up ',' p=0.256851
+'20.000' '.': p=0.538061  runner-up ',' p=0.461671
+'20.000' '.': p=0.512101  runner-up ',' p=0.486993
+```
+
+For contrast, digit positions in the same strings put **1e-5 to 1e-6** on their
+runner-up. The model is not confidently wrong. At the separator it is genuinely
+uncertain — in the worst case an almost exact coin flip — and it says so.
+
+**The 1.00 in the bug report is a line-level mean.** `score` has always been the
+mean top-1 probability over kept timesteps. A five-character figure with four
+digits at 0.9999 and one separator at 0.51 averages to 0.90 and rounds to
+something that looks confident. The mean is simply the wrong statistic for
+detecting one bad character in an otherwise clean string.
+
+### What was added
+
+Two additive, backward-compatible fields. `text` and `score` are untouched, and
+no decoded text is modified anywhere.
+
+- **`min_char_score`** — always present, one float per line: the *minimum*
+  per-character top-1 probability. On the misread above the line reports
+  `score: 0.970` but `min_char_score: 0.845`.
+- **`alternatives`** — opt-in per request via `?alternatives=true`: for each
+  decoded character whose runner-up holds at least `VISION_ALT_THRESHOLD` (1%)
+  of the mass, the position, the chosen character, the runner-up, and both
+  probabilities.
+
+```json
+{"text": "20.000", "score": 0.970, "min_char_score": 0.845,
+ "alternatives": [{"index": 2, "char": ".", "alt": ",", "p": 0.845132, "p_alt": 0.154425},
+                  {"index": 5, "char": "0", "alt": "O", "p": 0.985758, "p_alt": 0.013229}]}
+```
+
+That is a complete, locale-free description of the ambiguity: *this glyph is
+contested, here is the other candidate, here is how the mass splits.* A consumer
+resolving `3.375` (rate or misread thousands?) still needs document context, but
+it no longer has to guess **which** characters to be suspicious of.
+
+The 1% threshold is measured, not chosen: digits sit at 1e-5 or below,
+correctly-read separators at 0.9-2.5%, misread separators at 2-49%.
+
+**Why `alternatives` is opt-in.** On dense prose this model is genuinely
+uncertain nearly everywhere — the academic page produces 1641 alternatives across
+97 lines and doubles the response payload (128 KB vs 5 KB for the financial
+page's 40 lines). That is honest, not noise: at this model size `g`/`q`,
+`v`/`y`, and space-or-nothing really are close calls. But callers who only want
+text should not pay for it. `min_char_score` is one float and is always on.
+Default can be flipped globally with `VISION_ALTERNATIVES=1`.
+
+### What we recommend to FinScan
+
+The digit-normalisation plus cross-reader voting they already do remains the
+right architecture, and this changes none of it. What changes is that they no
+longer need to treat every separator as equally suspect:
+
+1. Use `min_char_score`, not `score`, as the line-level trust signal. It is the
+   one that moves when a single character is contested.
+2. Request `?alternatives=true` and filter to `alt in {',', '.'}`. That yields
+   exactly the positions where this reader knows it is guessing between the two,
+   with the split. A `p_alt` near 0.5 is a coin flip; near 0.01 it is not.
+3. Weight the cross-reader vote by `p`/`p_alt` at the contested position rather
+   than by the line score. When the MilkV splits 0.51/0.49 it should barely vote
+   at all; when it reads 0.9999 it should count fully.
+
+This does not fix the model — nothing short of retraining will, and retraining
+would forfeit the bit-equivalence-to-the-official-export property this engine is
+built on. It does replace a misleading number with an accurate one.
+
+## 25. State after phase 3
+
+- Engine: **unchanged from phase 2** and re-validated — PP-OCRv6 100.0000%
+  timestep argmax agreement and 97/97 exact decode at W=160/161/240/320 against
+  the ORT oracle; Rosetta 100% at W=100/320. Benchmarks unchanged
+  (3.21 / 5.49 / 92.03 ms/crop at W=160 / 320 / 3200).
+- API: `min_char_score` always, `alternatives` on request. Text output verified
+  still 97/97 byte-identical to the ONNX path on `sample.png`.
+- Deployed and live: `native-ppocrv6`, `rec_provider: spacemit-ai-harts x8`.
+
+Both rejected optimisations are recorded here rather than left as open TODOs, so
+nobody re-derives them a third time. If a future model on this board *is*
+weight-bound — a much larger recognizer, or an int8 path where activations shrink
+but weights do not — batching is worth revisiting, and section 22 describes
+exactly how it was built.
